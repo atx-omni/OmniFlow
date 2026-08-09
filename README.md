@@ -10,10 +10,10 @@ The complete walkthrough is in [Install OmniFlow In A GitHub Repository](docs/IN
 
 1. Confirm the Omni model already uses Git integration and Branch Mode with the target GitHub repository.
 2. Copy [`.omni/flow.example.json`](.omni/flow.example.json) to `.omni/flow.json`, then add the tenant URL, model ID, repository model path, and base branch.
-3. Add the Omni API key to GitHub Actions as a repository secret named `OMNI_API_KEY`. Never commit it.
-4. Copy [the workflow example](.github/workflow-examples/omniflow.yml) to `.github/workflows/omniflow.yml` in the customer repository and replace both `<pinned-commit-sha>` values with the same reviewed 40-character OmniFlow commit SHA.
-5. Optionally copy [`.omniflow.example.yml`](.omniflow.example.yml) to `.omniflow.yml` to customize policy. No policy file is required for the first run.
-6. Merge the setup files into the protected base branch so the privileged workflow can read them as trusted inputs.
+3. Copy [the workflow example](.github/workflow-examples/omniflow.yml) to `.github/workflows/omniflow.yml`, pin both action references to the same reviewed 40-character OmniFlow commit SHA, and add CODEOWNERS coverage.
+4. Protect the base branch before storing any Omni credential. Require pull requests, normal reviewer approval, and review from the owners of the workflow and trusted metadata.
+5. Optionally copy [`.omniflow.example.yml`](.omniflow.example.yml) to `.omniflow.yml`, then merge the setup files through the protected process.
+6. Create a dedicated least-privilege Omni personal access token and store it as the GitHub Actions secret `OMNI_API_KEY`. Do not use an Organization API Key.
 7. Create a harmless model change in an Omni branch, select **Create pull request**, and confirm OmniFlow validates the resulting GitHub pull request.
 
 After the first live run succeeds, make the OmniFlow check required in GitHub branch protection. Continue with the [installation checklist](docs/INSTALLATION.md#step-9-verify-the-installation) before treating OmniFlow as a merge gate.
@@ -56,17 +56,17 @@ The action installs from that pinned checkout during alpha testing:
 
 ```yaml
 - uses: atx-omni/OmniFlow@<pinned-commit-sha>
-  env:
-    OMNI_API_KEY: ${{ secrets.OMNI_API_KEY }}
+  with:
+    omni-api-key: ${{ secrets.OMNI_API_KEY }}
 ```
 
-Do not install an unpinned branch. Do not use `pip install omniflow-ci` until a signed version has been published and verified on PyPI. The distribution uses `omniflow-ci` because the unrelated `omniflow` project name is already registered; the command remains `omniflow`.
+Do not install an unpinned branch. OmniFlow does not currently publish an official PyPI package; `pip install omniflow-ci` is not a supported installation path. The action installs from the reviewed checkout using an exact, hash-verified Python 3.11 Linux dependency lock.
 
 ### 2. Add The API Secret
 
-Create a GitHub Actions secret named `OMNI_API_KEY`. The token must be able to list model branches, read model YAML, validate the model, run the Content Validator, and retrieve content labels. The optional dbt exposures endpoint requires Connection Admin permissions according to the [Omni API reference](https://docs.omni.co/api/dbt/get-dbt-exposures).
+Create a dedicated Omni service user with access only to the models and content being validated, then create a personal access token for that user and save it as the GitHub Actions secret `OMNI_API_KEY`. Do not use an Organization API Key: Omni documents that organization keys have Organization Admin permissions, while personal access tokens inherit their user's permissions. Tokens do not expire automatically, so define a rotation schedule and revoke them immediately after suspected exposure or maintainer access changes. See [Omni API authentication](https://docs.omni.co/api/authentication).
 
-Use the least-privilege token that satisfies the enabled checks. Never place credentials in repository files.
+The token must be able to list model branches, read model YAML, validate the model, run the Content Validator, and retrieve content labels. The optional dbt exposures endpoint requires Connection Admin permissions according to the [Omni API reference](https://docs.omni.co/api/dbt/get-dbt-exposures). Never place credentials in repository files.
 
 ### 3. Commit Trusted Model Identity Once
 
@@ -156,7 +156,7 @@ Each run writes root and redacted public summaries:
   restricted/<model_id>/
 ```
 
-Public reports exclude API keys, raw payloads, email addresses, document URLs, and folder paths. `security.redaction_level: strict` also removes content names, query names, owners, labels, and free-text messages. Restricted artifacts are not uploaded by the example workflow.
+Public reports exclude API keys, raw payloads, email addresses, document URLs, and folder paths. `security.redaction_level: strict` also removes content names, query names, owners, labels, and free-text messages. Restricted artifacts are deleted by default and are never uploaded by the example workflow. Opt-in retention is intended only for an isolated, ephemeral runner and writes files with owner-only permissions.
 
 Raw response output cannot be enabled in CI policy. The explicit `--unsafe-raw-output` option exists only on the local `content validate` debugging command.
 
@@ -183,6 +183,7 @@ Exit codes are `0` success, `1` validation failure, `2` configuration error, `3`
 - [Troubleshooting](docs/TROUBLESHOOTING.md)
 - [Support and safe diagnostic sharing](SUPPORT.md)
 - [Security policy](SECURITY.md)
+- [Security model and operator responsibilities](docs/SECURITY_MODEL.md)
 - [Contributing](CONTRIBUTING.md)
 - [Code of Conduct](CODE_OF_CONDUCT.md)
 - [MIT License](LICENSE)
@@ -206,9 +207,9 @@ The simulation covers same-repository and fork routing, contract failures, stric
 
 ## Maintainer Release Setup
 
-Before the first public release, configure a pending PyPI Trusted Publisher for project `omniflow-ci`, owner `atx-omni`, repository `OmniFlow`, workflow `release.yml`, and environment `pypi`. Protect that GitHub environment with required maintainer approval. A `vX.Y.Z` tag matching the package version then builds once, publishes the verified distributions to PyPI with attestations, and signs the SBOM, checksums, wheel, and source archive for the GitHub release.
+Controlled-alpha releases are GitHub releases only. A `vX.Y.Z` tag must point to a commit contained in protected `main`; the release build uses hash-locked tooling, creates an SBOM and checksums, and signs the artifacts through Sigstore before publication through the protected `github-release` environment.
 
-PyPI pending publishers do not reserve a name until the first successful upload, so the initial release should follow setup promptly.
+PyPI publication is intentionally disabled until maintainers secure the project name, configure a reviewed Trusted Publisher, and reintroduce that path in a separately reviewed change. A package using the OmniFlow name should not be treated as official unless this repository links to it.
 
 ## Official References
 

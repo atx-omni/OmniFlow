@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from .reporting.writer import write_reports
-from .security import public_safe
+from .security import public_safe, secure_write_text
 
 PUBLIC_DIR = "public"
 RESTRICTED_DIR = "restricted"
@@ -40,8 +40,7 @@ def write_public_json(
 ) -> dict[str, Any]:
     safe_payload = public_safe(payload, redaction_level=redaction_level)
     target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(safe_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    secure_write_text(target, json.dumps(safe_payload, indent=2, sort_keys=True) + "\n")
     return safe_payload
 
 
@@ -73,6 +72,4 @@ def write_artifact_manifest(
             f"{RESTRICTED_DIR}/<model_id>/content-report.json",
         ],
     }
-    (root / "artifact-manifest.json").write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    secure_write_text(root / "artifact-manifest.json", json.dumps(manifest, indent=2, sort_keys=True) + "\n")

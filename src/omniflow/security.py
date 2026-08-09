@@ -168,6 +168,38 @@ def validate_repo_output_path(value: str | Path) -> Path:
     return Path(value)
 
 
+def secure_mkdir(path: str | Path, *, enforce_private: bool = False) -> Path:
+    target = Path(path)
+    if target.is_symlink():
+        raise SecurityPolicyError("OmniFlow output directories must not be symbolic links")
+    existed = target.exists()
+    target.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if os.name == "posix" and (enforce_private or not existed):
+        target.chmod(0o700)
+    return target
+
+
+def secure_write_text(path: str | Path, value: str) -> None:
+    target = Path(path)
+    secure_mkdir(target.parent)
+    if target.is_symlink():
+        raise SecurityPolicyError("OmniFlow output files must not be symbolic links")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(target, flags, 0o600)
+    except OSError as exc:
+        raise SecurityPolicyError(f"Could not safely write OmniFlow output file '{target}'") from exc
+    try:
+        if os.name == "posix":
+            os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            descriptor = -1
+            stream.write(value)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
 def _redact_match(match: re.Match[str]) -> str:
     for index in range(1, len(match.groups()) + 1):
         prefix = match.group(index)

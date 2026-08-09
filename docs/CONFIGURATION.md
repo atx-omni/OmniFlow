@@ -138,13 +138,14 @@ security:
   max_report_samples: 20
   redact_document_names: false
   redaction_level: standard
-  retain_restricted_artifacts: true
+  retain_restricted_artifacts: false
 ```
 
 - `redaction_level` accepts `standard` or `strict`.
 - `strict` additionally removes content names, query names, owners, labels, and free-text messages from public output.
 - `allow_raw_response_output` cannot be enabled through policy.
-- Restricted artifacts stay on the runner unless a workflow explicitly uploads them. The official example uploads only redacted public artifacts.
+- Restricted artifacts are deleted by default. Opt-in retention writes owner-only files but should be used only on isolated, ephemeral runners. The official example uploads only redacted public artifacts.
+- Unknown configuration keys fail closed so misspelled security or policy settings cannot be silently ignored.
 - Personal folders are excluded by default.
 
 ## Local Debugging Overrides

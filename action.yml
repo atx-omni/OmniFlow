@@ -5,10 +5,9 @@ inputs:
     description: Path to .omniflow.yml
     required: false
     default: .omniflow.yml
-  version:
-    description: Optional PyPI version of omniflow-ci to install. Leave empty to install from the pinned action checkout.
+  omni-api-key:
+    description: Dedicated least-privilege Omni personal access token. Exposed only to the validation step.
     required: false
-    default: ""
   skip-reason:
     description: Record a successful skipped run without exposing the Omni API key.
     required: false
@@ -19,15 +18,22 @@ runs:
     - name: Install OmniFlow
       shell: bash
       env:
-        OMNIFLOW_INPUT_VERSION: ${{ inputs.version }}
+        PIP_DISABLE_PIP_VERSION_CHECK: "1"
+        PIP_NO_INPUT: "1"
       run: |
         set -euo pipefail
-        python -m pip install --disable-pip-version-check --no-input --upgrade "pip==26.1.2" "setuptools==83.0.0"
-        if [ -n "$OMNIFLOW_INPUT_VERSION" ]; then
-          python -m pip install --disable-pip-version-check --no-input "omniflow-ci==$OMNIFLOW_INPUT_VERSION"
-        else
-          python -m pip install --disable-pip-version-check --no-input "$GITHUB_ACTION_PATH"
-        fi
+        python - <<'PY'
+        import platform
+        import sys
+
+        supported = sys.version_info[:2] == (3, 11) and platform.system() == "Linux" and platform.machine() == "x86_64"
+        if not supported:
+            raise SystemExit("OmniFlow's locked action runtime requires Linux x86_64 with Python 3.11")
+        PY
+        python -m pip install --require-hashes --only-binary=:all: \
+          --requirement "$GITHUB_ACTION_PATH/requirements/action-py311-linux-x86_64.txt"
+        PIP_NO_INDEX=1 python -m pip install --no-deps --no-build-isolation "$GITHUB_ACTION_PATH"
+        python -m pip check
 
     - name: Record skipped run
       if: inputs['skip-reason'] != ''
@@ -44,6 +50,7 @@ runs:
       if: inputs['skip-reason'] == ''
       shell: bash
       env:
+        OMNI_API_KEY: ${{ inputs['omni-api-key'] }}
         OMNIFLOW_INPUT_CONFIG: ${{ inputs.config }}
         OMNIFLOW_GITHUB_TOKEN: ${{ github.token }}
       run: |

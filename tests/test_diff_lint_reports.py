@@ -1,6 +1,9 @@
+import os
+import stat
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from omniflow.diff.diff_engine import diff_graphs
 from omniflow.diff.semantic_graph import build_graph
@@ -27,6 +30,11 @@ class UnsafeYamlClient:
         return {"files": {"../escaped.view": "name: escaped\n"}, "checksums": {}}
 
 
+class MultiFileYamlClient:
+    def get_model_yaml(self, *args, **kwargs):
+        return {"files": {"views/a.view": "name: a\n", "views/b.view": "name: b\n"}, "checksums": {}}
+
+
 class DiffLintReportTests(unittest.TestCase):
     def test_loads_composite_topic_files_as_topics(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -45,6 +53,44 @@ class DiffLintReportTests(unittest.TestCase):
             )
             self.assertTrue((Path(tmp) / "views/orders.view").exists())
             self.assertEqual(manifest["files"]["views/orders.view"]["checksum"], "abc")
+            if os.name == "posix":
+                self.assertEqual(stat.S_IMODE((Path(tmp) / "views/orders.view").stat().st_mode), 0o600)
+                self.assertEqual(stat.S_IMODE((Path(tmp) / "views").stat().st_mode), 0o700)
+
+    def test_yaml_pull_rejects_excessive_file_count_before_writing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "yaml"
+            with mock.patch("omniflow.yaml_pull.MAX_YAML_FILES", 1):
+                with self.assertRaises(SecurityPolicyError):
+                    pull_yaml(
+                        client=MultiFileYamlClient(),
+                        model_id="model-1",
+                        branch_id=None,
+                        output_dir=root,
+                    )
+            self.assertFalse(root.exists())
+
+    def test_yaml_loader_rejects_cycles_depth_and_alias_fanout(self):
+        cases = {
+            "cycle.view": "loop: &loop [*loop]\n",
+            "depth.view": "value: " + ("[" * 101) + "0" + ("]" * 101) + "\n",
+            "aliases.view": "anchor: &value 1\nvalues: [" + ",".join("*value" for _ in range(51)) + "]\n",
+        }
+        for name, body in cases.items():
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    (Path(tmp) / name).write_text(body, encoding="utf-8")
+                    with self.assertRaises(SecurityPolicyError):
+                        load_yaml_files(tmp)
+
+    def test_yaml_parse_error_does_not_echo_customer_yaml(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "orders.view"
+            path.write_text("private_customer_value: [unterminated\n", encoding="utf-8")
+            with self.assertRaises(ConfigError) as raised:
+                load_yaml_files(tmp)
+        self.assertNotIn("private_customer_value", str(raised.exception))
+        self.assertIn("line", str(raised.exception))
 
     def test_yaml_pull_rejects_branch_id_for_non_combined_mode(self):
         with tempfile.TemporaryDirectory() as tmp:

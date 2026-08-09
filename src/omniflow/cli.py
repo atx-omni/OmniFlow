@@ -17,7 +17,7 @@ from .diff.semantic_graph import build_graph
 from .diff.yaml_loader import load_yaml_files
 from .discovery import ModelContext, discover_contexts
 from .downstream import generate_downstream_dependencies
-from .exceptions import ConfigError, ExitCodes, OmniAuthError, OmniFlowError
+from .exceptions import ConfigError, ExitCodes, OmniAuthError, OmniFlowError, SecurityPolicyError
 from .exposures import run_dbt_exposure_enrichment
 from .git import current_branch, current_sha, event_name, pr_number
 from .github.annotations import annotation_lines
@@ -34,6 +34,8 @@ from .yaml_pull import pull_yaml
 
 
 def main(argv: list[str] | None = None) -> int:
+    if os.name == "posix":
+        os.umask(0o077)
     parser = build_parser()
     args = parser.parse_args(argv)
     configure_logging("DEBUG" if getattr(args, "verbose", False) else "INFO")
@@ -148,6 +150,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         raise
     output_dir = Path(config.reporting.output_dir)
     _validate_run_output_layout(output_dir)
+    if not config.security.retain_restricted_artifacts:
+        _purge_restricted_path(restricted_dir(output_dir))
     if args.skip_reason:
         _write_skipped_artifacts(config=config, output_dir=output_dir, reason=args.skip_reason)
         print(f"OmniFlow skipped: {args.skip_reason}")
@@ -176,20 +180,22 @@ def cmd_run(args: argparse.Namespace) -> int:
         context_output_dir = restricted_dir(output_dir) / _safe_context_dir(context)
         _validate_context_output_layout(context_output_dir)
         try:
-            context_report, context_exit = _run_context(
-                config=config,
-                context=context,
-                output_dir=context_output_dir,
-            )
-        except OmniFlowError as exc:
-            context_report, context_exit = _write_context_failure_artifacts(
-                config=config,
-                context=context,
-                output_dir=context_output_dir,
-                exc=exc,
-            )
-        if not config.security.retain_restricted_artifacts and context_output_dir.exists():
-            shutil.rmtree(context_output_dir)
+            try:
+                context_report, context_exit = _run_context(
+                    config=config,
+                    context=context,
+                    output_dir=context_output_dir,
+                )
+            except OmniFlowError as exc:
+                context_report, context_exit = _write_context_failure_artifacts(
+                    config=config,
+                    context=context,
+                    output_dir=context_output_dir,
+                    exc=exc,
+                )
+        finally:
+            if not config.security.retain_restricted_artifacts:
+                _purge_restricted_path(restricted_dir(output_dir))
         all_reports.append(context_report)
         all_issues.extend(context_report.get("issues", []))
         exit_code = max(exit_code, context_exit)
@@ -858,8 +864,20 @@ def _validate_context_output_layout(output_dir: Path) -> None:
         validate_repo_output_path(output_dir / name / "manifest.json")
 
 
+def _purge_restricted_path(path: Path) -> None:
+    validate_repo_output_path(path)
+    if path.is_symlink():
+        raise SecurityPolicyError("Restricted artifact paths must not be symbolic links")
+    if path.exists():
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+
+
 def _write_unconfigured_failure_artifacts(*, output_dir: Path, exc: OmniFlowError) -> None:
     _validate_run_output_layout(output_dir)
+    _purge_restricted_path(restricted_dir(output_dir))
     issue = {"severity": "error", "validator": "setup", "message": redact(str(exc))}
     report = {
         "tool": "omniflow",

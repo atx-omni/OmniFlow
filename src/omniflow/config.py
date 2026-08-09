@@ -8,11 +8,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import yaml
-
 from .exceptions import ConfigError, SecurityPolicyError
 from .security import contains_secret_key, reject_secret_keys, validate_repo_output_path
 from .trust import read_trusted_repo_text
+from .yaml_security import parse_secure_yaml
 
 DEFAULT_CONFIG_PATH = ".omniflow.yml"
 DEFAULT_REPORT_FORMATS = ["json", "markdown", "sarif", "junit"]
@@ -31,6 +30,38 @@ SEMANTIC_LINT_RULES = {
     "forbid_personal_folder_validation_scope",
 }
 RULE_SEVERITIES = {"off", "info", "warn", "error"}
+CONFIG_KEYS = {"omni", "checks", "reporting", "security", "contracts"}
+OMNI_KEYS = {
+    "base_url",
+    "model_id",
+    "branch_id",
+    "branch_name",
+    "user_id",
+    "include_personal_folders",
+    "timeout",
+}
+CHECK_KEYS = {"content_validation", "model_validation", "semantic_lint", "dbt_exposures"}
+CONTENT_KEYS = {"enabled", "fail_on_new_only", "labels"}
+MODEL_KEYS = {"enabled", "fail_on_warnings"}
+LINT_KEYS = {"enabled", "rules"}
+EXPOSURE_KEYS = {"enabled", "fail_on_unavailable"}
+REPORTING_KEYS = {"formats", "output_dir"}
+SECURITY_KEYS = {
+    "redact_logs",
+    "allow_raw_response_output",
+    "max_report_samples",
+    "redact_document_names",
+    "redaction_level",
+    "retain_restricted_artifacts",
+}
+CONTRACT_KEYS = {"enabled", "fail_on"}
+CONTRACT_FAIL_KEYS = {
+    "deleted_referenced_fields",
+    "renamed_referenced_fields",
+    "referenced_field_type_changes",
+    "referenced_join_cardinality_changes",
+    "coverage_gaps",
+}
 
 
 def _expand_env_string(value: str) -> str:
@@ -99,13 +130,11 @@ def load_raw_config(path: str | Path | None = None) -> tuple[dict[str, Any], Pat
         text = read_trusted_repo_text(candidate)
         if text is None:
             continue
-        try:
-            payload = yaml.safe_load(text) or {}
-        except yaml.YAMLError as exc:
-            raise ConfigError(f"Could not parse config file '{candidate}': {exc}") from exc
+        payload = parse_secure_yaml(text, source=str(candidate))
         if not isinstance(payload, dict):
             raise ConfigError(f"Config file '{candidate}' must contain a top-level mapping")
         reject_secret_keys(payload, source=str(candidate))
+        _validate_config_schema(payload)
         return expand_env_vars(payload), candidate
     return {}, None
 
@@ -169,7 +198,7 @@ class SecuritySettings:
     max_report_samples: int = 20
     redact_document_names: bool = False
     redaction_level: str = "standard"
-    retain_restricted_artifacts: bool = True
+    retain_restricted_artifacts: bool = False
 
 
 @dataclass
@@ -319,7 +348,7 @@ def _to_config(raw: dict[str, Any], source: Path | None) -> OmniFlowConfig:
         retain_restricted_artifacts=parse_bool(
             "security.retain_restricted_artifacts",
             security_raw.get("retain_restricted_artifacts"),
-            True,
+            False,
         ),
     )
     return OmniFlowConfig(
@@ -364,6 +393,51 @@ def _mapping(value: Any, name: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ConfigError(f"{name} must be a mapping")
     return value
+
+
+def _validate_config_schema(raw: dict[str, Any]) -> None:
+    _reject_unknown_keys(raw, CONFIG_KEYS, "config")
+    omni = _mapping(raw.get("omni"), "omni")
+    checks = _mapping(raw.get("checks"), "checks")
+    reporting = _mapping(raw.get("reporting"), "reporting")
+    security = _mapping(raw.get("security"), "security")
+    contracts = _mapping(raw.get("contracts"), "contracts")
+    _reject_unknown_keys(omni, OMNI_KEYS, "omni")
+    _reject_unknown_keys(checks, CHECK_KEYS, "checks")
+    _reject_unknown_keys(reporting, REPORTING_KEYS, "reporting")
+    _reject_unknown_keys(security, SECURITY_KEYS, "security")
+    _reject_unknown_keys(contracts, CONTRACT_KEYS, "contracts")
+    _reject_unknown_keys(
+        _mapping(checks.get("content_validation"), "checks.content_validation"),
+        CONTENT_KEYS,
+        "checks.content_validation",
+    )
+    _reject_unknown_keys(
+        _mapping(checks.get("model_validation"), "checks.model_validation"),
+        MODEL_KEYS,
+        "checks.model_validation",
+    )
+    _reject_unknown_keys(
+        _mapping(checks.get("semantic_lint"), "checks.semantic_lint"),
+        LINT_KEYS,
+        "checks.semantic_lint",
+    )
+    _reject_unknown_keys(
+        _mapping(checks.get("dbt_exposures"), "checks.dbt_exposures"),
+        EXPOSURE_KEYS,
+        "checks.dbt_exposures",
+    )
+    _reject_unknown_keys(
+        _mapping(contracts.get("fail_on"), "contracts.fail_on"),
+        CONTRACT_FAIL_KEYS,
+        "contracts.fail_on",
+    )
+
+
+def _reject_unknown_keys(payload: dict[str, Any], allowed: set[str], source: str) -> None:
+    unknown = sorted(str(key) for key in payload if key not in allowed)
+    if unknown:
+        raise ConfigError(f"{source} contains unsupported key(s): {', '.join(unknown)}")
 
 
 def _bounded_int(name: str, value: Any, *, minimum: int, maximum: int, default: int) -> int:

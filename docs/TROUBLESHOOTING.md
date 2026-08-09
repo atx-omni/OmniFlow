@@ -28,7 +28,7 @@ Confirm that:
 
 - The secret is named exactly `OMNI_API_KEY`.
 - The secret is available to the repository or selected environment.
-- The workflow references the secret only through its environment.
+- The workflow passes the secret only through the action's `omni-api-key` input.
 - The pull request comes from a branch in the same repository.
 
 Fork pull requests intentionally do not receive the secret. Forked Omni changes fail closed; move the reviewed change to a same-repository branch for validation.
@@ -88,10 +88,10 @@ Confirm that the workflow has `security-events: write` permission and that GitHu
 
 Confirm that the workflow:
 
-- Uses Python 3.11, 3.12, or 3.13.
+- Uses the official Linux x86_64 runner and Python 3.11 action runtime.
 - Pins the OmniFlow action to a full commit SHA.
 - Has outbound access to Python package dependencies.
-- Has not replaced the trusted installation step with an unpinned branch install.
+- Has not changed the action's hash-locked dependency file or replaced the trusted installation step.
 
 ## Exit Codes
 

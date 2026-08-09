@@ -459,6 +459,63 @@ class DiscoveryTests(unittest.TestCase):
             with self.assertRaises(SecurityPolicyError):
                 load_flow_metadata()
 
+    def test_metadata_rejects_unknown_top_level_and_model_keys(self):
+        payloads = [
+            {
+                "version": 1,
+                "unexpected": True,
+                "models": [{"base_url": "https://omni.example", "model_id": "a", "model_path": "omni/a"}],
+            },
+            {
+                "version": 1,
+                "models": [
+                    {
+                        "base_url": "https://omni.example",
+                        "model_id": "a",
+                        "model_path": "omni/a",
+                        "api_version": "v1",
+                    }
+                ],
+            },
+        ]
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                with temporary_workdir() as tmp:
+                    write_json(tmp / ".omni/flow.json", payload)
+                    with self.assertRaises(ConfigError):
+                        load_flow_metadata()
+
+    def test_push_event_uses_bounded_event_changed_files_without_git_history(self):
+        with temporary_workdir() as tmp:
+            event = {
+                "size": 2,
+                "commits": [
+                    {"added": ["omni/model/views/orders.view"], "modified": [], "removed": []},
+                    {"added": [], "modified": ["README.md"], "removed": ["omni/model/old.topic"]},
+                ],
+            }
+            write_json(tmp / "event.json", event)
+            env = {"GITHUB_EVENT_NAME": "push", "GITHUB_EVENT_PATH": str(tmp / "event.json")}
+            with mock.patch.dict(os.environ, env, clear=True):
+                files = get_changed_files()
+        self.assertEqual(files, ["omni/model/views/orders.view", "README.md", "omni/model/old.topic"])
+
+    def test_incomplete_push_event_fails_closed(self):
+        with temporary_workdir() as tmp:
+            write_json(tmp / "event.json", {"size": 2, "commits": [{"added": [], "modified": [], "removed": []}]})
+            env = {"GITHUB_EVENT_NAME": "push", "GITHUB_EVENT_PATH": str(tmp / "event.json")}
+            with mock.patch.dict(os.environ, env, clear=True):
+                with self.assertRaises(ConfigError):
+                    get_changed_files()
+
+    def test_multiple_pr_markers_fail_closed(self):
+        with temporary_workdir() as tmp:
+            marker = '<!-- omniflow-context {"model_id":"a"} -->'
+            write_json(tmp / "event.json", {"pull_request": {"body": f"{marker}\n{marker}"}})
+            with mock.patch.dict(os.environ, {"GITHUB_EVENT_PATH": str(tmp / "event.json")}, clear=True):
+                with self.assertRaises(ConfigError):
+                    load_pr_marker()
+
 
 class ContractImpactTests(unittest.TestCase):
     def dependencies(self):

@@ -8,6 +8,7 @@ REQUIRED_DOCUMENTS = [
     "docs/INSTALLATION.md",
     "docs/CONFIGURATION.md",
     "docs/TROUBLESHOOTING.md",
+    "docs/SECURITY_MODEL.md",
     "SUPPORT.md",
     "SECURITY.md",
     "CONTRIBUTING.md",
@@ -25,7 +26,10 @@ class DocumentationTests(unittest.TestCase):
 
     def test_internal_markdown_links_resolve(self):
         for document in sorted(ROOT.rglob("*.md")):
-            if any(part in {".git", "build", "dist"} or part.endswith(".egg-info") for part in document.parts):
+            if any(
+                part in {".git", ".venv", "build", "dist"} or part.endswith(".egg-info")
+                for part in document.parts
+            ):
                 continue
             text = document.read_text(encoding="utf-8")
             for raw_target in MARKDOWN_LINK_RE.findall(text):
@@ -52,6 +56,10 @@ class DocumentationTests(unittest.TestCase):
             "Verify The Installation",
         ]:
             self.assertIn(required_text, text)
+        self.assertLess(text.index("Protect The Base Branch"), text.index("Create And Store A Dedicated Omni PAT"))
+        self.assertIn("Do not use an Organization API Key", text)
+        self.assertIn("omni-api-key", text)
+        self.assertNotIn("version input", text)
 
     def test_documentation_is_included_in_source_distribution(self):
         manifest = (ROOT / "MANIFEST.in").read_text(encoding="utf-8")
