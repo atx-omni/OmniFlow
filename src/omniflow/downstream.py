@@ -5,6 +5,7 @@ from typing import Any
 
 from .exceptions import OmniAPIError
 from .omni_client import OmniClient
+from .security import redact
 
 
 def generate_downstream_dependencies(
@@ -20,6 +21,7 @@ def generate_downstream_dependencies(
     dependencies: list[dict[str, Any]] = []
     seen = set()
     mode = "targeted"
+    coverage_gaps: list[dict[str, str]] = []
     for search in searches:
         try:
             payload = client.search_content_references(
@@ -30,10 +32,25 @@ def generate_downstream_dependencies(
                 user_id=user_id,
                 include_personal_folders=include_personal_folders,
             )
-        except OmniAPIError:
+        except OmniAPIError as exc:
             if dependencies:
-                raise
+                mode = "targeted_partial"
+                coverage_gaps.append(
+                    {
+                        "type": search["type"],
+                        "name": search["name"],
+                        "message": redact(str(exc)),
+                    }
+                )
+                continue
             mode = "full_validation_fallback"
+            coverage_gaps.append(
+                {
+                    "type": search["type"],
+                    "name": search["name"],
+                    "message": redact(str(exc)),
+                }
+            )
             payload = client.validate_content(
                 model_id,
                 branch_id=branch_id,
@@ -60,6 +77,7 @@ def generate_downstream_dependencies(
         "generated_at": dt.datetime.utcnow().isoformat(timespec="seconds") + "Z",
         "generation_mode": mode,
         "searches": searches,
+        "coverage_gaps": coverage_gaps,
         "dependencies": dependencies,
     }
 

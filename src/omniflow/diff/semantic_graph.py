@@ -34,6 +34,8 @@ def _infer_kind(file_path: str, payload: dict[str, Any]) -> str:
     lower = file_path.lower()
     if lower.endswith(".topic") or ".topic." in lower:
         return "topic"
+    if lower.endswith(".composite_topic") or ".composite_topic." in lower:
+        return "topic"
     if "relationship" in lower:
         return "relationship"
     if payload.get("type") == "topic" or "base_view" in payload:
@@ -79,4 +81,3 @@ def _add_relationships(graph: SemanticGraph, file_path: str, payload: dict[str, 
     for name, relationship in items:
         if isinstance(relationship, dict):
             graph.relationships[str(name)] = {"file": file_path, "name": str(name), **relationship}
-

@@ -74,7 +74,7 @@ def _relationship_property_changes(base_relationships: dict[str, Any], head_rela
     for name in sorted(set(base_relationships) & set(head_relationships)):
         base = base_relationships[name]
         head = head_relationships[name]
-        for key in ("relationship", "cardinality", "type"):
+        for key in ("relationship", "relationship_type", "cardinality", "type"):
             if base.get(key) != head.get(key):
                 changes.append(_change("relationship_cardinality_changed", head, name, "warning", "Join relationship/cardinality changed."))
                 break

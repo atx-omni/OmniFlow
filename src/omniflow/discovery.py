@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .exceptions import ConfigError
+from .exceptions import ConfigError, SecurityPolicyError
 from .git import current_branch
 from .security import reject_secret_keys
 
@@ -55,12 +55,12 @@ def discover_contexts(
         raise ConfigError("Missing model identity. Use --auto or provide --base-url and --model-id.")
 
     marker = load_pr_marker()
-    if marker.get("base_url") and marker.get("model_id"):
+    if base_url and marker.get("model_id"):
         context = _model_from_payload(
             {
-                "base_url": marker["base_url"],
+                "base_url": base_url,
                 "model_id": marker["model_id"],
-                "model_path": marker.get("model_path") or "",
+                "model_path": marker.get("model_path") or model_path or "",
                 "base_branch": marker.get("base_branch"),
                 "git_provider": marker.get("git_provider"),
                 "web_url": marker.get("web_url"),
@@ -71,6 +71,11 @@ def discover_contexts(
         if branch_id:
             context.branch_id = branch_id
         return [context]
+    if marker.get("base_url"):
+        raise SecurityPolicyError(
+            "OmniFlow PR markers cannot provide base_url by default. "
+            "Use .omni/flow.json, OMNI_BASE_URL, or --base-url from a trusted workflow source."
+        )
 
     if allow_skip and not marker and not Path(flow_path).exists():
         return []
@@ -121,7 +126,10 @@ def load_pr_marker() -> dict[str, Any]:
     match = PR_MARKER_RE.search(body)
     if not match:
         return {}
-    payload = json.loads(match.group(1))
+    try:
+        payload = json.loads(match.group(1))
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"OmniFlow PR marker contains invalid JSON: {exc.msg}") from exc
     if not isinstance(payload, dict):
         raise ConfigError("OmniFlow PR marker must contain a JSON object")
     reject_secret_keys(payload, source="omniflow-context PR marker")
@@ -179,6 +187,8 @@ def select_model_contexts(
     if matched:
         return matched
     if allow_skip and changed_files:
+        return []
+    if allow_skip and not changed_files:
         return []
     if len(models) == 1:
         return models

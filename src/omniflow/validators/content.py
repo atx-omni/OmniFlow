@@ -243,6 +243,7 @@ def run_content_validation(
     fail_on_new_only: bool,
     max_samples: int = 20,
     redact_document_names: bool = False,
+    allow_raw_response_output: bool = False,
 ) -> tuple[dict[str, Any], int]:
     payload = client.validate_content(
         model_id,
@@ -263,7 +264,12 @@ def run_content_validation(
             payload = filter_validator_payload(payload, set(records_by_identifier))
         payload = enrich_validator_payload(payload, records_by_identifier)
 
-    normalized = normalize_issues(_redact_issue_names(extract_issues(payload), redact_document_names))
+    safe_issues = _sanitize_issues(
+        extract_issues(payload),
+        redact_document_names=redact_document_names,
+        allow_raw_response_output=allow_raw_response_output,
+    )
+    normalized = normalize_issues(safe_issues)
     previous_payload = load_json(history_in) or {}
     previous = compare_history_labels(previous_payload, labels) if previous_payload else []
     new_items, existing_items, resolved_items = partition_issues(normalized, previous)
@@ -303,6 +309,28 @@ def run_content_validation(
     )
     exit_code = 1 if (len(new_items) if fail_on_new_only else len(normalized)) > 0 else 0
     return report, exit_code
+
+
+def _sanitize_issues(
+    issues: list[Any],
+    *,
+    redact_document_names: bool,
+    allow_raw_response_output: bool,
+) -> list[Any]:
+    redacted = []
+    for issue in issues:
+        if isinstance(issue, dict):
+            next_issue = dict(issue)
+            if not allow_raw_response_output:
+                next_issue.pop("raw_issue", None)
+            if redact_document_names:
+                for key in ("document_name", "query_name"):
+                    if key in next_issue:
+                        next_issue[key] = "[REDACTED]"
+            redacted.append(next_issue)
+        else:
+            redacted.append(issue)
+    return redacted
 
 
 def _redact_issue_names(issues: list[Any], enabled: bool) -> list[Any]:

@@ -49,7 +49,14 @@ class OmniClientTests(unittest.TestCase):
         self.assertEqual(client.validate_model("model-1"), [])
         self.assertEqual(len(session.calls), 2)
 
+    def test_content_validator_find_type_uses_documented_enum_values(self):
+        session = FakeSession([FakeResponse({"content": []})])
+        client = OmniClient(base_url="https://omni.example", api_key="secret", session=session)
+        client.search_content_references("model-1", find="orders.revenue", find_type="field")
+        _, _, kwargs = session.calls[0]
+        self.assertEqual(kwargs["params"]["find"], "orders.revenue")
+        self.assertEqual(kwargs["params"]["find_type"], "FIELD")
+
 
 if __name__ == "__main__":
     unittest.main()
-

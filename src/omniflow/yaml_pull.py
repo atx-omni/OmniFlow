@@ -5,7 +5,10 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .exceptions import ConfigError
 from .omni_client import OmniClient
+
+SUPPORTED_YAML_MODES = {"extension", "staged", "combined"}
 
 
 def pull_yaml(
@@ -18,6 +21,10 @@ def pull_yaml(
     include_checksums: bool = True,
     fully_resolved: bool = False,
 ) -> dict[str, Any]:
+    if mode not in SUPPORTED_YAML_MODES:
+        raise ConfigError(f"Unsupported YAML pull mode '{mode}'. Expected one of: combined, extension, staged.")
+    if branch_id and mode != "combined":
+        raise ConfigError("Omni YAML branch pulls require mode='combined' according to the Omni API contract.")
     payload = client.get_model_yaml(
         model_id,
         branch_id=branch_id,

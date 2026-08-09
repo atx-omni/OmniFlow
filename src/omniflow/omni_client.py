@@ -69,7 +69,7 @@ class OmniClient:
         if find:
             params["find"] = find
         if find_type:
-            params["find_type"] = find_type
+            params["find_type"] = _content_validator_find_type(find_type)
         return self._request("GET", f"/api/v1/models/{model_id}/content-validator", params=params)
 
     def search_content_references(
@@ -132,12 +132,6 @@ class OmniClient:
         if labels:
             params["include"] = "labels"
             params["labels"] = ",".join(labels)
-        if branch_id:
-            params["branch_id"] = branch_id
-        if include_personal_folders:
-            params["include_personal_folders"] = "true"
-        if user_id:
-            params["userId"] = user_id
         return self._paginate("/api/v1/content", params=params)
 
     def _paginate(self, path: str, *, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
@@ -207,3 +201,13 @@ def _retry_after_seconds(value: str | None) -> int | None:
         return max(0, min(60, int(value)))
     except ValueError:
         return None
+
+
+def _content_validator_find_type(value: str) -> str:
+    normalized = value.strip().upper()
+    aliases = {
+        "FIELD": "FIELD",
+        "VIEW": "VIEW",
+        "TOPIC": "TOPIC",
+    }
+    return aliases.get(normalized, normalized)

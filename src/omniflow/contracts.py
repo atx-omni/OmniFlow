@@ -48,14 +48,18 @@ def evaluate_contracts(
             "referenced_breaking": len(failing),
             "referenced": sum(1 for impact in impacts if impact["referenced"]),
             "unreferenced": sum(1 for impact in impacts if not impact["referenced"]),
+            "dependency_generation_mode": dependencies.get("generation_mode"),
+            "dependency_coverage_gaps": len(dependencies.get("coverage_gaps", [])) if isinstance(dependencies.get("coverage_gaps"), list) else 0,
         },
+        "dependency_generation_mode": dependencies.get("generation_mode"),
+        "coverage_gaps": dependencies.get("coverage_gaps", []) if isinstance(dependencies.get("coverage_gaps"), list) else [],
         "issues": impacts,
     }
     return report, 1 if failing else 0
 
 
-def _index_references(dependencies: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
-    indexed: dict[str, list[dict[str, Any]]] = {}
+def _index_references(dependencies: dict[str, Any]) -> dict[tuple[str | None, str], list[dict[str, Any]]]:
+    indexed: dict[tuple[str | None, str], list[dict[str, Any]]] = {}
     for item in dependencies.get("dependencies", []):
         if not isinstance(item, dict):
             continue
@@ -71,25 +75,41 @@ def _index_references(dependencies: dict[str, Any]) -> dict[str, list[dict[str, 
         for ref in item.get("references", []):
             if not isinstance(ref, dict) or not isinstance(ref.get("name"), str):
                 continue
-            indexed.setdefault(ref["name"], []).append(content)
+            ref_type = ref.get("type") if isinstance(ref.get("type"), str) else None
+            indexed.setdefault((ref_type, ref["name"]), []).append(content)
     return indexed
 
 
-def _content_for_change(change: dict[str, Any], references: dict[str, list[dict[str, Any]]]) -> list[dict[str, Any]]:
+def _content_for_change(change: dict[str, Any], references: dict[tuple[str | None, str], list[dict[str, Any]]]) -> list[dict[str, Any]]:
     names = []
     for key in ("field", "previous_field", "name", "previous_name"):
         value = change.get(key)
         if isinstance(value, str) and value:
             names.append(value)
+    ref_types = _reference_types_for_change(change)
     deduped: list[dict[str, Any]] = []
     seen = set()
     for name in names:
-        for content in references.get(name, []):
-            identity = (content.get("content_id"), content.get("query_id"), name)
-            if identity not in seen:
-                seen.add(identity)
-                deduped.append(content)
+        for ref_type in ref_types:
+            for content in references.get((ref_type, name), []):
+                identity = (content.get("content_id"), content.get("query_id"), ref_type, name)
+                if identity not in seen:
+                    seen.add(identity)
+                    deduped.append(content)
     return deduped
+
+
+def _reference_types_for_change(change: dict[str, Any]) -> tuple[str | None, ...]:
+    change_type = str(change.get("type") or "")
+    if change.get("field") or change.get("previous_field") or change_type.startswith("field_") or change_type.startswith("measure_"):
+        return ("field",)
+    if change_type.startswith("view_"):
+        return ("view",)
+    if change_type.startswith("topic_"):
+        return ("topic",)
+    if change_type.startswith("relationship_"):
+        return ("relationship", "field")
+    return (None, "field", "view", "topic", "relationship")
 
 
 def _impact_level(change: dict[str, Any], referenced_content: list[dict[str, Any]]) -> str:

@@ -139,7 +139,7 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(contexts[0].model_id, "b")
         self.assertEqual(contexts[0].branch_name, "feature/content")
 
-    def test_pr_marker_can_provide_complete_model_context_without_flow_file(self):
+    def test_pr_marker_cannot_provide_base_url_without_trusted_source(self):
         with temporary_workdir() as tmp:
             event = {
                 "pull_request": {
@@ -148,11 +148,46 @@ class DiscoveryTests(unittest.TestCase):
             }
             write_json(tmp / "event.json", event)
             with mock.patch.dict(os.environ, {"GITHUB_EVENT_PATH": str(tmp / "event.json")}, clear=True):
-                contexts = discover_contexts(auto=True)
+                with self.assertRaises(SecurityPolicyError):
+                    discover_contexts(auto=True)
+
+    def test_pr_marker_uses_trusted_base_url_override_without_flow_file(self):
+        with temporary_workdir() as tmp:
+            event = {
+                "pull_request": {
+                    "body": '<!-- omniflow-context {"model_id":"model-1","model_path":"omni/model","branch_name":"feature/a"} -->'
+                }
+            }
+            write_json(tmp / "event.json", event)
+            with mock.patch.dict(os.environ, {"GITHUB_EVENT_PATH": str(tmp / "event.json")}, clear=True):
+                contexts = discover_contexts(auto=True, base_url="https://omni.example")
         self.assertEqual(len(contexts), 1)
         self.assertEqual(contexts[0].base_url, "https://omni.example")
         self.assertEqual(contexts[0].model_id, "model-1")
         self.assertEqual(contexts[0].model_path, "omni/model")
+
+    def test_auto_routing_skips_single_model_when_changed_files_unavailable(self):
+        with temporary_workdir() as tmp:
+            write_json(
+                tmp / ".omni/flow.json",
+                {
+                    "version": 1,
+                    "models": [
+                        {"base_url": "https://omni.example", "model_id": "a", "model_path": "omni/a"},
+                    ],
+                },
+            )
+            with mock.patch.dict(os.environ, {"GITHUB_HEAD_REF": "feature/dbt"}, clear=True):
+                contexts = discover_contexts(auto=True, allow_skip=True)
+        self.assertEqual(contexts, [])
+
+    def test_malformed_pr_marker_is_config_error(self):
+        with temporary_workdir() as tmp:
+            event = {"pull_request": {"body": '<!-- omniflow-context {"model_id":} -->'}}
+            write_json(tmp / "event.json", event)
+            with mock.patch.dict(os.environ, {"GITHUB_EVENT_PATH": str(tmp / "event.json")}, clear=True):
+                with self.assertRaises(ConfigError):
+                    load_pr_marker()
 
     def test_ambiguous_multi_model_without_marker_fails(self):
         with temporary_workdir() as tmp:
@@ -238,15 +273,46 @@ class ContractImpactTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(report["issues"][0]["impact_level"], "referenced_safe")
 
+    def test_reference_type_mismatch_does_not_match_contract_impact(self):
+        report, exit_code = evaluate_contracts(
+            diff_result={"changes": [{"type": "field_deleted", "field": "orders", "risk": "breaking"}]},
+            dependencies={
+                "dependencies": [
+                    {
+                        "content_id": "dash-1",
+                        "references": [{"type": "topic", "name": "orders"}],
+                    }
+                ]
+            },
+            settings=ContractSettings(),
+            model_id="model-1",
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(report["issues"][0]["impact_level"], "unreferenced")
+
+    def test_contract_report_includes_dependency_coverage(self):
+        dependencies = self.dependencies()
+        dependencies["generation_mode"] = "targeted_partial"
+        dependencies["coverage_gaps"] = [{"type": "field", "name": "orders.margin", "message": "unavailable"}]
+        report, _ = evaluate_contracts(
+            diff_result={"changes": [{"type": "field_deleted", "field": "orders.revenue", "risk": "breaking"}]},
+            dependencies=dependencies,
+            settings=ContractSettings(),
+            model_id="model-1",
+        )
+        self.assertEqual(report["dependency_generation_mode"], "targeted_partial")
+        self.assertEqual(report["summary"]["dependency_coverage_gaps"], 1)
+
 
 class FakeDependencyClient:
-    def __init__(self, *, fail_targeted=False):
+    def __init__(self, *, fail_targeted=False, fail_after_first=False):
         self.fail_targeted = fail_targeted
+        self.fail_after_first = fail_after_first
         self.searches = []
 
     def search_content_references(self, model_id, *, find, find_type, **kwargs):
         self.searches.append((find_type, find))
-        if self.fail_targeted:
+        if self.fail_targeted or (self.fail_after_first and len(self.searches) > 1):
             raise OmniAPIError("targeted search unavailable")
         return {
             "content": [
@@ -300,6 +366,22 @@ class DownstreamGenerationTests(unittest.TestCase):
         )
         self.assertEqual(dependency_graph["generation_mode"], "full_validation_fallback")
         self.assertEqual(dependency_graph["dependencies"][0]["content_id"], "dash-fallback")
+
+    def test_partial_targeted_failure_preserves_successful_dependencies(self):
+        dependency_graph = generate_downstream_dependencies(
+            client=FakeDependencyClient(fail_after_first=True),
+            model_id="model-1",
+            branch_id="branch-1",
+            diff_result={
+                "changes": [
+                    {"type": "field_deleted", "field": "orders.revenue"},
+                    {"type": "field_deleted", "field": "orders.margin"},
+                ]
+            },
+        )
+        self.assertEqual(dependency_graph["generation_mode"], "targeted_partial")
+        self.assertEqual(dependency_graph["dependencies"][0]["content_id"], "dash-1")
+        self.assertEqual(dependency_graph["coverage_gaps"][0]["name"], "orders.margin")
 
 
 if __name__ == "__main__":

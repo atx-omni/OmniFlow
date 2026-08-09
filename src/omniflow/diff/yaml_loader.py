@@ -10,7 +10,7 @@ def load_yaml_files(root: str | Path) -> dict[str, Any]:
     base = Path(root)
     files: dict[str, Any] = {}
     for path in sorted(base.rglob("*")):
-        if not path.is_file() or path.suffix not in {".yaml", ".yml", ".view", ".topic"}:
+        if not path.is_file() or path.suffix not in {".yaml", ".yml", ".view", ".topic", ".composite_topic"}:
             continue
         rel = path.relative_to(base).as_posix()
         text = path.read_text(encoding="utf-8")
@@ -24,4 +24,3 @@ def parse_yaml_file_map(files: dict[str, str]) -> dict[str, Any]:
         if isinstance(text, str):
             parsed[name] = yaml.safe_load(text) or {}
     return parsed
-

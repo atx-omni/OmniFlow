@@ -83,6 +83,65 @@ class ContentModelTests(unittest.TestCase):
         self.assertEqual(report["new_issues"], 1)
         self.assertEqual(exit_code, 1)
 
+    def test_content_validation_strips_raw_issue_by_default(self):
+        client = FakeClient()
+        client.content_payload = {
+            "content": [
+                {
+                    "identifier": "dash-1",
+                    "name": "Revenue",
+                    "queries_and_issues": [
+                        {"query_name": "Q1", "issues": [{"message": "Broken field", "secretish_detail": "raw"}]}
+                    ],
+                }
+            ]
+        }
+        client.content_records = [{"identifier": "dash-1"}]
+        with tempfile.TemporaryDirectory() as tmp:
+            report, _ = run_content_validation(
+                client=client,
+                model_id="model-1",
+                branch_id=None,
+                user_id=None,
+                include_personal_folders=False,
+                labels=[],
+                history_in=Path(tmp) / "history.json",
+                history_out=Path(tmp) / "history.json",
+                report_out=Path(tmp) / "report.json",
+                fail_on_new_only=False,
+            )
+        self.assertNotIn("raw_issue", report["issues"][0]["raw"])
+
+    def test_content_validation_can_include_raw_issue_when_explicitly_enabled(self):
+        client = FakeClient()
+        client.content_payload = {
+            "content": [
+                {
+                    "identifier": "dash-1",
+                    "name": "Revenue",
+                    "queries_and_issues": [
+                        {"query_name": "Q1", "issues": [{"message": "Broken field", "debug_detail": "raw"}]}
+                    ],
+                }
+            ]
+        }
+        client.content_records = [{"identifier": "dash-1"}]
+        with tempfile.TemporaryDirectory() as tmp:
+            report, _ = run_content_validation(
+                client=client,
+                model_id="model-1",
+                branch_id=None,
+                user_id=None,
+                include_personal_folders=False,
+                labels=[],
+                history_in=Path(tmp) / "history.json",
+                history_out=Path(tmp) / "history.json",
+                report_out=Path(tmp) / "report.json",
+                fail_on_new_only=False,
+                allow_raw_response_output=True,
+            )
+        self.assertIn("raw_issue", report["issues"][0]["raw"])
+
     def test_model_validation_parsing_and_exit_policy(self):
         client = FakeClient()
         client.model_payload = [{"message": "Warn", "is_warning": True}, {"message": "Error", "is_warning": False}]
@@ -94,4 +153,3 @@ class ContentModelTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

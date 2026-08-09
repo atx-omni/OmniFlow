@@ -275,6 +275,7 @@ def _run_context(
             fail_on_new_only=config.content_validation.fail_on_new_only,
             max_samples=config.security.max_report_samples,
             redact_document_names=config.security.redact_document_names,
+            allow_raw_response_output=config.security.allow_raw_response_output,
         )
         reports.append(content_report)
         all_issues.extend(content_report.get("issues", []))
@@ -318,6 +319,7 @@ def _run_context(
             head_graph,
             configured_rules=config.semantic_lint.rules,
             include_personal_folders=config.omni.include_personal_folders,
+            diff_result=diff_report,
         )
         lint_report = {
             "tool": "omniflow",
@@ -383,6 +385,7 @@ def cmd_content_validate(args: argparse.Namespace) -> int:
         fail_on_new_only=fail_on_new_only,
         max_samples=config.security.max_report_samples,
         redact_document_names=config.security.redact_document_names,
+        allow_raw_response_output=config.security.allow_raw_response_output,
     )
     print(
         "Content validator results: "
@@ -445,8 +448,10 @@ def cmd_report(args: argparse.Namespace) -> int:
 def cmd_doctor(args: argparse.Namespace) -> int:
     config = _override_config(load_config(args.config), args)
     missing = []
-    if not require_api_key():
+    api_key = require_api_key()
+    if not api_key:
         missing.append("OMNI_API_KEY")
+    contexts = []
     if args.auto:
         contexts = discover_contexts(
             auto=True,
@@ -465,7 +470,14 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             missing.append("--model-id or OMNI_MODEL_ID")
     if missing:
         raise ConfigError(f"Missing required values: {', '.join(missing)}")
-    print("omniflow doctor passed")
+    issues = []
+    for context in contexts:
+        client = OmniClient(base_url=context.base_url, api_key=api_key, timeout=config.omni.timeout)
+        git_config = client.get_git_configuration(context.model_id)
+        issues.extend(_git_configuration_issues(context, git_config))
+    if issues:
+        raise ConfigError("Omni Git configuration mismatch: " + "; ".join(issues))
+    print(f"omniflow doctor passed: {len(contexts) or 1} model context(s) ready")
     return 0
 
 
@@ -487,6 +499,11 @@ def _client_and_branch_for_context(context: ModelContext, timeout: int):
         timeout=timeout,
     )
     branch_id = context.branch_id or client.resolve_branch_id(context.model_id, context.branch_name)
+    if context.branch_name and not branch_id:
+        raise ConfigError(
+            f"Could not resolve Omni branch '{context.branch_name}' for model {context.model_id}. "
+            "Verify the Omni PR branch exists and the API key can list model branches."
+        )
     return client, branch_id
 
 
@@ -585,6 +602,26 @@ def _context_dict(context: ModelContext) -> dict[str, Any]:
         "git_provider": context.git_provider,
         "web_url": context.web_url,
     }
+
+
+def _git_configuration_issues(context: ModelContext, git_config: dict[str, Any]) -> list[str]:
+    checks = [
+        ("model_path", context.model_path, git_config.get("modelPath")),
+        ("base_branch", context.base_branch, git_config.get("baseBranch")),
+        ("git_provider", context.git_provider, git_config.get("gitServiceProvider")),
+        ("web_url", context.web_url, git_config.get("webUrl")),
+    ]
+    issues = []
+    for label, expected, actual in checks:
+        if not expected or actual is None:
+            continue
+        if _normalize_git_config_value(expected) != _normalize_git_config_value(actual):
+            issues.append(f"{label} expected {expected!r} but Omni reports {actual!r}")
+    return issues
+
+
+def _normalize_git_config_value(value: Any) -> str:
+    return str(value).strip().strip("/").lower()
 
 
 
