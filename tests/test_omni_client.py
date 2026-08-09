@@ -30,6 +30,12 @@ class FakeSession:
         return self.responses.pop(0)
 
 
+class FailingSession(FakeSession):
+    def request(self, method, url, **kwargs):
+        self.calls.append((method, url, kwargs))
+        raise self.responses.pop(0)
+
+
 class InvalidJsonResponse(FakeResponse):
     def json(self):
         raise ValueError("private response fragment")
@@ -197,6 +203,176 @@ class OmniClientTests(unittest.TestCase):
         )
         with self.assertRaises(ConfigError):
             client.list_content(labels=["Verified"], include_personal_folders=True)
+
+    def test_ai_job_methods_use_branch_and_discard_data_bearing_fields(self):
+        session = FakeSession(
+            [
+                FakeResponse(
+                    {
+                        "jobId": "job-1",
+                        "conversationId": "conversation-1",
+                        "omniChatUrl": "https://omni.example/chat/conversation-1",
+                    },
+                    status_code=201,
+                ),
+                FakeResponse(
+                    {
+                        "id": "job-1",
+                        "state": "COMPLETE",
+                        "prompt": "private prompt",
+                        "resultSummary": "private query result",
+                    }
+                ),
+            ]
+        )
+        client = OmniClient(base_url="https://omni.example", api_key=FAKE_API_KEY, session=session)
+        self.assertEqual(
+            client.create_ai_job("model-1", branch_id="branch-1", prompt="Fix validation errors"),
+            {"job_id": "job-1"},
+        )
+        self.assertEqual(client.get_ai_job_status("job-1"), {"job_id": "job-1", "state": "COMPLETE"})
+        self.assertEqual(
+            session.calls[0][2]["json"],
+            {"modelId": "model-1", "branchId": "branch-1", "prompt": "Fix validation errors"},
+        )
+
+    def test_ai_status_rejects_mismatched_job_and_unknown_state(self):
+        for payload in (
+            {"id": "other-job", "state": "COMPLETE"},
+            {"id": "job-1", "state": "SURPRISE"},
+        ):
+            with self.subTest(payload=payload):
+                client = OmniClient(
+                    base_url="https://omni.example",
+                    api_key=FAKE_API_KEY,
+                    session=FakeSession([FakeResponse(payload)]),
+                )
+                with self.assertRaises(OmniAPIError):
+                    client.get_ai_job_status("job-1")
+
+    def test_ai_job_cancellation_uses_idempotent_documented_endpoint(self):
+        session = FakeSession([FakeResponse({"jobId": "job-1", "state": "CANCELLED"})])
+        client = OmniClient(base_url="https://omni.example", api_key=FAKE_API_KEY, session=session)
+        self.assertEqual(client.cancel_ai_job("job-1"), {"job_id": "job-1", "state": "CANCELLED"})
+        self.assertEqual(session.calls[0][0], "POST")
+        self.assertEqual(session.calls[0][1], "https://omni.example/api/v1/ai/jobs/job-1/cancel")
+
+    def test_yaml_write_delete_and_git_commit_use_documented_contracts(self):
+        session = FakeSession(
+            [
+                FakeResponse({"fileName": "orders.view", "success": True}),
+                FakeResponse({"fileName": "temporary.view", "success": True}),
+                FakeResponse(
+                    {
+                        "pr_url": "https://github.com/example/repo/pull/1",
+                        "git_sha": "abc123",
+                        "in_sync": False,
+                        "did_sync": True,
+                    }
+                ),
+            ]
+        )
+        client = OmniClient(base_url="https://omni.example", api_key=FAKE_API_KEY, session=session)
+        client.update_model_yaml(
+            "model-1",
+            branch_id="branch-1",
+            file_name="orders.view",
+            yaml_text="name: orders\n",
+            previous_checksum="checksum-1",
+            commit_message="OmniFlow rollback",
+        )
+        client.delete_model_yaml(
+            "model-1",
+            branch_id="branch-1",
+            file_name="temporary.view",
+            commit_message="OmniFlow rollback",
+        )
+        commit = client.commit_model_branch(
+            "model-1",
+            branch_id="branch-1",
+            commit_message="OmniFlow AI repair",
+        )
+        self.assertEqual(commit["git_sha"], "abc123")
+        self.assertEqual(
+            session.calls[0][2]["json"],
+            {
+                "fileName": "orders.view",
+                "yaml": "name: orders\n",
+                "mode": "combined",
+                "branchId": "branch-1",
+                "commitMessage": "OmniFlow rollback",
+                "previousChecksum": "checksum-1",
+            },
+        )
+        self.assertEqual(session.calls[1][0], "DELETE")
+        self.assertEqual(session.calls[1][2]["params"]["branchId"], "branch-1")
+        self.assertEqual(
+            session.calls[2][2]["json"],
+            {
+                "branch_id": "branch-1",
+                "commit_message": "OmniFlow AI repair",
+                "allow_branch_exists": True,
+                "require_branch_exists": True,
+            },
+        )
+
+    def test_non_idempotent_writes_are_never_retried(self):
+        for call in ("ai", "yaml", "delete", "commit"):
+            with self.subTest(call=call):
+                session = FakeSession([FakeResponse({}, status_code=500)])
+                client = OmniClient(base_url="https://omni.example", api_key=FAKE_API_KEY, session=session)
+                with self.assertRaises(OmniAPIError):
+                    if call == "ai":
+                        client.create_ai_job("model-1", branch_id="branch-1", prompt="Fix errors")
+                    elif call == "yaml":
+                        client.update_model_yaml(
+                            "model-1",
+                            branch_id="branch-1",
+                            file_name="orders.view",
+                            yaml_text="name: orders\n",
+                            previous_checksum="checksum-1",
+                            commit_message="Rollback",
+                        )
+                    elif call == "delete":
+                        client.delete_model_yaml(
+                            "model-1",
+                            branch_id="branch-1",
+                            file_name="orders.view",
+                            commit_message="Rollback",
+                        )
+                    else:
+                        client.commit_model_branch(
+                            "model-1",
+                            branch_id="branch-1",
+                            commit_message="AI repair",
+                        )
+                self.assertEqual(len(session.calls), 1)
+
+    def test_non_idempotent_transport_failure_is_not_retried_or_leaked(self):
+        from requests import ConnectionError
+
+        session = FailingSession([ConnectionError("Bearer private-token")])
+        client = OmniClient(base_url="https://omni.example", api_key=FAKE_API_KEY, session=session)
+        with self.assertRaises(OmniAPIError) as raised:
+            client.create_ai_job("model-1", branch_id="branch-1", prompt="Fix errors")
+        self.assertEqual(len(session.calls), 1)
+        self.assertNotIn("private-token", str(raised.exception))
+
+    def test_write_methods_reject_unsupported_file_names_and_multiline_messages(self):
+        client = OmniClient(base_url="https://omni.example", api_key=FAKE_API_KEY, session=FakeSession([]))
+        with self.assertRaises(ConfigError):
+            client.delete_model_yaml(
+                "model-1",
+                branch_id="branch-1",
+                file_name="model",
+                commit_message="Rollback",
+            )
+        with self.assertRaises(ConfigError):
+            client.commit_model_branch(
+                "model-1",
+                branch_id="branch-1",
+                commit_message="line one\nline two",
+            )
 
 
 if __name__ == "__main__":

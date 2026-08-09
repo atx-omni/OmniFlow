@@ -28,9 +28,12 @@ checks:
       warn_relationship_cardinality_change: warn
       require_topic_labels: warn
 
-  dbt_exposures:
-    enabled: false
-    fail_on_unavailable: false
+  # Optional: add published Omni dashboard-to-dbt model lineage to reports.
+  # Requires a configured Omni dbt integration and Connection Admin permission.
+  # Leave this commented out when the Omni connection does not use dbt.
+  # dbt_exposures:
+  #   enabled: true
+  #   fail_on_unavailable: false
 
 reporting:
   formats:
@@ -47,3 +50,14 @@ security:
   redact_document_names: false
   redaction_level: standard
   retain_restricted_artifacts: false
+
+# Unreleased development scaffold: human-authorized Omni Modeling Agent repair.
+# Do not enable for customer use until Omni publishes a supported Modeling Agent API.
+# Omni's documented AI Jobs API may execute queries and has no no-query switch.
+# repairs:
+#   ai:
+#     enabled: true
+#     allow_query_execution: true
+#     max_changed_files: 3
+#     max_changed_lines: 200
+#     poll_timeout_seconds: 300

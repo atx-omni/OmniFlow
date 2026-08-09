@@ -140,7 +140,7 @@ After the first successful run:
 3. Confirm the existing pull-request, approval, CODEOWNER, force-push, and deletion protections remain enabled.
 4. Confirm Omni's pull-request webhook is configured so approved merges remain synchronized with Omni.
 
-OmniFlow validates and reports; it does not merge the pull request or write model YAML. After approval and merge, Omni Git integration performs the configured promotion behavior.
+Core OmniFlow validation validates and reports; it does not merge the pull request or write model YAML. After approval and merge, Omni Git integration performs the configured promotion behavior.
 
 ## Step 9: Verify The Installation
 
@@ -160,3 +160,18 @@ The installation is ready for controlled alpha use when all of these are true:
 - [ ] Omni's post-merge Git integration behavior has been verified separately.
 
 For setup failures, continue with [Troubleshooting](TROUBLESHOOTING.md). For safe diagnostic sharing, see [Support](../SUPPORT.md).
+
+## Step 10: Do Not Install AI Repair Yet
+
+The repository contains an AI Repair development scaffold, but it is not supported for customer installation. Omni's documented AI Jobs API may execute queries and does not document the Modeling Agent mutation behavior required by the workflow.
+
+The future design in [OmniFlow AI Repair Development Scaffold](AI_REPAIR.md) requires:
+
+1. Create the protected `omniflow-ai-repair` GitHub environment with required reviewers.
+2. Store the separate `OMNIFLOW_REPAIR_API_KEY` as an environment secret.
+3. Enable `repairs.ai` with explicit query-execution acknowledgement.
+4. Add the pinned `.github/workflows/omniflow-ai-repair.yml` workflow.
+5. Create the exact `omniflow-ai-repair` authorization label.
+6. Prove repair, rollback, PR update, and independent rerun behavior on a non-production model.
+
+Keep `repairs.ai.enabled: false`, do not install the repair workflow, and do not create a repair PAT. Ordinary validation remains fully supported without AI Repair.

@@ -53,7 +53,15 @@ def write_artifact_manifest(
     root = Path(output_dir)
     public_artifacts = [
         f"{PUBLIC_DIR}/{name}"
-        for name in ("report.json", "report.md", "report.sarif", "junit.xml", "evidence.json")
+        for name in (
+            "report.json",
+            "report.md",
+            "report.sarif",
+            "junit.xml",
+            "evidence.json",
+            "repair.json",
+            "repair.md",
+        )
         if (root / PUBLIC_DIR / name).is_file()
     ]
     manifest = {

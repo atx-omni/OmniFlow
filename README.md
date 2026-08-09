@@ -28,7 +28,7 @@ After the first live run succeeds, make the OmniFlow check required in GitHub br
 - Optional, branch-aware dbt exposure metadata
 - JSON, Markdown, SARIF, JUnit, and evidence artifacts
 
-OmniFlow does not execute warehouse queries, store query results, merge pull requests, or deploy model files directly.
+Core OmniFlow validation does not execute warehouse queries, store query results, write model YAML, or merge pull requests. An [AI Repair development scaffold](docs/AI_REPAIR.md) is present but is disabled, unreleased, and not supported for customer installation because Omni does not currently document a public Modeling Agent mutation API.
 
 ## End-User Flow
 
@@ -41,6 +41,8 @@ OmniFlow does not execute warehouse queries, store query results, merge pull req
 7. The pull request receives a redacted reviewer summary; detailed artifacts remain restricted to the runner unless explicitly uploaded.
 8. GitHub branch protection blocks merge when required OmniFlow checks fail.
 9. After review and approval, the pull request is merged. Omni's configured pull-request webhook promotes the Omni branch and publishes associated draft content.
+
+The unreleased AI Repair scaffold is not part of this customer workflow. It must remain disabled until Omni publishes a supported Modeling Agent API contract.
 
 The final promotion is Omni Git integration behavior, not an OmniFlow API write. See [Omni Branch Mode](https://docs.omni.co/content/develop/branch-mode) and [Git integration settings](https://docs.omni.co/integrations/git/settings).
 
@@ -114,6 +116,10 @@ checks:
 
 Make the OmniFlow job a required GitHub check and require pull-request approval. Confirm the Omni pull-request webhook is configured; Omni documents that it is required to keep Git and Omni branches synchronized.
 
+### 6. AI Repair Development Status
+
+Do not install AI Repair for customer use. The repository contains a guarded development scaffold, but the documented AI Jobs API is query-oriented and does not expose the Modeling Agent's branch-editing behavior. See [AI Repair Development Scaffold](docs/AI_REPAIR.md) for the blocker and safety design.
+
 ## Trust And Routing
 
 The example uses GitHub's `pull_request_target` event but never checks out or executes proposed PR code. OmniFlow retrieves changed filenames through GitHub's API and reads `.omni/flow.json`, `.omniflow.yml`, and the workflow itself from the trusted base branch. This prevents a same-repository pull request from changing `base_url`, disabling gates, enabling unsafe output, replacing the action, or redirecting `OMNI_API_KEY`.
@@ -160,11 +166,14 @@ Public reports exclude API keys, raw payloads, email addresses, document URLs, a
 
 Raw response output cannot be enabled in CI policy. The explicit `--unsafe-raw-output` option exists only on the local `content validate` debugging command.
 
+The unreleased AI Repair scaffold emits `repair.json` and `repair.md` during maintainer testing. These contain status, IDs, file names, counts, validation summaries, rollback status, and commit metadata only. Authored YAML, prompts, AI result summaries, chat URLs, and query results are not persisted by OmniFlow.
+
 ## CLI
 
 ```bash
 omniflow doctor --auto
 omniflow run --auto
+omniflow repair ai --auto
 omniflow content validate --base-url https://example.omniapp.co --model-id <id>
 omniflow model validate --base-url https://example.omniapp.co --model-id <id>
 omniflow yaml pull --base-url https://example.omniapp.co --model-id <id> --out .omniflow/yaml
@@ -180,6 +189,7 @@ Exit codes are `0` success, `1` validation failure, `2` configuration error, `3`
 
 - [Step-by-step installation](docs/INSTALLATION.md)
 - [Configuration reference](docs/CONFIGURATION.md)
+- [AI Repair development scaffold](docs/AI_REPAIR.md)
 - [Troubleshooting](docs/TROUBLESHOOTING.md)
 - [Support and safe diagnostic sharing](SUPPORT.md)
 - [Security policy](SECURITY.md)
@@ -217,6 +227,9 @@ PyPI publication is intentionally disabled until maintainers secure the project 
 - [Omni model validation API](https://docs.omni.co/api/models/validate-model)
 - [Omni Content Validator API](https://docs.omni.co/api/content-validator/validate-content)
 - [Omni dbt exposures API](https://docs.omni.co/api/dbt/get-dbt-exposures)
+- [Omni AI Jobs API](https://docs.omni.co/api/ai/create-ai-job)
+- [Omni AI data security](https://docs.omni.co/ai/security)
+- [Omni Git branch commit API](https://docs.omni.co/api/model-git-configuration/create-or-update-a-pull-request-for-a-model-branch)
 - [Omni Git integration best practices](https://docs.omni.co/integrations/git/best-practices)
 - [GitHub secure workflow guidance](https://docs.github.com/en/actions/reference/security/secure-use)
 - [PyPI Trusted Publisher setup](https://docs.pypi.org/trusted-publishers/creating-a-project-through-oidc/)

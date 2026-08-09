@@ -10,7 +10,7 @@ from typing import Any
 
 from . import __version__
 from .artifacts import public_dir, restricted_dir, write_artifact_manifest, write_public_json, write_public_reports
-from .config import DEFAULT_REPORT_FORMATS, load_config, require_api_key
+from .config import DEFAULT_REPORT_FORMATS, load_config, require_api_key, require_repair_api_key
 from .contracts import evaluate_contracts
 from .diff.diff_engine import diff_graphs
 from .diff.semantic_graph import build_graph
@@ -21,8 +21,11 @@ from .exceptions import ConfigError, ExitCodes, OmniAuthError, OmniFlowError, Se
 from .exposures import run_dbt_exposure_enrichment
 from .git import current_branch, current_sha, event_name, pr_number
 from .github.annotations import annotation_lines
+from .github.repair_attempt import GitHubRepairAttemptGuard, load_repair_event
 from .logging import configure_logging
 from .omni_client import OmniClient
+from .repair.orchestrator import run_ai_repair, validate_ai_repair_policy
+from .repair.reporting import write_repair_artifacts
 from .reporting.json_report import write_json_report
 from .reporting.writer import write_reports
 from .security import redact, validate_repo_output_path
@@ -125,6 +128,14 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_omni_args(doctor)
     doctor.add_argument("--auto", action="store_true", help="Validate Omni-managed metadata discovery")
     doctor.set_defaults(func=cmd_doctor)
+
+    repair = subcommands.add_parser("repair", help="Human-authorized repair commands")
+    repair_sub = repair.add_subparsers(required=True)
+    repair_ai = repair_sub.add_parser("ai", help="Run the opt-in Omni AI model repair workflow")
+    _add_config_arg(repair_ai)
+    _add_common_omni_args(repair_ai)
+    repair_ai.add_argument("--auto", action="store_true", help="Discover the exact pull request model context")
+    repair_ai.set_defaults(func=cmd_repair_ai)
     return parser
 
 
@@ -358,8 +369,9 @@ def _run_context(
     config,
     context: ModelContext,
     output_dir: Path,
+    api_key: str | None = None,
 ) -> tuple[dict[str, Any], int]:
-    client, branch_id = _client_and_branch_for_context(context, config.omni.timeout)
+    client, branch_id = _client_and_branch_for_context(context, config.omni.timeout, api_key=api_key)
     all_issues: list[dict[str, Any]] = []
     reports: list[dict[str, Any]] = []
     exit_code = 0
@@ -649,6 +661,84 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_repair_ai(args: argparse.Namespace) -> int:
+    try:
+        config = _override_config(load_config(args.config), args)
+    except OmniFlowError as exc:
+        _write_repair_setup_failure_artifacts(output_dir=Path(".omniflow"), exc=exc)
+        raise
+    output_dir = Path(config.reporting.output_dir)
+    _validate_run_output_layout(output_dir)
+    try:
+        if not args.auto:
+            raise ConfigError("AI repair requires --auto trusted pull request discovery")
+        validate_ai_repair_policy(config)
+        event = load_repair_event()
+        github_token = os.getenv("OMNIFLOW_GITHUB_TOKEN")
+        if not github_token:
+            raise ConfigError("OMNIFLOW_GITHUB_TOKEN is required for AI repair pull request safeguards")
+        contexts = discover_contexts(
+            auto=True,
+            base_url=config.omni.base_url,
+            model_id=config.omni.model_id,
+            model_path=getattr(args, "model_path", None),
+            branch_name=config.omni.branch_name,
+            branch_id=config.omni.branch_id,
+            allow_skip=False,
+        )
+        if len(contexts) != 1:
+            raise ConfigError("AI repair requires exactly one unambiguous Omni model context")
+        context = contexts[0]
+        repair_key = require_repair_api_key()
+        client, branch_id = _client_and_branch_for_context(context, config.omni.timeout, api_key=repair_key)
+        if not branch_id:
+            raise SecurityPolicyError("AI repair cannot run without an existing Omni development branch")
+        guard = GitHubRepairAttemptGuard(token=github_token)
+        validation_output = restricted_dir(output_dir) / _safe_context_dir(context) / "repair-validation"
+        _validate_context_output_layout(validation_output)
+        outcome = run_ai_repair(
+            config=config,
+            context=context,
+            event=event,
+            client=client,
+            guard=guard,
+            validation_runner=lambda: _run_context(
+                config=config,
+                context=context,
+                output_dir=validation_output,
+                api_key=repair_key,
+            ),
+        )
+        write_repair_artifacts(
+            outcome.report,
+            output_dir=output_dir,
+            redaction_level=config.security.redaction_level,
+        )
+        write_artifact_manifest(
+            output_dir=output_dir,
+            restricted_artifacts_enabled=config.security.retain_restricted_artifacts,
+            redaction_level=config.security.redaction_level,
+        )
+        print(f"OmniFlow AI repair: status={outcome.report['status']} exit_code={outcome.exit_code}")
+        return outcome.exit_code
+    except OmniFlowError as exc:
+        report = _repair_failure_report(config=config, exc=exc)
+        write_repair_artifacts(
+            report,
+            output_dir=output_dir,
+            redaction_level=config.security.redaction_level,
+        )
+        write_artifact_manifest(
+            output_dir=output_dir,
+            restricted_artifacts_enabled=config.security.retain_restricted_artifacts,
+            redaction_level=config.security.redaction_level,
+        )
+        raise
+    finally:
+        if not config.security.retain_restricted_artifacts:
+            _purge_restricted_path(restricted_dir(output_dir))
+
+
 def _client_and_branch(config):
     context = ModelContext(
         base_url=_required(config.omni.base_url, "base_url"),
@@ -838,7 +928,15 @@ def _emit_github_annotations(issues: list[dict[str, Any]], *, limit: int) -> Non
 
 
 def _validate_run_output_layout(output_dir: Path) -> None:
-    report_names = ("report.json", "report.md", "report.sarif", "junit.xml", "evidence.json")
+    report_names = (
+        "report.json",
+        "report.md",
+        "report.sarif",
+        "junit.xml",
+        "evidence.json",
+        "repair.json",
+        "repair.md",
+    )
     for path in (output_dir, public_dir(output_dir), restricted_dir(output_dir)):
         validate_repo_output_path(path)
     for name in report_names:
@@ -920,6 +1018,54 @@ def _write_unconfigured_failure_artifacts(*, output_dir: Path, exc: OmniFlowErro
     }
     write_public_json(output_dir / "evidence.json", evidence, redaction_level="standard")
     write_public_json(public_dir(output_dir) / "evidence.json", evidence, redaction_level="standard")
+    write_artifact_manifest(
+        output_dir=output_dir,
+        restricted_artifacts_enabled=False,
+        redaction_level="standard",
+    )
+
+
+def _repair_failure_report(*, config, exc: OmniFlowError) -> dict[str, Any]:
+    return {
+        "tool": "omniflow",
+        "tool_version": __version__,
+        "operation": "ai_repair_beta",
+        "generated_at": utc_now_iso(),
+        "status": "failed",
+        "message": redact(str(exc)),
+        "model_id": config.omni.model_id,
+        "branch_id": config.omni.branch_id,
+        "branch_name": config.omni.branch_name,
+        "config_hash": config.hash,
+        "query_execution_acknowledged": config.ai_repair.allow_query_execution,
+        "raw_query_results_stored": False,
+        "manual_review_required": False,
+        "policy_decision": "fail",
+        "exit_code": exc.exit_code,
+        "exit_code_reason": _exit_code_reason(exc.exit_code),
+        "issues": [{"validator": "ai_repair", "severity": "error", "message": redact(str(exc))}],
+    }
+
+
+def _write_repair_setup_failure_artifacts(*, output_dir: Path, exc: OmniFlowError) -> None:
+    _validate_run_output_layout(output_dir)
+    _purge_restricted_path(restricted_dir(output_dir))
+    report = {
+        "tool": "omniflow",
+        "tool_version": __version__,
+        "operation": "ai_repair_beta",
+        "generated_at": utc_now_iso(),
+        "status": "failed",
+        "message": redact(str(exc)),
+        "query_execution_acknowledged": False,
+        "raw_query_results_stored": False,
+        "manual_review_required": False,
+        "policy_decision": "fail",
+        "exit_code": exc.exit_code,
+        "exit_code_reason": _exit_code_reason(exc.exit_code),
+        "issues": [{"validator": "ai_repair", "severity": "error", "message": redact(str(exc))}],
+    }
+    write_repair_artifacts(report, output_dir=output_dir, redaction_level="standard")
     write_artifact_manifest(
         output_dir=output_dir,
         restricted_artifacts_enabled=False,
