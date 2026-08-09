@@ -125,6 +125,12 @@ class ContractSettings:
 
 
 @dataclass
+class DbtExposureSettings:
+    enabled: bool = False
+    fail_on_unavailable: bool = False
+
+
+@dataclass
 class ReportingSettings:
     formats: list[str] = field(default_factory=lambda: ["json", "markdown"])
     output_dir: str = ".omniflow"
@@ -136,6 +142,8 @@ class SecuritySettings:
     allow_raw_response_output: bool = False
     max_report_samples: int = 20
     redact_document_names: bool = False
+    redaction_level: str = "standard"
+    retain_restricted_artifacts: bool = True
 
 
 @dataclass
@@ -147,6 +155,7 @@ class OmniCIConfig:
     model_validation: ModelValidationSettings
     semantic_lint: SemanticLintSettings
     contracts: ContractSettings
+    dbt_exposures: DbtExposureSettings
     reporting: ReportingSettings
     security: SecuritySettings
     hash: str
@@ -166,6 +175,7 @@ def _to_config(raw: dict[str, Any], source: Path | None) -> OmniCIConfig:
     content_raw = checks_raw.get("content_validation", {}) or {}
     model_raw = checks_raw.get("model_validation", {}) or {}
     lint_raw = checks_raw.get("semantic_lint", {}) or {}
+    exposures_raw = checks_raw.get("dbt_exposures", {}) or {}
 
     omni = OmniSettings(
         base_url=_string_env("OMNI_BASE_URL", omni_raw.get("base_url")),
@@ -228,6 +238,14 @@ def _to_config(raw: dict[str, Any], source: Path | None) -> OmniCIConfig:
             True,
         ),
     )
+    dbt_exposures = DbtExposureSettings(
+        enabled=parse_bool("dbt_exposures.enabled", exposures_raw.get("enabled"), False),
+        fail_on_unavailable=parse_bool(
+            "dbt_exposures.fail_on_unavailable",
+            exposures_raw.get("fail_on_unavailable"),
+            False,
+        ),
+    )
     reporting = ReportingSettings(
         formats=parse_csv(reporting_raw.get("formats")) or ["json", "markdown"],
         output_dir=str(reporting_raw.get("output_dir") or ".omniflow"),
@@ -241,6 +259,12 @@ def _to_config(raw: dict[str, Any], source: Path | None) -> OmniCIConfig:
         ),
         max_report_samples=int(security_raw.get("max_report_samples", 20) or 20),
         redact_document_names=parse_bool("security.redact_document_names", security_raw.get("redact_document_names"), False),
+        redaction_level=_redaction_level(security_raw.get("redaction_level", "standard")),
+        retain_restricted_artifacts=parse_bool(
+            "security.retain_restricted_artifacts",
+            security_raw.get("retain_restricted_artifacts"),
+            True,
+        ),
     )
     return OmniCIConfig(
         raw=raw,
@@ -250,6 +274,7 @@ def _to_config(raw: dict[str, Any], source: Path | None) -> OmniCIConfig:
         model_validation=model,
         semantic_lint=lint,
         contracts=contracts,
+        dbt_exposures=dbt_exposures,
         reporting=reporting,
         security=security,
         hash=config_hash(raw),
@@ -264,6 +289,17 @@ def _string_env(env_name: str, configured: Any) -> str | None:
         raise ConfigError(f"Expected {env_name} to resolve to a string")
     stripped = value.strip()
     return stripped or None
+
+
+def _redaction_level(value: Any) -> str:
+    if value is None:
+        return "standard"
+    if not isinstance(value, str):
+        raise ConfigError("security.redaction_level must be 'standard' or 'strict'")
+    normalized = value.strip().lower()
+    if normalized not in {"standard", "strict"}:
+        raise ConfigError("security.redaction_level must be 'standard' or 'strict'")
+    return normalized
 
 
 def require_api_key() -> str:

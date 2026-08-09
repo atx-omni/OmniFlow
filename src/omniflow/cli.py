@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import shutil
 import sys
 from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .artifacts import public_dir, restricted_dir, write_artifact_manifest, write_public_json, write_public_reports
 from .config import load_config, require_api_key
 from .contracts import evaluate_contracts
 from .diff.diff_engine import diff_graphs
@@ -16,6 +18,7 @@ from .discovery import ModelContext, discover_contexts
 from .downstream import generate_downstream_dependencies
 from .evidence import build_evidence
 from .exceptions import ConfigError, ExitCodes, OmniCIError
+from .exposures import run_dbt_exposure_enrichment
 from .git import current_branch, current_sha, pr_number
 from .logging import configure_logging
 from .omni_client import OmniClient
@@ -85,6 +88,14 @@ def build_parser() -> argparse.ArgumentParser:
     yaml_pull.add_argument("--fully-resolved", action="store_true")
     yaml_pull.set_defaults(func=cmd_yaml_pull)
 
+    exposures = subcommands.add_parser("exposures", help="dbt exposure commands")
+    exposures_sub = exposures.add_subparsers(required=True)
+    exposures_pull = exposures_sub.add_parser("pull", help="Fetch Omni dbt exposure metadata")
+    _add_config_arg(exposures_pull)
+    _add_common_omni_args(exposures_pull)
+    exposures_pull.add_argument("--out", default=None)
+    exposures_pull.set_defaults(func=cmd_exposures_pull)
+
     diff_parser = subcommands.add_parser("diff", help="Compare semantic YAML")
     diff_parser.add_argument("--base", required=True, help="Directory containing base YAML")
     diff_parser.add_argument("--head", required=True, help="Directory containing head YAML")
@@ -143,18 +154,34 @@ def cmd_run(args: argparse.Namespace) -> int:
     all_issues: list[dict[str, Any]] = []
     exit_code = 0
     for context in contexts:
-        context_report, context_exit = _run_context(
-            config=config,
-            context=context,
-            output_dir=output_dir / _safe_context_dir(context),
-        )
+        context_output_dir = restricted_dir(output_dir) / _safe_context_dir(context)
+        try:
+            context_report, context_exit = _run_context(
+                config=config,
+                context=context,
+                output_dir=context_output_dir,
+            )
+        except OmniCIError as exc:
+            context_report, context_exit = _write_context_failure_artifacts(
+                config=config,
+                context=context,
+                output_dir=context_output_dir,
+                exc=exc,
+            )
+        if not config.security.retain_restricted_artifacts and context_output_dir.exists():
+            shutil.rmtree(context_output_dir)
         all_reports.append(context_report)
         all_issues.extend(context_report.get("issues", []))
         exit_code = max(exit_code, context_exit)
 
     summary = _summarize(all_issues)
     report = _aggregate_report(config, contexts, exit_code, all_issues, summary, all_reports)
-    write_reports(report, output_dir=output_dir, formats=config.reporting.formats)
+    write_public_reports(
+        report,
+        output_dir=output_dir,
+        formats=config.reporting.formats,
+        redaction_level=config.security.redaction_level,
+    )
     evidence = {
         "tool": "omniflow",
         "tool_version": __version__,
@@ -168,7 +195,13 @@ def cmd_run(args: argparse.Namespace) -> int:
         "exit_code": exit_code,
         "timestamp": dt.datetime.utcnow().isoformat(timespec="seconds") + "Z",
     }
-    write_json_report(output_dir / "evidence.json", evidence)
+    write_public_json(output_dir / "evidence.json", evidence, redaction_level=config.security.redaction_level)
+    write_public_json(public_dir(output_dir) / "evidence.json", evidence, redaction_level=config.security.redaction_level)
+    write_artifact_manifest(
+        output_dir=output_dir,
+        restricted_artifacts_enabled=config.security.retain_restricted_artifacts,
+        redaction_level=config.security.redaction_level,
+    )
     print(f"OmniFlow complete: models={len(contexts)} issues={summary['total_issues']} exit_code={exit_code}")
     return exit_code
 
@@ -196,7 +229,12 @@ def _write_setup_failure_artifacts(*, config, output_dir: Path, exc: OmniCIError
         "exit_code": exc.exit_code,
         "exit_code_reason": "configuration error" if exc.exit_code == ExitCodes.CONFIG_ERROR else "setup failed",
     }
-    write_reports(report, output_dir=output_dir, formats=config.reporting.formats)
+    write_public_reports(
+        report,
+        output_dir=output_dir,
+        formats=config.reporting.formats,
+        redaction_level=config.security.redaction_level,
+    )
     evidence = {
         "tool": "omniflow",
         "tool_version": __version__,
@@ -211,7 +249,13 @@ def _write_setup_failure_artifacts(*, config, output_dir: Path, exc: OmniCIError
         "exit_code_reason": report["exit_code_reason"],
         "timestamp": dt.datetime.utcnow().isoformat(timespec="seconds") + "Z",
     }
-    write_json_report(output_dir / "evidence.json", evidence)
+    write_public_json(output_dir / "evidence.json", evidence, redaction_level=config.security.redaction_level)
+    write_public_json(public_dir(output_dir) / "evidence.json", evidence, redaction_level=config.security.redaction_level)
+    write_artifact_manifest(
+        output_dir=output_dir,
+        restricted_artifacts_enabled=config.security.retain_restricted_artifacts,
+        redaction_level=config.security.redaction_level,
+    )
 
 
 def _write_skipped_artifacts(*, config, output_dir: Path) -> None:
@@ -232,7 +276,12 @@ def _write_skipped_artifacts(*, config, output_dir: Path) -> None:
         "exit_code": 0,
         "exit_code_reason": "no Omni PR context or changed Omni model files detected",
     }
-    write_reports(report, output_dir=output_dir, formats=config.reporting.formats)
+    write_public_reports(
+        report,
+        output_dir=output_dir,
+        formats=config.reporting.formats,
+        redaction_level=config.security.redaction_level,
+    )
     evidence = {
         "tool": "omniflow",
         "tool_version": __version__,
@@ -247,7 +296,13 @@ def _write_skipped_artifacts(*, config, output_dir: Path) -> None:
         "exit_code_reason": report["exit_code_reason"],
         "timestamp": dt.datetime.utcnow().isoformat(timespec="seconds") + "Z",
     }
-    write_json_report(output_dir / "evidence.json", evidence)
+    write_public_json(output_dir / "evidence.json", evidence, redaction_level=config.security.redaction_level)
+    write_public_json(public_dir(output_dir) / "evidence.json", evidence, redaction_level=config.security.redaction_level)
+    write_artifact_manifest(
+        output_dir=output_dir,
+        restricted_artifacts_enabled=config.security.retain_restricted_artifacts,
+        redaction_level=config.security.redaction_level,
+    )
 
 
 def _run_context(
@@ -359,11 +414,42 @@ def _run_context(
         all_issues.extend(contract_report.get("issues", []))
         exit_code = max(exit_code, contract_exit)
 
+    if config.dbt_exposures.enabled:
+        exposure_report, exposure_exit = run_dbt_exposure_enrichment(
+            client=client,
+            model_id=context.model_id,
+            settings=config.dbt_exposures,
+        )
+        write_json_report(output_dir / "dbt-exposures.json", exposure_report)
+        reports.append(exposure_report)
+        all_issues.extend(exposure_report.get("issues", []))
+        exit_code = max(exit_code, exposure_exit)
+
     summary = _summarize(all_issues)
     report = _base_report(config, context, branch_id, exit_code, all_issues, summary)
     report["check_reports"] = reports
     write_json_report(output_dir / "report.json", report)
     return report, exit_code
+
+
+def _write_context_failure_artifacts(
+    *,
+    config,
+    context: ModelContext,
+    output_dir: Path,
+    exc: OmniCIError,
+) -> tuple[dict[str, Any], int]:
+    issue = {
+        "severity": "error",
+        "validator": "context",
+        "message": redact(str(exc)),
+    }
+    summary = _summarize([issue])
+    report = _base_report(config, context, context.branch_id, exc.exit_code, [issue], summary)
+    report["check_reports"] = []
+    report["exit_code_reason"] = _exit_code_reason(exc.exit_code)
+    write_json_report(output_dir / "report.json", report)
+    return report, exc.exit_code
 
 
 def cmd_content_validate(args: argparse.Namespace) -> int:
@@ -424,6 +510,20 @@ def cmd_yaml_pull(args: argparse.Namespace) -> int:
     )
     print(f"Pulled {len(manifest['files'])} YAML file(s) to {out}")
     return 0
+
+
+def cmd_exposures_pull(args: argparse.Namespace) -> int:
+    config = _override_config(load_config(args.config), args)
+    client, _ = _client_and_branch(config)
+    report, exit_code = run_dbt_exposure_enrichment(
+        client=client,
+        model_id=_required(config.omni.model_id, "omni.model_id"),
+        settings=config.dbt_exposures,
+    )
+    output_path = Path(args.out or Path(config.reporting.output_dir) / "dbt-exposures.json")
+    write_json_report(output_path, report)
+    print(f"Pulled {report['summary']['total_exposures']} dbt exposure record(s) to {output_path}")
+    return exit_code
 
 
 def cmd_diff(args: argparse.Namespace) -> int:
@@ -579,6 +679,18 @@ def _summarize(issues: list[dict[str, Any]]) -> dict[str, Any]:
         "resolved_issues": sum(1 for issue in issues if issue.get("state") == "resolved"),
         "risk_level": "breaking" if any(issue.get("risk") == "breaking" for issue in issues) else "info",
     }
+
+
+def _exit_code_reason(exit_code: int) -> str:
+    return {
+        ExitCodes.SUCCESS: "success",
+        ExitCodes.VALIDATION_FAILED: "validation failed",
+        ExitCodes.CONFIGURATION_ERROR: "configuration error",
+        ExitCodes.AUTHORIZATION_ERROR: "authentication or authorization error",
+        ExitCodes.OMNI_API_ERROR: "Omni API error",
+        ExitCodes.SECURITY_POLICY_VIOLATION: "security policy violation",
+        ExitCodes.INTERNAL_ERROR: "internal tool error",
+    }.get(exit_code, "unknown error")
 
 
 def _required(value: Any, name: str) -> Any:

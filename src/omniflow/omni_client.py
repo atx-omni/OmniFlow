@@ -97,6 +97,9 @@ class OmniClient:
             raise OmniAPIError("Git configuration returned an unexpected response shape")
         return payload
 
+    def get_dbt_exposures(self, model_id: str) -> Any:
+        return self._request("GET", f"/api/v1/models/{model_id}/dbt-exposures")
+
     def list_models(
         self,
         model_kind: str | None = None,

@@ -27,6 +27,10 @@ checks:
       warn_join_cardinality_change: warn
       require_topic_labels: warn
 
+  dbt_exposures:
+    enabled: false
+    fail_on_unavailable: false
+
 reporting:
   formats:
     - json
@@ -40,3 +44,5 @@ security:
   allow_raw_response_output: false
   max_report_samples: 20
   redact_document_names: false
+  redaction_level: standard
+  retain_restricted_artifacts: true

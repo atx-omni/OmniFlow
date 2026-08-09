@@ -57,6 +57,13 @@ class OmniClientTests(unittest.TestCase):
         self.assertEqual(kwargs["params"]["find"], "orders.revenue")
         self.assertEqual(kwargs["params"]["find_type"], "FIELD")
 
+    def test_get_dbt_exposures_uses_documented_endpoint(self):
+        session = FakeSession([FakeResponse({"exposures": []})])
+        client = OmniClient(base_url="https://omni.example", api_key="secret", session=session)
+        self.assertEqual(client.get_dbt_exposures("model-1"), {"exposures": []})
+        _, url, _ = session.calls[0]
+        self.assertEqual(url, "https://omni.example/api/v1/models/model-1/dbt-exposures")
+
 
 if __name__ == "__main__":
     unittest.main()

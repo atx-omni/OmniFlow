@@ -27,14 +27,13 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install OmniFlow
-        run: python -m pip install "omniflow==0.4.0"
-
       - name: Run OmniFlow
         if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: atx-omni/omniflow@<pinned-commit-sha>
         env:
           OMNI_API_KEY: ${{ secrets.OMNI_API_KEY }}
-        run: omniflow run --auto --config .omniflow.yml
+        with:
+          config: .omniflow.yml
 
       - name: Skip unsafe fork PR
         if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
@@ -48,29 +47,30 @@ jobs:
         with:
           name: omniflow-public-summary
           path: |
-            .omniflow/report.json
-            .omniflow/report.md
-            .omniflow/report.sarif
-            .omniflow/junit.xml
-            .omniflow/evidence.json
+            .omniflow/public/report.json
+            .omniflow/public/report.md
+            .omniflow/public/report.sarif
+            .omniflow/public/junit.xml
+            .omniflow/public/evidence.json
+            .omniflow/artifact-manifest.json
           if-no-files-found: ignore
           include-hidden-files: true
 
       - name: Upload SARIF
-        if: always() && hashFiles('.omniflow/report.sarif') != ''
+        if: always() && hashFiles('.omniflow/public/report.sarif') != ''
         continue-on-error: true
         uses: github/codeql-action/upload-sarif@dc73d59c2d7bd4f8194098a91219eeee6d8a1719
         with:
-          sarif_file: .omniflow/report.sarif
+          sarif_file: .omniflow/public/report.sarif
 
       - name: Comment on PR
-        if: always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && hashFiles('.omniflow/report.md') != ''
+        if: always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && hashFiles('.omniflow/public/report.md') != ''
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           MARKER='<!-- omniflow-report -->'
-          BODY="$(printf '%s\n\n' "$MARKER"; cat .omniflow/report.md)"
+          BODY="$(printf '%s\n\n' "$MARKER"; cat .omniflow/public/report.md)"
           EXISTING="$(gh pr view "$PR_NUMBER" --json comments --jq '.comments[] | select(.body | contains("<!-- omniflow-report -->")) | .id' | head -n 1)"
           if [ -n "$EXISTING" ]; then
             gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${EXISTING}" -f body="$BODY" >/dev/null

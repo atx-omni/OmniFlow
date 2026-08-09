@@ -15,6 +15,16 @@ The default action command is:
 omniflow run --auto
 ```
 
+For alpha testing, install OmniFlow through the pinned GitHub Action checkout:
+
+```yaml
+- uses: atx-omni/omniflow@<pinned-commit-sha>
+  env:
+    OMNI_API_KEY: ${{ secrets.OMNI_API_KEY }}
+```
+
+Do not use `pip install omniflow` for alpha testing unless this project has been explicitly published to PyPI under the expected version.
+
 No customer-managed `base_url`, `model_id`, or `branch_name` is required in policy config. OmniFlow uses trusted repo metadata or explicit CI environment values for Omni host identity, and it can read the `omniflow-context` PR marker when present for model and branch selection.
 
 ## PR Context And Metadata
@@ -72,6 +82,10 @@ checks:
   model_validation:
     enabled: true
     fail_on_warnings: false
+
+  dbt_exposures:
+    enabled: false
+    fail_on_unavailable: false
 ```
 
 If any config or Omni-managed metadata key matches `api_key`, `token`, `secret`, or `password`, OmniFlow fails before running.
@@ -84,6 +98,7 @@ omniflow run --auto
 omniflow content validate --base-url https://example.omniapp.co --model-id <id>
 omniflow model validate --base-url https://example.omniapp.co --model-id <id>
 omniflow yaml pull --base-url https://example.omniapp.co --model-id <id> --out .omniflow/yaml
+omniflow exposures pull --base-url https://example.omniapp.co --model-id <id>
 omniflow diff --base path/to/base/yaml --head path/to/head/yaml
 ```
 
@@ -98,11 +113,15 @@ Explicit identity flags are retained for debugging and local advanced usage only
 - `.omniflow/report.sarif`
 - `.omniflow/junit.xml`
 - `.omniflow/evidence.json`
+- `.omniflow/public/`
+- `.omniflow/restricted/`
 - per-model semantic diff and contract impact artifacts
 
 Reports include IDs, names, owners, labels, paths, summaries, risk levels, config hash, git SHA, branch, PR number, model ID, and policy decision. Reports must not include API keys, raw query results, or raw Omni payloads.
 
-The example GitHub workflow uploads only the reviewer-safe summary artifacts by default: `report.json`, `report.md`, `report.sarif`, `junit.xml`, and `evidence.json`. Per-model YAML pulls, dependency graphs, and detailed contract artifacts remain local CI workspace files unless a team explicitly chooses to upload restricted audit artifacts.
+The example GitHub workflow uploads only `.omniflow/public/` summary artifacts and `.omniflow/artifact-manifest.json` by default. Per-model YAML pulls, dependency graphs, exposure details, and detailed contract artifacts live under `.omniflow/restricted/` and remain local CI workspace files unless a team explicitly chooses to upload restricted audit artifacts.
+
+Set `security.redaction_level: strict` for regulated environments that need content names, query names, owner metadata, URLs, folder paths, and labels redacted from public artifacts.
 
 ## Exit Codes
 
