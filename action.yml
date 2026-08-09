@@ -22,7 +22,7 @@ runs:
         OMNIFLOW_INPUT_VERSION: ${{ inputs.version }}
       run: |
         set -euo pipefail
-        python -m pip install --disable-pip-version-check --no-input --upgrade "pip==26.1.2"
+        python -m pip install --disable-pip-version-check --no-input --upgrade "pip==26.1.2" "setuptools==83.0.0"
         if [ -n "$OMNIFLOW_INPUT_VERSION" ]; then
           python -m pip install --disable-pip-version-check --no-input "omniflow-ci==$OMNIFLOW_INPUT_VERSION"
         else

@@ -80,6 +80,18 @@ class RepositoryHardeningTests(unittest.TestCase):
         self.assertIn("python -m pip_audit --local", text)
         self.assertIn("GH_REPO: ${{ github.repository }}", text)
 
+    def test_build_and_ci_use_patched_setuptools(self):
+        pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+        self.assertIn("setuptools>=83,<84", pyproject["build-system"]["requires"])
+
+        for path in [
+            ROOT / "action.yml",
+            ROOT / ".github/workflows/dependency-scan.yml",
+            ROOT / ".github/workflows/release.yml",
+            ROOT / ".github/workflows/test.yml",
+        ]:
+            self.assertIn("setuptools==83.0.0", path.read_text(encoding="utf-8"), msg=str(path))
+
 
 if __name__ == "__main__":
     unittest.main()
