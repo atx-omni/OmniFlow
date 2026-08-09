@@ -308,7 +308,7 @@ def run_scenario(scenario: Scenario, *, keep_workdir: bool) -> dict[str, Any]:
 
 
 def setup_repo(repo: Path, *, base_url: str, scenario: Scenario) -> None:
-    run(["git", "init", "-q"], cwd=repo)
+    run(["git", "init", "-q", "--initial-branch=main"], cwd=repo)
     run(["git", "config", "user.email", "omniflow@example.com"], cwd=repo)
     run(["git", "config", "user.name", "OmniFlow Simulation"], cwd=repo)
     (repo / ".omni").mkdir()

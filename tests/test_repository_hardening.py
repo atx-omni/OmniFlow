@@ -92,6 +92,10 @@ class RepositoryHardeningTests(unittest.TestCase):
         ]:
             self.assertIn("setuptools==83.0.0", path.read_text(encoding="utf-8"), msg=str(path))
 
+    def test_simulator_uses_deterministic_base_branch(self):
+        text = (ROOT / "scripts/simulate_alpha.py").read_text(encoding="utf-8")
+        self.assertIn('["git", "init", "-q", "--initial-branch=main"]', text)
+
 
 if __name__ == "__main__":
     unittest.main()
