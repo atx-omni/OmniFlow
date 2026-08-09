@@ -7,6 +7,7 @@ from omniflow.exceptions import ConfigError
 from omniflow.diff.diff_engine import diff_graphs
 from omniflow.diff.semantic_graph import build_graph
 from omniflow.diff.yaml_loader import load_yaml_files
+from omniflow.reporting.markdown_report import render_markdown_report
 from omniflow.reporting.junit_report import to_junit
 from omniflow.reporting.sarif_report import to_sarif
 from omniflow.validators.yaml_lint import has_error, lint_graph
@@ -78,6 +79,61 @@ class DiffLintReportTests(unittest.TestCase):
         junit = to_junit(report)
         self.assertEqual(sarif["version"], "2.1.0")
         self.assertIn("<failure", junit)
+
+    def test_markdown_report_is_reviewer_friendly_for_contract_failure(self):
+        report = {
+            "tool_version": "0.4.0",
+            "generated_at": "2026-08-09T00:00:00Z",
+            "git_sha": "abc",
+            "git_branch": "feature/a",
+            "config_hash": "hash",
+            "policy_decision": "fail",
+            "exit_code_reason": "validation failed",
+            "models": [{"model_id": "model-1", "model_path": "omni/model", "branch_name": "feature/a"}],
+            "summary": {"total_issues": 1, "errors": 1, "warnings": 0, "risk_level": "breaking"},
+            "issues": [
+                {
+                    "validator": "contracts",
+                    "severity": "error",
+                    "impact_level": "referenced_breaking",
+                    "field": "orders.revenue",
+                    "referenced_content": [{"content_id": "dash-1"}],
+                    "message": "Deleted referenced field.",
+                }
+            ],
+            "model_reports": [
+                {
+                    "check_reports": [
+                        {
+                            "coverage_gaps": [
+                                {"type": "field", "name": "orders.margin", "message": "targeted search unavailable"}
+                            ]
+                        }
+                    ]
+                }
+            ],
+        }
+        markdown = render_markdown_report(report)
+        self.assertIn("## Decision", markdown)
+        self.assertIn("Fail: review blocking issues before merge.", markdown)
+        self.assertIn("`model-1` path `omni/model` branch `feature/a`", markdown)
+        self.assertIn("## Downstream Contract Impact", markdown)
+        self.assertIn("referenced content: `1`", markdown)
+        self.assertIn("orders.margin", markdown)
+        self.assertIn("Resolve blocking validation", markdown)
+
+    def test_markdown_report_guides_skipped_non_omni_prs(self):
+        markdown = render_markdown_report(
+            {
+                "tool_version": "0.4.0",
+                "policy_decision": "skipped",
+                "exit_code_reason": "no Omni PR context or changed Omni model files detected",
+                "summary": {},
+                "issues": [],
+            }
+        )
+        self.assertIn("Skipped: no Omni semantic-layer changes were detected.", markdown)
+        self.assertIn("No reviewer action needed", markdown)
 
 
 if __name__ == "__main__":

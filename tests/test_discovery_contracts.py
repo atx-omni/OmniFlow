@@ -383,6 +383,18 @@ class DownstreamGenerationTests(unittest.TestCase):
         self.assertEqual(dependency_graph["dependencies"][0]["content_id"], "dash-1")
         self.assertEqual(dependency_graph["coverage_gaps"][0]["name"], "orders.margin")
 
+    def test_relationship_changes_record_coverage_gap_without_unsupported_search(self):
+        client = FakeDependencyClient()
+        dependency_graph = generate_downstream_dependencies(
+            client=client,
+            model_id="model-1",
+            branch_id="branch-1",
+            diff_result={"changes": [{"type": "relationship_cardinality_changed", "name": "orders_to_items"}]},
+        )
+        self.assertEqual(client.searches, [])
+        self.assertEqual(dependency_graph["coverage_gaps"][0]["type"], "relationship")
+        self.assertIn("VIEW, FIELD, and TOPIC", dependency_graph["coverage_gaps"][0]["message"])
+
 
 if __name__ == "__main__":
     unittest.main()

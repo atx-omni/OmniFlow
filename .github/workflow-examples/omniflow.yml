@@ -46,8 +46,13 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: omniflow-evidence
-          path: .omniflow/
+          name: omniflow-public-summary
+          path: |
+            .omniflow/report.json
+            .omniflow/report.md
+            .omniflow/report.sarif
+            .omniflow/junit.xml
+            .omniflow/evidence.json
           if-no-files-found: ignore
           include-hidden-files: true
 

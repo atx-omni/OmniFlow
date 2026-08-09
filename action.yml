@@ -16,6 +16,15 @@ runs:
       shell: bash
       run: python -m pip install "omniflow==${{ inputs.version }}"
 
+    - name: Skip unsafe fork PR
+      if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+      shell: bash
+      run: |
+        mkdir -p .omniflow
+        printf '{"policy_decision":"skipped","reason":"Fork pull request cannot access OMNI_API_KEY safely."}\n' > .omniflow/report.json
+        printf '# OmniFlow\n\nFork pull request skipped because secrets are not available safely.\n' > .omniflow/report.md
+
     - name: Run OmniFlow
+      if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
       shell: bash
       run: omniflow run --auto --config "${{ inputs.config }}"

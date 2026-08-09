@@ -15,21 +15,23 @@ The default action command is:
 omniflow run --auto
 ```
 
-No customer-managed `base_url`, `model_id`, or `branch_name` is required in policy config. OmniFlow reads the `omniflow-context` PR marker when present and can fall back to `.omni/flow.json` for repos that prefer checked-in non-secret metadata.
+No customer-managed `base_url`, `model_id`, or `branch_name` is required in policy config. OmniFlow uses trusted repo metadata or explicit CI environment values for Omni host identity, and it can read the `omniflow-context` PR marker when present for model and branch selection.
 
 ## PR Context And Metadata
 
-Preferred PR marker:
+Optional PR marker:
 
 ```html
-<!-- omniflow-context {"base_url":"https://customer.omniapp.co","model_id":"uuid","model_path":"omni/my_model","branch_name":"feature/my-change"} -->
+<!-- omniflow-context {"model_id":"uuid","model_path":"omni/my_model","branch_name":"feature/my-change"} -->
 ```
 
-Optional fallback metadata:
+Trusted fallback metadata:
 
 - `.omni/flow.json`: non-secret model/repository identity for one or more Omni models.
 
 An example file is included at `.omni/flow.example.json`.
+
+The PR marker must not provide `base_url`. OmniFlow only accepts Omni host identity from trusted sources such as `.omni/flow.json`, `OMNI_BASE_URL`, or explicit CLI flags. This prevents a pull request body from redirecting CI secrets to an untrusted host.
 
 ## PR Routing
 
@@ -99,6 +101,8 @@ Explicit identity flags are retained for debugging and local advanced usage only
 - per-model semantic diff and contract impact artifacts
 
 Reports include IDs, names, owners, labels, paths, summaries, risk levels, config hash, git SHA, branch, PR number, model ID, and policy decision. Reports must not include API keys, raw query results, or raw Omni payloads.
+
+The example GitHub workflow uploads only the reviewer-safe summary artifacts by default: `report.json`, `report.md`, `report.sarif`, `junit.xml`, and `evidence.json`. Per-model YAML pulls, dependency graphs, and detailed contract artifacts remain local CI workspace files unless a team explicitly chooses to upload restricted audit artifacts.
 
 ## Exit Codes
 

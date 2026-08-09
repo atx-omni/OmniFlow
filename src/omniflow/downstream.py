@@ -21,7 +21,7 @@ def generate_downstream_dependencies(
     dependencies: list[dict[str, Any]] = []
     seen = set()
     mode = "targeted"
-    coverage_gaps: list[dict[str, str]] = []
+    coverage_gaps: list[dict[str, str]] = _coverage_gaps_from_diff(diff_result)
     for search in searches:
         try:
             payload = client.search_content_references(
@@ -94,9 +94,26 @@ def _searches_from_diff(diff_result: dict[str, Any]) -> list[dict[str, str]]:
             _append_search(searches, seen, "view", change["name"])
         if change.get("type", "").startswith("topic_") and isinstance(change.get("name"), str):
             _append_search(searches, seen, "topic", change["name"])
-        if change.get("type", "").startswith("relationship_") and isinstance(change.get("name"), str):
-            _append_search(searches, seen, "field", change["name"])
     return searches
+
+
+def _coverage_gaps_from_diff(diff_result: dict[str, Any]) -> list[dict[str, str]]:
+    gaps = []
+    for change in diff_result.get("changes", []):
+        if not isinstance(change, dict):
+            continue
+        if str(change.get("type", "")).startswith("relationship_"):
+            gaps.append(
+                {
+                    "type": "relationship",
+                    "name": str(change.get("name") or change.get("field") or ""),
+                    "message": (
+                        "Omni Content Validator supports direct VIEW, FIELD, and TOPIC searches. "
+                        "Relationship impact requires derived field/view/topic coverage."
+                    ),
+                }
+            )
+    return gaps
 
 
 def _append_search(searches: list[dict[str, str]], seen: set[tuple[str, str]], find_type: str, name: str) -> None:
