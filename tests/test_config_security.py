@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from omniflow.config import load_config
+from omniflow.config import load_config, require_repair_api_key
 from omniflow.exceptions import ConfigError, SecurityPolicyError
 from omniflow.security import public_safe, redact
 
@@ -57,6 +57,55 @@ contracts:
         self.assertIsNone(config.omni.model_id)
         self.assertTrue(config.model_validation.enabled)
         self.assertFalse(config.security.retain_restricted_artifacts)
+        self.assertFalse(config.ai_repair.enabled)
+        self.assertFalse(config.ai_repair.allow_query_execution)
+
+    def test_ai_repair_requires_explicit_opt_in_and_bounded_limits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".omniflow.yml"
+            path.write_text(
+                """
+repairs:
+  ai:
+    enabled: true
+    allow_query_execution: true
+    max_changed_files: 4
+    max_changed_lines: 300
+    poll_timeout_seconds: 420
+""",
+                encoding="utf-8",
+            )
+            config = load_config(path)
+        self.assertTrue(config.ai_repair.enabled)
+        self.assertTrue(config.ai_repair.allow_query_execution)
+        self.assertEqual(config.ai_repair.max_changed_files, 4)
+        self.assertEqual(config.ai_repair.max_changed_lines, 300)
+        self.assertEqual(config.ai_repair.poll_timeout_seconds, 420)
+
+    def test_ai_repair_rejects_unknown_keys_and_unbounded_limits(self):
+        for body in (
+            "repairs:\n  ai:\n    prompt: fix everything\n",
+            "repairs:\n  ai:\n    max_changed_files: 0\n",
+            "repairs:\n  ai:\n    max_changed_lines: 2001\n",
+            "repairs:\n  ai:\n    poll_timeout_seconds: 29\n",
+        ):
+            with self.subTest(body=body):
+                with tempfile.TemporaryDirectory() as tmp:
+                    path = Path(tmp) / ".omniflow.yml"
+                    path.write_text(body, encoding="utf-8")
+                    with self.assertRaises(ConfigError):
+                        load_config(path)
+
+    def test_repair_key_is_read_only_from_dedicated_environment_variable(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(ConfigError):
+                require_repair_api_key()
+        with mock.patch.dict(
+            os.environ,
+            {"OMNIFLOW_REPAIR_API_KEY": "repair-token"},  # pragma: allowlist secret
+            clear=True,
+        ):
+            self.assertEqual(require_repair_api_key(), "repair-token")
 
     def test_rejects_unknown_top_level_and_nested_policy_keys(self):
         for body in (

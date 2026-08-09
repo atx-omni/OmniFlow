@@ -34,7 +34,7 @@ class RepositoryHardeningTests(unittest.TestCase):
 
     def test_all_first_party_workflow_actions_are_pinned_by_sha(self):
         workflow_paths = sorted((ROOT / ".github/workflows").glob("*.yml"))
-        workflow_paths.append(ROOT / ".github/workflow-examples/omniflow.yml")
+        workflow_paths.extend(sorted((ROOT / ".github/workflow-examples").glob("*.yml")))
         for path in workflow_paths:
             payload = yaml.safe_load(path.read_text(encoding="utf-8"))
             for use in nested_uses(payload):
@@ -49,6 +49,7 @@ class RepositoryHardeningTests(unittest.TestCase):
         scripts = [step.get("run", "") for step in action["runs"]["steps"]]
         self.assertFalse(any("${{ inputs." in script for script in scripts))
         self.assertTrue(any("--skip-reason" in script for script in scripts))
+        self.assertTrue(any("omniflow repair ai --auto" in script for script in scripts))
 
     def test_example_workflow_uses_minimal_checkout_and_uploads_only_public_evidence(self):
         text = (ROOT / ".github/workflow-examples/omniflow.yml").read_text(encoding="utf-8")
@@ -68,7 +69,7 @@ class RepositoryHardeningTests(unittest.TestCase):
 
     def test_every_checkout_disables_persisted_credentials(self):
         paths = sorted((ROOT / ".github/workflows").glob("*.yml"))
-        paths.append(ROOT / ".github/workflow-examples/omniflow.yml")
+        paths.extend(sorted((ROOT / ".github/workflow-examples").glob("*.yml")))
         for path in paths:
             payload = yaml.safe_load(path.read_text(encoding="utf-8"))
             for job in payload.get("jobs", {}).values():
@@ -116,15 +117,39 @@ class RepositoryHardeningTests(unittest.TestCase):
         action = yaml.safe_load((ROOT / "action.yml").read_text(encoding="utf-8"))
         self.assertNotIn("version", action["inputs"])
         self.assertIn("omni-api-key", action["inputs"])
+        self.assertIn("repair-api-key", action["inputs"])
+        self.assertEqual(action["inputs"]["mode"]["default"], "validate")
         install = next(step for step in action["runs"]["steps"] if step["name"] == "Install OmniFlow")
         run = next(step for step in action["runs"]["steps"] if step["name"] == "Run OmniFlow")
+        repair = next(step for step in action["runs"]["steps"] if step["name"] == "Run OmniFlow AI repair")
         self.assertIn("--require-hashes", install["run"])
         self.assertIn("--only-binary=:all:", install["run"])
         self.assertIn("--no-deps --no-build-isolation", install["run"])
         self.assertIn("PIP_NO_INDEX=1", install["run"])
         self.assertNotIn("OMNI_API_KEY", install.get("env", {}))
         self.assertEqual(run["env"]["OMNI_API_KEY"], "${{ inputs['omni-api-key'] }}")
+        self.assertNotIn("OMNI_API_KEY", repair["env"])
+        self.assertEqual(
+            repair["env"]["OMNIFLOW_REPAIR_API_KEY"],
+            "${{ inputs['repair-api-key'] }}",
+        )
+        self.assertNotIn("OMNIFLOW_REPAIR_API_KEY", install.get("env", {}))
         self.assertNotIn("omniflow-ci==", (ROOT / "action.yml").read_text(encoding="utf-8"))
+
+    def test_ai_repair_workflow_is_manual_protected_and_same_repository_only(self):
+        text = (ROOT / ".github/workflow-examples/omniflow-ai-repair.yml").read_text(encoding="utf-8")
+        self.assertIn("pull_request_target:", text)
+        self.assertIn("types: [labeled]", text)
+        self.assertIn("github.event.label.name == 'omniflow-ai-repair'", text)
+        self.assertIn("head.repo.full_name == github.repository", text)
+        self.assertIn("environment: omniflow-ai-repair", text)
+        self.assertIn("cancel-in-progress: false", text)
+        self.assertIn("persist-credentials: false", text)
+        self.assertNotIn("ref: ${{ github.event.pull_request.head", text)
+        self.assertIn("mode: repair", text)
+        self.assertIn("repair-api-key: ${{ secrets.OMNIFLOW_REPAIR_API_KEY }}", text)
+        self.assertNotIn("OMNI_API_KEY", text)
+        self.assertNotIn(".omniflow/restricted/", text)
 
     def test_action_and_release_locks_pin_every_requirement_with_sha256(self):
         for relative in (

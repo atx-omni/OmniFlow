@@ -9,6 +9,7 @@ REQUIRED_DOCUMENTS = [
     "docs/CONFIGURATION.md",
     "docs/TROUBLESHOOTING.md",
     "docs/SECURITY_MODEL.md",
+    "docs/AI_REPAIR.md",
     "SUPPORT.md",
     "SECURITY.md",
     "CONTRIBUTING.md",
@@ -60,6 +61,25 @@ class DocumentationTests(unittest.TestCase):
         self.assertIn("Do not use an Organization API Key", text)
         self.assertIn("omni-api-key", text)
         self.assertNotIn("version input", text)
+        self.assertIn("Step 10: Do Not Install AI Repair Yet", text)
+
+    def test_ai_repair_guide_documents_every_required_safety_gate(self):
+        text = (ROOT / "docs/AI_REPAIR.md").read_text(encoding="utf-8")
+        for required_text in (
+            "OMNIFLOW_REPAIR_API_KEY",
+            "allow_query_execution: true",
+            "omniflow-ai-repair",
+            "protected GitHub environment",
+            "same-repository",
+            "one repair attempt",
+            "does not approve, merge, or deploy",
+            "does not document a no-query",
+            "rollback_failed",
+            "require_branch_exists: true",
+            "non-production model",
+            "Release blocked",
+        ):
+            self.assertIn(required_text, text)
 
     def test_documentation_is_included_in_source_distribution(self):
         manifest = (ROOT / "MANIFEST.in").read_text(encoding="utf-8")
@@ -69,6 +89,8 @@ class DocumentationTests(unittest.TestCase):
     def test_workflow_example_has_two_pinned_action_placeholders(self):
         workflow = (ROOT / ".github/workflow-examples/omniflow.yml").read_text(encoding="utf-8")
         self.assertEqual(workflow.count("atx-omni/OmniFlow@<pinned-commit-sha>"), 2)
+        repair = (ROOT / ".github/workflow-examples/omniflow-ai-repair.yml").read_text(encoding="utf-8")
+        self.assertEqual(repair.count("atx-omni/OmniFlow@<pinned-commit-sha>"), 1)
 
 
 if __name__ == "__main__":

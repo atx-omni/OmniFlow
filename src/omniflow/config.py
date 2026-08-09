@@ -30,7 +30,7 @@ SEMANTIC_LINT_RULES = {
     "forbid_personal_folder_validation_scope",
 }
 RULE_SEVERITIES = {"off", "info", "warn", "error"}
-CONFIG_KEYS = {"omni", "checks", "reporting", "security", "contracts"}
+CONFIG_KEYS = {"omni", "checks", "reporting", "security", "contracts", "repairs"}
 OMNI_KEYS = {
     "base_url",
     "model_id",
@@ -61,6 +61,14 @@ CONTRACT_FAIL_KEYS = {
     "referenced_field_type_changes",
     "referenced_join_cardinality_changes",
     "coverage_gaps",
+}
+REPAIR_KEYS = {"ai"}
+AI_REPAIR_KEYS = {
+    "enabled",
+    "allow_query_execution",
+    "max_changed_files",
+    "max_changed_lines",
+    "poll_timeout_seconds",
 }
 
 
@@ -202,6 +210,15 @@ class SecuritySettings:
 
 
 @dataclass
+class AIRepairSettings:
+    enabled: bool = False
+    allow_query_execution: bool = False
+    max_changed_files: int = 3
+    max_changed_lines: int = 200
+    poll_timeout_seconds: int = 300
+
+
+@dataclass
 class OmniFlowConfig:
     raw: dict[str, Any]
     source: Path | None
@@ -213,6 +230,7 @@ class OmniFlowConfig:
     dbt_exposures: DbtExposureSettings
     reporting: ReportingSettings
     security: SecuritySettings
+    ai_repair: AIRepairSettings
     hash: str
 
 
@@ -227,6 +245,8 @@ def _to_config(raw: dict[str, Any], source: Path | None) -> OmniFlowConfig:
     reporting_raw = _mapping(raw.get("reporting"), "reporting")
     security_raw = _mapping(raw.get("security"), "security")
     contracts_raw = _mapping(raw.get("contracts"), "contracts")
+    repairs_raw = _mapping(raw.get("repairs"), "repairs")
+    ai_repair_raw = _mapping(repairs_raw.get("ai"), "repairs.ai")
     content_raw = _mapping(checks_raw.get("content_validation"), "checks.content_validation")
     model_raw = _mapping(checks_raw.get("model_validation"), "checks.model_validation")
     lint_raw = _mapping(checks_raw.get("semantic_lint"), "checks.semantic_lint")
@@ -351,6 +371,35 @@ def _to_config(raw: dict[str, Any], source: Path | None) -> OmniFlowConfig:
             False,
         ),
     )
+    ai_repair = AIRepairSettings(
+        enabled=parse_bool("repairs.ai.enabled", ai_repair_raw.get("enabled"), False),
+        allow_query_execution=parse_bool(
+            "repairs.ai.allow_query_execution",
+            ai_repair_raw.get("allow_query_execution"),
+            False,
+        ),
+        max_changed_files=_bounded_int(
+            "repairs.ai.max_changed_files",
+            ai_repair_raw.get("max_changed_files", 3),
+            minimum=1,
+            maximum=20,
+            default=3,
+        ),
+        max_changed_lines=_bounded_int(
+            "repairs.ai.max_changed_lines",
+            ai_repair_raw.get("max_changed_lines", 200),
+            minimum=1,
+            maximum=2_000,
+            default=200,
+        ),
+        poll_timeout_seconds=_bounded_int(
+            "repairs.ai.poll_timeout_seconds",
+            ai_repair_raw.get("poll_timeout_seconds", 300),
+            minimum=30,
+            maximum=900,
+            default=300,
+        ),
+    )
     return OmniFlowConfig(
         raw=raw,
         source=source,
@@ -362,6 +411,7 @@ def _to_config(raw: dict[str, Any], source: Path | None) -> OmniFlowConfig:
         dbt_exposures=dbt_exposures,
         reporting=reporting,
         security=security,
+        ai_repair=ai_repair,
         hash=config_hash(raw),
     )
 
@@ -402,11 +452,14 @@ def _validate_config_schema(raw: dict[str, Any]) -> None:
     reporting = _mapping(raw.get("reporting"), "reporting")
     security = _mapping(raw.get("security"), "security")
     contracts = _mapping(raw.get("contracts"), "contracts")
+    repairs = _mapping(raw.get("repairs"), "repairs")
     _reject_unknown_keys(omni, OMNI_KEYS, "omni")
     _reject_unknown_keys(checks, CHECK_KEYS, "checks")
     _reject_unknown_keys(reporting, REPORTING_KEYS, "reporting")
     _reject_unknown_keys(security, SECURITY_KEYS, "security")
     _reject_unknown_keys(contracts, CONTRACT_KEYS, "contracts")
+    _reject_unknown_keys(repairs, REPAIR_KEYS, "repairs")
+    _reject_unknown_keys(_mapping(repairs.get("ai"), "repairs.ai"), AI_REPAIR_KEYS, "repairs.ai")
     _reject_unknown_keys(
         _mapping(checks.get("content_validation"), "checks.content_validation"),
         CONTENT_KEYS,
@@ -487,4 +540,13 @@ def require_api_key() -> str:
     value = os.getenv("OMNI_API_KEY")
     if not value:
         raise ConfigError("Missing OMNI_API_KEY. API keys are only read from environment variables.")
+    return value
+
+
+def require_repair_api_key() -> str:
+    value = os.getenv("OMNIFLOW_REPAIR_API_KEY")
+    if not value:
+        raise ConfigError(
+            "Missing OMNIFLOW_REPAIR_API_KEY. AI repair requires a separate write-capable Omni token."
+        )
     return value
