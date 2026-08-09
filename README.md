@@ -4,6 +4,20 @@ OmniFlow is an open-source, local-first CI gate for Omni semantic-layer developm
 
 > **Status:** Controlled alpha. The local test and simulation suites are automated, but a real Omni-created pull request is still required before using OmniFlow as a production merge gate.
 
+## Quick Start
+
+The complete walkthrough is in [Install OmniFlow In A GitHub Repository](docs/INSTALLATION.md). The short path is:
+
+1. Confirm the Omni model already uses Git integration and Branch Mode with the target GitHub repository.
+2. Copy [`.omni/flow.example.json`](.omni/flow.example.json) to `.omni/flow.json`, then add the tenant URL, model ID, repository model path, and base branch.
+3. Add the Omni API key to GitHub Actions as a repository secret named `OMNI_API_KEY`. Never commit it.
+4. Copy [the workflow example](.github/workflow-examples/omniflow.yml) to `.github/workflows/omniflow.yml` in the customer repository and replace both `<pinned-commit-sha>` values with the same reviewed 40-character OmniFlow commit SHA.
+5. Optionally copy [`.omniflow.example.yml`](.omniflow.example.yml) to `.omniflow.yml` to customize policy. No policy file is required for the first run.
+6. Merge the setup files into the protected base branch so the privileged workflow can read them as trusted inputs.
+7. Create a harmless model change in an Omni branch, select **Create pull request**, and confirm OmniFlow validates the resulting GitHub pull request.
+
+After the first live run succeeds, make the OmniFlow check required in GitHub branch protection. Continue with the [installation checklist](docs/INSTALLATION.md#step-9-verify-the-installation) before treating OmniFlow as a merge gate.
+
 ## What OmniFlow Checks
 
 - Omni model validation, with separate error and warning policy
@@ -30,7 +44,9 @@ OmniFlow does not execute warehouse queries, store query results, merge pull req
 
 The final promotion is Omni Git integration behavior, not an OmniFlow API write. See [Omni Branch Mode](https://docs.omni.co/content/develop/branch-mode) and [Git integration settings](https://docs.omni.co/integrations/git/settings).
 
-## Repository Setup
+## Installation Details
+
+These are the required installation components. New users should follow the [full step-by-step guide](docs/INSTALLATION.md), which includes prerequisites, exact sequencing, first-run expectations, and branch protection.
 
 ### 1. Add The Workflow
 
@@ -39,7 +55,7 @@ Copy `.github/workflow-examples/omniflow.yml` into the customer repository as `.
 The action installs from that pinned checkout during alpha testing:
 
 ```yaml
-- uses: atx-omni/omniflow@<pinned-commit-sha>
+- uses: atx-omni/OmniFlow@<pinned-commit-sha>
   env:
     OMNI_API_KEY: ${{ secrets.OMNI_API_KEY }}
 ```
@@ -160,6 +176,17 @@ Explicit identity flags are for local debugging. The customer workflow uses `omn
 
 Exit codes are `0` success, `1` validation failure, `2` configuration error, `3` authentication or authorization error, `4` Omni API error, `5` security policy violation, and `6` internal error.
 
+## Documentation
+
+- [Step-by-step installation](docs/INSTALLATION.md)
+- [Configuration reference](docs/CONFIGURATION.md)
+- [Troubleshooting](docs/TROUBLESHOOTING.md)
+- [Support and safe diagnostic sharing](SUPPORT.md)
+- [Security policy](SECURITY.md)
+- [Contributing](CONTRIBUTING.md)
+- [Code of Conduct](CODE_OF_CONDUCT.md)
+- [MIT License](LICENSE)
+
 ## Local Verification
 
 ```bash
@@ -179,7 +206,7 @@ The simulation covers same-repository and fork routing, contract failures, stric
 
 ## Maintainer Release Setup
 
-Before the first public release, configure a pending PyPI Trusted Publisher for project `omniflow-ci`, owner `atx-omni`, repository `omniflow`, workflow `release.yml`, and environment `pypi`. Protect that GitHub environment with required maintainer approval. A `vX.Y.Z` tag matching the package version then builds once, publishes the verified distributions to PyPI with attestations, and signs the SBOM, checksums, wheel, and source archive for the GitHub release.
+Before the first public release, configure a pending PyPI Trusted Publisher for project `omniflow-ci`, owner `atx-omni`, repository `OmniFlow`, workflow `release.yml`, and environment `pypi`. Protect that GitHub environment with required maintainer approval. A `vX.Y.Z` tag matching the package version then builds once, publishes the verified distributions to PyPI with attestations, and signs the SBOM, checksums, wheel, and source archive for the GitHub release.
 
 PyPI pending publishers do not reserve a name until the first successful upload, so the initial release should follow setup promptly.
 

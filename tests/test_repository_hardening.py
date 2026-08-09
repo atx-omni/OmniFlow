@@ -38,7 +38,7 @@ class RepositoryHardeningTests(unittest.TestCase):
         for path in workflow_paths:
             payload = yaml.safe_load(path.read_text(encoding="utf-8"))
             for use in nested_uses(payload):
-                if use == "atx-omni/omniflow@<pinned-commit-sha>":
+                if use == "atx-omni/OmniFlow@<pinned-commit-sha>":
                     continue
                 self.assertRegex(use, PINNED_USE_RE, msg=f"Unpinned action in {path}: {use}")
 

@@ -27,7 +27,7 @@ jobs:
 
       - name: Run OmniFlow
         if: github.event_name != 'pull_request_target' || github.event.pull_request.head.repo.full_name == github.repository
-        uses: atx-omni/omniflow@<pinned-commit-sha>
+        uses: atx-omni/OmniFlow@<pinned-commit-sha>
         env:
           OMNI_API_KEY: ${{ secrets.OMNI_API_KEY }}
         with:
@@ -35,7 +35,7 @@ jobs:
 
       - name: Route fork pull request without Omni secret
         if: github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name != github.repository
-        uses: atx-omni/omniflow@<pinned-commit-sha>
+        uses: atx-omni/OmniFlow@<pinned-commit-sha>
         with:
           config: .omniflow.yml
 
