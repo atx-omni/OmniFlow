@@ -452,12 +452,10 @@ class DiscoveryTests(unittest.TestCase):
 
     def test_metadata_rejects_secret_keys(self):
         with temporary_workdir() as tmp:
-            write_json(
-                tmp / ".omni/flow.json",
-                {"version": 1, "api_key": "bad", "models": []},  # pragma: allowlist secret
-            )
+            path = tmp / ".omni/flow.json"
+            write_json(path, {"version": 1, "api_key": "bad", "models": []})  # pragma: allowlist secret
             with self.assertRaises(SecurityPolicyError):
-                load_flow_metadata()
+                load_flow_metadata(path)
 
     def test_metadata_rejects_unknown_top_level_and_model_keys(self):
         payloads = [
@@ -481,9 +479,10 @@ class DiscoveryTests(unittest.TestCase):
         for payload in payloads:
             with self.subTest(payload=payload):
                 with temporary_workdir() as tmp:
-                    write_json(tmp / ".omni/flow.json", payload)
+                    path = tmp / ".omni/flow.json"
+                    write_json(path, payload)
                     with self.assertRaises(ConfigError):
-                        load_flow_metadata()
+                        load_flow_metadata(path)
 
     def test_push_event_uses_bounded_event_changed_files_without_git_history(self):
         with temporary_workdir() as tmp:
