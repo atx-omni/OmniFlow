@@ -6,7 +6,11 @@ inputs:
     required: false
     default: .omniflow.yml
   version:
-    description: Optional PyPI version of omniflow to install. Leave empty to install from the pinned action checkout.
+    description: Optional PyPI version of omniflow-ci to install. Leave empty to install from the pinned action checkout.
+    required: false
+    default: ""
+  skip-reason:
+    description: Record a successful skipped run without exposing the Omni API key.
     required: false
     default: ""
 runs:
@@ -14,24 +18,34 @@ runs:
   steps:
     - name: Install OmniFlow
       shell: bash
+      env:
+        OMNIFLOW_INPUT_VERSION: ${{ inputs.version }}
       run: |
-        if [ -n "${{ inputs.version }}" ]; then
-          python -m pip install "omniflow==${{ inputs.version }}"
+        set -euo pipefail
+        python -m pip install --disable-pip-version-check --no-input --upgrade "pip==26.1.2"
+        if [ -n "$OMNIFLOW_INPUT_VERSION" ]; then
+          python -m pip install --disable-pip-version-check --no-input "omniflow-ci==$OMNIFLOW_INPUT_VERSION"
         else
-          python -m pip install "$GITHUB_ACTION_PATH"
+          python -m pip install --disable-pip-version-check --no-input "$GITHUB_ACTION_PATH"
         fi
 
-    - name: Skip unsafe fork PR
-      if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+    - name: Record skipped run
+      if: inputs['skip-reason'] != ''
       shell: bash
+      env:
+        OMNIFLOW_INPUT_CONFIG: ${{ inputs.config }}
+        OMNIFLOW_INPUT_SKIP_REASON: ${{ inputs['skip-reason'] }}
       run: |
-        mkdir -p .omniflow/public
-        printf '{"policy_decision":"skipped","reason":"Fork pull request cannot access OMNI_API_KEY safely."}\n' > .omniflow/report.json
-        printf '# OmniFlow\n\nFork pull request skipped because secrets are not available safely.\n' > .omniflow/report.md
-        cp .omniflow/report.json .omniflow/public/report.json
-        cp .omniflow/report.md .omniflow/public/report.md
+        set -euo pipefail
+        omniflow run --auto --config "$OMNIFLOW_INPUT_CONFIG" \
+          --skip-reason "$OMNIFLOW_INPUT_SKIP_REASON"
 
     - name: Run OmniFlow
-      if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+      if: inputs['skip-reason'] == ''
       shell: bash
-      run: omniflow run --auto --config "${{ inputs.config }}"
+      env:
+        OMNIFLOW_INPUT_CONFIG: ${{ inputs.config }}
+        OMNIFLOW_GITHUB_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        omniflow run --auto --config "$OMNIFLOW_INPUT_CONFIG"

@@ -3,16 +3,16 @@ from __future__ import annotations
 from typing import Any
 
 from ..diff.semantic_graph import SemanticGraph
-
+from ..exceptions import ConfigError
 
 SEVERITIES = {"off": 0, "info": 1, "warn": 2, "error": 3}
 DEFAULT_RULES = {
     "require_field_descriptions": "warn",
     "require_measure_descriptions": "warn",
-    "require_primary_keys": "error",
+    "require_primary_keys": "warn",
     "require_topic_labels": "warn",
     "forbid_many_to_many_without_comment": "warn",
-    "block_deleted_fields": "error",
+    "block_deleted_fields": "warn",
     "warn_field_type_change": "warn",
     "warn_measure_aggregation_change": "warn",
     "warn_relationship_cardinality_change": "warn",
@@ -25,7 +25,9 @@ def merged_rules(configured: dict[str, str] | None = None) -> dict[str, str]:
     rules = dict(DEFAULT_RULES)
     for key, value in (configured or {}).items():
         if value not in SEVERITIES:
-            raise ValueError(f"Invalid severity for {key}: {value}")
+            raise ConfigError(f"Invalid severity for {key}: {value}")
+        if key not in DEFAULT_RULES:
+            raise ConfigError(f"Unknown semantic lint rule: {key}")
         rules[key] = value
     return rules
 
@@ -40,26 +42,49 @@ def lint_graph(
     rules = merged_rules(configured_rules)
     issues: list[dict[str, Any]] = []
     if include_personal_folders:
-        _emit(issues, rules, "forbid_personal_folder_validation_scope", None, "Personal folders should not be part of default CI validation scope.")
+        _emit(
+            issues,
+            rules,
+            "forbid_personal_folder_validation_scope",
+            None,
+            "Personal folders should not be part of default CI validation scope.",
+        )
     for name, field in sorted(graph.fields.items()):
         if not field.get("description"):
-            _emit(issues, rules, "require_field_descriptions", field, "Field is missing a description.", field=name)
-        if _is_measure(field) and not field.get("description"):
-            _emit(issues, rules, "require_measure_descriptions", field, "Measure is missing a description.", field=name)
+            rule = "require_measure_descriptions" if _is_measure(field) else "require_field_descriptions"
+            noun = "Measure" if _is_measure(field) else "Field"
+            _emit(issues, rules, rule, field, f"{noun} is missing a description.", field=name)
     for view_name, view in sorted(graph.views.items()):
         if not _has_primary_key_for_view(graph, view_name):
             _emit(issues, rules, "require_primary_keys", view, "View does not define a primary key.", view=view_name)
-        meta_owner = view.get("meta", {}).get("owner") if isinstance(view.get("meta"), dict) else None
-        if not (view.get("owner") or view.get("owner_email") or meta_owner):
-            _emit(issues, rules, "require_owner_metadata", view, "View is missing owner metadata.", view=view_name)
     for topic_name, topic in sorted(graph.topics.items()):
         if not topic.get("label"):
             _emit(issues, rules, "require_topic_labels", topic, "Topic is missing a label.", topic=topic_name)
+        if not topic.get("owners"):
+            _emit(
+                issues,
+                rules,
+                "require_owner_metadata",
+                topic,
+                "Topic is missing documented owners metadata.",
+                topic=topic_name,
+            )
     for rel_name, relationship in sorted(graph.relationships.items()):
-        cardinality = str(relationship.get("relationship") or relationship.get("cardinality") or "").lower()
+        cardinality = str(
+            relationship.get("relationship_type")
+            or relationship.get("relationship")
+            or relationship.get("cardinality")
+            or ""
+        ).lower()
         if "many_to_many" in cardinality or "many-to-many" in cardinality:
-            if not (relationship.get("comment") or relationship.get("description")):
-                _emit(issues, rules, "forbid_many_to_many_without_comment", relationship, "Many-to-many relationship needs a comment.", relationship=rel_name)
+            _emit(
+                issues,
+                rules,
+                "forbid_many_to_many_without_comment",
+                relationship,
+                "Many-to-many relationship requires manual governance review; Omni does not document a relationship comment property.",
+                relationship=rel_name,
+            )
     for change in (diff_result or {}).get("changes", []):
         _emit_diff_issue(issues, rules, change)
     return issues

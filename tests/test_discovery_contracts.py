@@ -1,21 +1,22 @@
 import contextlib
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from omniflow.config import ContractSettings
+from omniflow.config import ContractSettings, load_config
 from omniflow.contracts import evaluate_contracts
 from omniflow.discovery import (
     discover_contexts,
+    get_changed_files,
     load_flow_metadata,
     load_pr_marker,
 )
 from omniflow.downstream import generate_downstream_dependencies
-from omniflow.exceptions import OmniAPIError
-from omniflow.exceptions import ConfigError, SecurityPolicyError
+from omniflow.exceptions import ConfigError, OmniAPIError, SecurityPolicyError
 
 
 @contextlib.contextmanager
@@ -63,6 +64,16 @@ class DiscoveryTests(unittest.TestCase):
                 contexts = discover_contexts(auto=True, allow_skip=True)
         self.assertEqual(contexts, [])
 
+    def test_missing_metadata_fails_closed_for_omni_files(self):
+        with temporary_workdir():
+            with mock.patch.dict(
+                os.environ,
+                {"OMNIFLOW_CHANGED_FILES": "omni/model/views/orders.view"},
+                clear=True,
+            ):
+                with self.assertRaises(ConfigError):
+                    discover_contexts(auto=True, allow_skip=True)
+
     def test_auto_routing_skips_non_omni_changed_files(self):
         with temporary_workdir() as tmp:
             write_json(
@@ -81,6 +92,52 @@ class DiscoveryTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {"OMNIFLOW_CHANGED_FILES": "models/marts/fact_orders.sql"}, clear=True):
                 contexts = discover_contexts(auto=True, allow_skip=True)
         self.assertEqual(contexts, [])
+
+    def test_unregistered_omni_files_fail_closed(self):
+        with temporary_workdir() as tmp:
+            write_json(
+                tmp / ".omni/flow.json",
+                {
+                    "version": 1,
+                    "models": [
+                        {
+                            "base_url": "https://omni.example",
+                            "model_id": "model-1",
+                            "model_path": "omni/registered",
+                        }
+                    ],
+                },
+            )
+            with mock.patch.dict(
+                os.environ,
+                {"OMNIFLOW_CHANGED_FILES": "omni/unregistered/model.yaml"},
+                clear=True,
+            ):
+                with self.assertRaises(ConfigError):
+                    discover_contexts(auto=True, allow_skip=True)
+
+    def test_nested_unregistered_omni_files_fail_closed(self):
+        with temporary_workdir() as tmp:
+            write_json(
+                tmp / ".omni/flow.json",
+                {
+                    "version": 1,
+                    "models": [
+                        {
+                            "base_url": "https://omni.example",
+                            "model_id": "model-1",
+                            "model_path": "omni/registered",
+                        }
+                    ],
+                },
+            )
+            with mock.patch.dict(
+                os.environ,
+                {"OMNIFLOW_CHANGED_FILES": "omni/unregistered/views/orders.yaml"},
+                clear=True,
+            ):
+                with self.assertRaises(ConfigError):
+                    discover_contexts(auto=True, allow_skip=True)
 
     def test_multi_model_selection_by_changed_file_prefix(self):
         with temporary_workdir() as tmp:
@@ -110,7 +167,9 @@ class DiscoveryTests(unittest.TestCase):
                     ],
                 },
             )
-            with mock.patch.dict(os.environ, {"OMNIFLOW_CHANGED_FILES": "omni/a/model.yaml\nomni/b/model.yaml"}, clear=True):
+            with mock.patch.dict(
+                os.environ, {"OMNIFLOW_CHANGED_FILES": "omni/a/model.yaml\nomni/b/model.yaml"}, clear=True
+            ):
                 contexts = discover_contexts(auto=True)
         self.assertEqual([context.model_id for context in contexts], ["a", "b"])
 
@@ -127,9 +186,7 @@ class DiscoveryTests(unittest.TestCase):
                 },
             )
             event = {
-                "pull_request": {
-                    "body": '<!-- omniflow-context {"model_id":"b","branch_name":"feature/content"} -->'
-                }
+                "pull_request": {"body": '<!-- omniflow-context {"model_id":"b","branch_name":"feature/content"} -->'}
             }
             write_json(tmp / "event.json", event)
             with mock.patch.dict(os.environ, {"GITHUB_EVENT_PATH": str(tmp / "event.json")}, clear=True):
@@ -138,6 +195,56 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(marker["model_id"], "b")
         self.assertEqual(contexts[0].model_id, "b")
         self.assertEqual(contexts[0].branch_name, "feature/content")
+
+    def test_pr_marker_cannot_redirect_validation_to_a_different_branch(self):
+        with temporary_workdir() as tmp:
+            write_json(
+                tmp / ".omni/flow.json",
+                {
+                    "version": 1,
+                    "models": [
+                        {
+                            "base_url": "https://omni.example",
+                            "model_id": "model-1",
+                            "model_path": "omni/model",
+                        }
+                    ],
+                },
+            )
+            event = {
+                "pull_request": {"body": '<!-- omniflow-context {"model_id":"model-1","branch_name":"safe/branch"} -->'}
+            }
+            write_json(tmp / "event.json", event)
+            env = {"GITHUB_EVENT_PATH": str(tmp / "event.json"), "GITHUB_HEAD_REF": "risky/branch"}
+            with mock.patch.dict(os.environ, env, clear=True):
+                with self.assertRaises(SecurityPolicyError):
+                    discover_contexts(auto=True)
+
+    def test_pull_request_must_target_the_models_trusted_base_branch(self):
+        with temporary_workdir() as tmp:
+            write_json(
+                tmp / ".omni/flow.json",
+                {
+                    "version": 1,
+                    "models": [
+                        {
+                            "base_url": "https://omni.example",
+                            "model_id": "model-1",
+                            "model_path": "omni/model",
+                            "base_branch": "main",
+                        }
+                    ],
+                },
+            )
+            env = {
+                "GITHUB_EVENT_NAME": "pull_request_target",
+                "GITHUB_BASE_REF": "release",
+                "GITHUB_HEAD_REF": "feature/omni",
+                "OMNIFLOW_CHANGED_FILES": "omni/model/views/orders.view",
+            }
+            with mock.patch.dict(os.environ, env, clear=True):
+                with self.assertRaises(ConfigError):
+                    discover_contexts(auto=True)
 
     def test_pr_marker_cannot_provide_base_url_without_trusted_source(self):
         with temporary_workdir() as tmp:
@@ -151,7 +258,7 @@ class DiscoveryTests(unittest.TestCase):
                 with self.assertRaises(SecurityPolicyError):
                     discover_contexts(auto=True)
 
-    def test_pr_marker_uses_trusted_base_url_override_without_flow_file(self):
+    def test_pr_marker_requires_trusted_flow_metadata_even_with_host_override(self):
         with temporary_workdir() as tmp:
             event = {
                 "pull_request": {
@@ -160,11 +267,150 @@ class DiscoveryTests(unittest.TestCase):
             }
             write_json(tmp / "event.json", event)
             with mock.patch.dict(os.environ, {"GITHUB_EVENT_PATH": str(tmp / "event.json")}, clear=True):
-                contexts = discover_contexts(auto=True, base_url="https://omni.example")
-        self.assertEqual(len(contexts), 1)
-        self.assertEqual(contexts[0].base_url, "https://omni.example")
-        self.assertEqual(contexts[0].model_id, "model-1")
-        self.assertEqual(contexts[0].model_path, "omni/model")
+                with self.assertRaises(ConfigError):
+                    discover_contexts(auto=True, base_url="https://omni.example")
+
+    def test_pull_request_uses_identity_and_policy_from_trusted_base_branch(self):
+        with temporary_workdir() as tmp:
+            subprocess.run(["git", "init", "-q", "-b", "main"], check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], check=True)
+            subprocess.run(["git", "config", "user.name", "OmniFlow Tests"], check=True)
+            write_json(
+                tmp / ".omni/flow.json",
+                {
+                    "version": 1,
+                    "models": [
+                        {
+                            "base_url": "https://trusted.omniapp.co",
+                            "model_id": "model-1",
+                            "model_path": "omni/model",
+                            "base_branch": "main",
+                        }
+                    ],
+                },
+            )
+            (tmp / ".omniflow.yml").write_text(
+                "checks:\n  model_validation:\n    enabled: true\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "add", "."], check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "trusted base"], check=True)
+            subprocess.run(["git", "switch", "-q", "-c", "feature/untrusted"], check=True)
+            write_json(
+                tmp / ".omni/flow.json",
+                {
+                    "version": 1,
+                    "models": [
+                        {
+                            "base_url": "https://attacker.example",
+                            "model_id": "model-1",
+                            "model_path": "omni/model",
+                            "base_branch": "main",
+                        }
+                    ],
+                },
+            )
+            (tmp / ".omniflow.yml").write_text(
+                "checks:\n  model_validation:\n    enabled: false\n",
+                encoding="utf-8",
+            )
+            env = {
+                "GITHUB_EVENT_NAME": "pull_request_target",
+                "GITHUB_BASE_REF": "main",
+                "GITHUB_HEAD_REF": "feature/untrusted",
+                "OMNIFLOW_CHANGED_FILES": "omni/model/views/orders.view",
+            }
+            with mock.patch.dict(os.environ, env, clear=True):
+                contexts = discover_contexts(auto=True)
+                config = load_config(".omniflow.yml")
+        self.assertEqual(contexts[0].base_url, "https://trusted.omniapp.co")
+        self.assertTrue(config.model_validation.enabled)
+
+    def test_pull_request_target_uses_github_api_file_list(self):
+        with temporary_workdir() as tmp:
+            event = {
+                "number": 42,
+                "repository": {"full_name": "acme/analytics"},
+                "pull_request": {
+                    "changed_files": 2,
+                    "head": {"ref": "feature/omni", "sha": "a" * 40},
+                },
+            }
+            write_json(tmp / "event.json", event)
+            response = mock.Mock()
+            response.ok = True
+            response.status_code = 200
+            response.json.return_value = [
+                {"filename": "omni/model/views/orders.view"},
+                {
+                    "filename": "docs/orders.md",
+                    "previous_filename": "omni/model/topics/orders.topic",
+                },
+            ]
+            env = {
+                "GITHUB_EVENT_NAME": "pull_request_target",
+                "GITHUB_EVENT_PATH": str(tmp / "event.json"),
+                "GITHUB_REPOSITORY": "acme/analytics",
+                "OMNIFLOW_GITHUB_TOKEN": "github-token",
+            }
+            with mock.patch.dict(os.environ, env, clear=True):
+                with mock.patch("omniflow.discovery.requests.get", return_value=response) as request:
+                    files = get_changed_files()
+        self.assertEqual(
+            files,
+            ["omni/model/views/orders.view", "docs/orders.md", "omni/model/topics/orders.topic"],
+        )
+        self.assertFalse(request.call_args.kwargs["allow_redirects"])
+        self.assertEqual(request.call_args.kwargs["headers"]["Authorization"], "Bearer github-token")
+
+    def test_pull_request_target_without_github_token_fails_closed(self):
+        with temporary_workdir() as tmp:
+            event = {"number": 42, "repository": {"full_name": "acme/analytics"}, "pull_request": {}}
+            write_json(tmp / "event.json", event)
+            env = {
+                "GITHUB_EVENT_NAME": "pull_request_target",
+                "GITHUB_EVENT_PATH": str(tmp / "event.json"),
+            }
+            with mock.patch.dict(os.environ, env, clear=True):
+                with self.assertRaises(ConfigError):
+                    get_changed_files()
+
+    def test_pull_request_target_rejects_github_api_url_with_query(self):
+        with temporary_workdir() as tmp:
+            event = {
+                "number": 42,
+                "repository": {"full_name": "acme/analytics"},
+                "pull_request": {"changed_files": 1},
+            }
+            write_json(tmp / "event.json", event)
+            env = {
+                "GITHUB_EVENT_NAME": "pull_request_target",
+                "GITHUB_EVENT_PATH": str(tmp / "event.json"),
+                "OMNIFLOW_GITHUB_TOKEN": "github-token",
+                "GITHUB_API_URL": "https://api.github.com?redirect=https://example.com",
+            }
+            with mock.patch.dict(os.environ, env, clear=True):
+                with self.assertRaises(SecurityPolicyError):
+                    get_changed_files()
+
+    def test_root_model_path_routes_only_omni_files(self):
+        flow = {
+            "models": [
+                {
+                    "base_url": "https://omni.example",
+                    "model_id": "model-1",
+                    "model_path": ".",
+                }
+            ]
+        }
+        from omniflow.discovery import select_model_contexts
+
+        contexts = select_model_contexts(
+            flow,
+            changed_files=["views/orders.yaml", "models/marts/orders.sql"],
+            branch_name="feature/omni",
+        )
+        self.assertEqual([context.model_id for context in contexts], ["model-1"])
 
     def test_auto_routing_skips_single_model_when_changed_files_unavailable(self):
         with temporary_workdir() as tmp:
@@ -206,7 +452,10 @@ class DiscoveryTests(unittest.TestCase):
 
     def test_metadata_rejects_secret_keys(self):
         with temporary_workdir() as tmp:
-            write_json(tmp / ".omni/flow.json", {"version": 1, "api_key": "bad", "models": []})
+            write_json(
+                tmp / ".omni/flow.json",
+                {"version": 1, "api_key": "bad", "models": []},  # pragma: allowlist secret
+            )
             with self.assertRaises(SecurityPolicyError):
                 load_flow_metadata()
 
@@ -250,14 +499,34 @@ class ContractImpactTests(unittest.TestCase):
         self.assertEqual(report["issues"][0]["impact_level"], "unreferenced")
 
     def test_referenced_type_and_cardinality_changes_fail(self):
-        for change in (
-            {"type": "field_type_changed", "field": "orders.revenue", "risk": "breaking"},
-            {"type": "relationship_cardinality_changed", "name": "orders.revenue", "risk": "warning"},
-        ):
+        cases = (
+            (
+                {"type": "field_type_changed", "field": "orders.revenue", "risk": "breaking"},
+                self.dependencies(),
+            ),
+            (
+                {
+                    "type": "relationship_cardinality_changed",
+                    "name": "orders_to_items",
+                    "affected_views": ["orders", "order_items"],
+                    "risk": "breaking",
+                },
+                {
+                    "dependencies": [
+                        {
+                            "content_id": "dash-1",
+                            "query_id": "query-1",
+                            "references": [{"type": "view", "name": "orders"}],
+                        }
+                    ]
+                },
+            ),
+        )
+        for change, dependencies in cases:
             with self.subTest(change=change):
                 _, exit_code = evaluate_contracts(
                     diff_result={"changes": [change]},
-                    dependencies=self.dependencies(),
+                    dependencies=dependencies,
                     settings=ContractSettings(),
                     model_id="model-1",
                 )
@@ -323,9 +592,7 @@ class FakeDependencyClient:
                     "name": "Executive Revenue",
                     "owner": {"name": "Jane Doe", "email": "jane@example.com"},
                     "labels": [{"name": "Verified"}],
-                    "queries_and_issues": [
-                        {"query_presentation_id": "query-1", "query_name": "Revenue by Month"}
-                    ],
+                    "queries_and_issues": [{"query_presentation_id": "query-1", "query_name": "Revenue by Month"}],
                 }
             ]
         }
@@ -355,17 +622,20 @@ class DownstreamGenerationTests(unittest.TestCase):
         self.assertEqual(client.searches, [("field", "orders.revenue")])
         self.assertEqual(dependency_graph["generation_mode"], "targeted")
         self.assertEqual(dependency_graph["dependencies"][0]["content_id"], "dash-1")
-        self.assertEqual(dependency_graph["dependencies"][0]["references"], [{"type": "field", "name": "orders.revenue"}])
+        self.assertEqual(
+            dependency_graph["dependencies"][0]["references"], [{"type": "field", "name": "orders.revenue"}]
+        )
 
-    def test_falls_back_to_full_validation_when_targeted_search_unavailable(self):
+    def test_targeted_search_failure_records_a_blocking_coverage_gap(self):
         dependency_graph = generate_downstream_dependencies(
             client=FakeDependencyClient(fail_targeted=True),
             model_id="model-1",
             branch_id="branch-1",
             diff_result={"changes": [{"type": "field_deleted", "field": "orders.revenue"}]},
         )
-        self.assertEqual(dependency_graph["generation_mode"], "full_validation_fallback")
-        self.assertEqual(dependency_graph["dependencies"][0]["content_id"], "dash-fallback")
+        self.assertEqual(dependency_graph["generation_mode"], "targeted_unavailable")
+        self.assertEqual(dependency_graph["dependencies"], [])
+        self.assertEqual(dependency_graph["coverage_gaps"][0]["name"], "orders.revenue")
 
     def test_partial_targeted_failure_preserves_successful_dependencies(self):
         dependency_graph = generate_downstream_dependencies(
@@ -393,7 +663,7 @@ class DownstreamGenerationTests(unittest.TestCase):
         )
         self.assertEqual(client.searches, [])
         self.assertEqual(dependency_graph["coverage_gaps"][0]["type"], "relationship")
-        self.assertIn("VIEW, FIELD, and TOPIC", dependency_graph["coverage_gaps"][0]["message"])
+        self.assertIn("did not identify joined views", dependency_graph["coverage_gaps"][0]["message"])
 
 
 if __name__ == "__main__":

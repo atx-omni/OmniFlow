@@ -4,7 +4,6 @@ from typing import Any
 
 from ..reporting.markdown_report import render_markdown_report
 
-
 MARKER = "<!-- omniflow-report -->"
 
 

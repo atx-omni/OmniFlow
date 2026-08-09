@@ -10,17 +10,41 @@ from typing import Any
 
 import yaml
 
-from .exceptions import ConfigError
-from .security import reject_secret_keys
-
+from .exceptions import ConfigError, SecurityPolicyError
+from .security import contains_secret_key, reject_secret_keys, validate_repo_output_path
+from .trust import read_trusted_repo_text
 
 DEFAULT_CONFIG_PATH = ".omniflow.yml"
+DEFAULT_REPORT_FORMATS = ["json", "markdown", "sarif", "junit"]
+REPORT_FORMATS = {"json", "markdown", "md", "sarif", "junit", "xml"}
+SEMANTIC_LINT_RULES = {
+    "require_field_descriptions",
+    "require_measure_descriptions",
+    "require_primary_keys",
+    "require_topic_labels",
+    "forbid_many_to_many_without_comment",
+    "block_deleted_fields",
+    "warn_field_type_change",
+    "warn_measure_aggregation_change",
+    "warn_relationship_cardinality_change",
+    "require_owner_metadata",
+    "forbid_personal_folder_validation_scope",
+}
+RULE_SEVERITIES = {"off", "info", "warn", "error"}
 
 
 def _expand_env_string(value: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        env_name = match.group(1) or match.group(2)
+        if contains_secret_key(env_name):
+            raise SecurityPolicyError(
+                f"Secret-like environment variable {env_name} cannot be expanded from policy config"
+            )
+        return os.getenv(env_name, "")
+
     return re.sub(
         r"\$(\w+)|\$\{([^}]+)\}",
-        lambda match: os.getenv(match.group(1) or match.group(2), ""),
+        replace,
         value,
     )
 
@@ -72,10 +96,11 @@ def config_hash(payload: dict[str, Any]) -> str:
 def load_raw_config(path: str | Path | None = None) -> tuple[dict[str, Any], Path | None]:
     candidates = [Path(path)] if path else [Path(DEFAULT_CONFIG_PATH)]
     for candidate in candidates:
-        if not candidate.exists():
+        text = read_trusted_repo_text(candidate)
+        if text is None:
             continue
         try:
-            payload = yaml.safe_load(candidate.read_text(encoding="utf-8")) or {}
+            payload = yaml.safe_load(text) or {}
         except yaml.YAMLError as exc:
             raise ConfigError(f"Could not parse config file '{candidate}': {exc}") from exc
         if not isinstance(payload, dict):
@@ -122,6 +147,7 @@ class ContractSettings:
     fail_on_renamed_referenced_fields: bool = True
     fail_on_referenced_field_type_changes: bool = True
     fail_on_referenced_join_cardinality_changes: bool = True
+    fail_on_coverage_gaps: bool = True
 
 
 @dataclass
@@ -132,7 +158,7 @@ class DbtExposureSettings:
 
 @dataclass
 class ReportingSettings:
-    formats: list[str] = field(default_factory=lambda: ["json", "markdown"])
+    formats: list[str] = field(default_factory=lambda: list(DEFAULT_REPORT_FORMATS))
     output_dir: str = ".omniflow"
 
 
@@ -147,7 +173,7 @@ class SecuritySettings:
 
 
 @dataclass
-class OmniCIConfig:
+class OmniFlowConfig:
     raw: dict[str, Any]
     source: Path | None
     omni: OmniSettings
@@ -161,21 +187,34 @@ class OmniCIConfig:
     hash: str
 
 
-def load_config(path: str | Path | None = None) -> OmniCIConfig:
+def load_config(path: str | Path | None = None) -> OmniFlowConfig:
     raw, source = load_raw_config(path)
     return _to_config(raw, source)
 
 
-def _to_config(raw: dict[str, Any], source: Path | None) -> OmniCIConfig:
-    omni_raw = raw.get("omni", {}) or {}
-    checks_raw = raw.get("checks", {}) or {}
-    reporting_raw = raw.get("reporting", {}) or {}
-    security_raw = raw.get("security", {}) or {}
-    contracts_raw = raw.get("contracts", {}) or {}
-    content_raw = checks_raw.get("content_validation", {}) or {}
-    model_raw = checks_raw.get("model_validation", {}) or {}
-    lint_raw = checks_raw.get("semantic_lint", {}) or {}
-    exposures_raw = checks_raw.get("dbt_exposures", {}) or {}
+def _to_config(raw: dict[str, Any], source: Path | None) -> OmniFlowConfig:
+    omni_raw = _mapping(raw.get("omni"), "omni")
+    checks_raw = _mapping(raw.get("checks"), "checks")
+    reporting_raw = _mapping(raw.get("reporting"), "reporting")
+    security_raw = _mapping(raw.get("security"), "security")
+    contracts_raw = _mapping(raw.get("contracts"), "contracts")
+    content_raw = _mapping(checks_raw.get("content_validation"), "checks.content_validation")
+    model_raw = _mapping(checks_raw.get("model_validation"), "checks.model_validation")
+    lint_raw = _mapping(checks_raw.get("semantic_lint"), "checks.semantic_lint")
+    exposures_raw = _mapping(checks_raw.get("dbt_exposures"), "checks.dbt_exposures")
+    lint_rules = _lint_rules(lint_raw.get("rules"))
+    formats = _report_formats(reporting_raw.get("formats"))
+    output_dir = _output_dir(reporting_raw.get("output_dir"))
+    allow_raw_response_output = parse_bool(
+        "security.allow_raw_response_output",
+        security_raw.get("allow_raw_response_output"),
+        False,
+    )
+    if allow_raw_response_output:
+        raise SecurityPolicyError(
+            "security.allow_raw_response_output cannot be enabled in policy config. "
+            "Use --unsafe-raw-output only for an explicit local debugging command."
+        )
 
     omni = OmniSettings(
         base_url=_string_env("OMNI_BASE_URL", omni_raw.get("base_url")),
@@ -188,7 +227,13 @@ def _to_config(raw: dict[str, Any], source: Path | None) -> OmniCIConfig:
             os.getenv("OMNI_INCLUDE_PERSONAL_FOLDERS", omni_raw.get("include_personal_folders")),
             False,
         ),
-        timeout=int(os.getenv("OMNI_TIMEOUT", omni_raw.get("timeout", 60) or 60)),
+        timeout=_bounded_int(
+            "OMNI_TIMEOUT",
+            os.getenv("OMNI_TIMEOUT", omni_raw.get("timeout", 60)),
+            minimum=1,
+            maximum=300,
+            default=60,
+        ),
     )
     content = ContentValidationSettings(
         enabled=parse_bool("content_validation.enabled", content_raw.get("enabled"), True),
@@ -205,7 +250,7 @@ def _to_config(raw: dict[str, Any], source: Path | None) -> OmniCIConfig:
     )
     lint = SemanticLintSettings(
         enabled=parse_bool("semantic_lint.enabled", lint_raw.get("enabled"), True),
-        rules={str(key): str(value) for key, value in (lint_raw.get("rules") or {}).items()},
+        rules=lint_rules,
     )
     contracts = ContractSettings(
         enabled=parse_bool("contracts.enabled", contracts_raw.get("enabled"), True),
@@ -237,6 +282,13 @@ def _to_config(raw: dict[str, Any], source: Path | None) -> OmniCIConfig:
             else None,
             True,
         ),
+        fail_on_coverage_gaps=parse_bool(
+            "contracts.fail_on.coverage_gaps",
+            (contracts_raw.get("fail_on") or {}).get("coverage_gaps")
+            if isinstance(contracts_raw.get("fail_on"), dict)
+            else None,
+            True,
+        ),
     )
     dbt_exposures = DbtExposureSettings(
         enabled=parse_bool("dbt_exposures.enabled", exposures_raw.get("enabled"), False),
@@ -247,18 +299,22 @@ def _to_config(raw: dict[str, Any], source: Path | None) -> OmniCIConfig:
         ),
     )
     reporting = ReportingSettings(
-        formats=parse_csv(reporting_raw.get("formats")) or ["json", "markdown"],
-        output_dir=str(reporting_raw.get("output_dir") or ".omniflow"),
+        formats=formats,
+        output_dir=output_dir,
     )
     security = SecuritySettings(
         redact_logs=parse_bool("security.redact_logs", security_raw.get("redact_logs"), True),
-        allow_raw_response_output=parse_bool(
-            "security.allow_raw_response_output",
-            security_raw.get("allow_raw_response_output"),
-            False,
+        allow_raw_response_output=False,
+        max_report_samples=_bounded_int(
+            "security.max_report_samples",
+            security_raw.get("max_report_samples", 20),
+            minimum=0,
+            maximum=1000,
+            default=20,
         ),
-        max_report_samples=int(security_raw.get("max_report_samples", 20) or 20),
-        redact_document_names=parse_bool("security.redact_document_names", security_raw.get("redact_document_names"), False),
+        redact_document_names=parse_bool(
+            "security.redact_document_names", security_raw.get("redact_document_names"), False
+        ),
         redaction_level=_redaction_level(security_raw.get("redaction_level", "standard")),
         retain_restricted_artifacts=parse_bool(
             "security.retain_restricted_artifacts",
@@ -266,7 +322,7 @@ def _to_config(raw: dict[str, Any], source: Path | None) -> OmniCIConfig:
             True,
         ),
     )
-    return OmniCIConfig(
+    return OmniFlowConfig(
         raw=raw,
         source=source,
         omni=omni,
@@ -300,6 +356,57 @@ def _redaction_level(value: Any) -> str:
     if normalized not in {"standard", "strict"}:
         raise ConfigError("security.redaction_level must be 'standard' or 'strict'")
     return normalized
+
+
+def _mapping(value: Any, name: str) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ConfigError(f"{name} must be a mapping")
+    return value
+
+
+def _bounded_int(name: str, value: Any, *, minimum: int, maximum: int, default: int) -> int:
+    if value is None or value == "":
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{name} must be an integer") from exc
+    if not minimum <= parsed <= maximum:
+        raise ConfigError(f"{name} must be between {minimum} and {maximum}")
+    return parsed
+
+
+def _lint_rules(value: Any) -> dict[str, str]:
+    rules = _mapping(value, "checks.semantic_lint.rules")
+    normalized: dict[str, str] = {}
+    for key, severity in rules.items():
+        rule_id = str(key)
+        level = str(severity).strip().lower()
+        if rule_id not in SEMANTIC_LINT_RULES:
+            raise ConfigError(f"Unknown semantic lint rule: {rule_id}")
+        if level not in RULE_SEVERITIES:
+            raise ConfigError(f"Invalid severity for {rule_id}: {severity!r}")
+        normalized[rule_id] = level
+    return normalized
+
+
+def _report_formats(value: Any) -> list[str]:
+    formats = [item.lower() for item in parse_csv(value)] or list(DEFAULT_REPORT_FORMATS)
+    unknown = sorted(set(formats) - REPORT_FORMATS)
+    if unknown:
+        raise ConfigError(f"Unknown reporting format(s): {', '.join(unknown)}")
+    return formats
+
+
+def _output_dir(value: Any) -> str:
+    output = str(value or ".omniflow").strip()
+    path = Path(output)
+    if not output or path.is_absolute() or ".." in path.parts:
+        raise ConfigError("reporting.output_dir must be a relative path inside the repository")
+    validate_repo_output_path(path)
+    return output
 
 
 def require_api_key() -> str:

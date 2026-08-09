@@ -14,7 +14,6 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 MODEL_ID = "model-1"
@@ -33,9 +32,11 @@ fields:
     type: number
     description: Revenue
     aggregate_type: sum
-relationships:
-  order_items:
-    relationship_type: many_to_one
+""",
+    "relationships/relationships.yaml": """- join_from_view: orders
+  join_to_view: order_items
+  relationship_type: many_to_one
+  on_sql: $${orders.id} = $${order_items.order_id}
 """,
     "topics/sales.topic": """name: sales
 label: Sales
@@ -51,9 +52,11 @@ fields:
     type: number
     primary_key: true
     description: Order ID
-relationships:
-  order_items:
-    relationship_type: one_to_many
+""",
+    "relationships/relationships.yaml": """- join_from_view: orders
+  join_to_view: order_items
+  relationship_type: one_to_many
+  on_sql: $${orders.id} = $${order_items.order_id}
 """,
     "topics/sales.topic": """name: sales
 label: Sales
@@ -71,6 +74,7 @@ class Scenario:
     marker: dict[str, Any] | None = None
     server_mode: str = "normal"
     config: str | None = None
+    include_api_key: bool = True
 
 
 SCENARIOS = [
@@ -80,6 +84,22 @@ SCENARIOS = [
         expected_exit=0,
         changed_files="models/marts/fct_orders.sql",
         server_mode="unused",
+    ),
+    Scenario(
+        name="fork_non_omni_without_secret",
+        description="fork dbt-only PR should skip without receiving the Omni secret",
+        expected_exit=0,
+        changed_files="models/marts/fct_orders.sql",
+        server_mode="unused",
+        include_api_key=False,
+    ),
+    Scenario(
+        name="fork_omni_without_secret",
+        description="fork Omni PR should fail closed when the Omni secret is withheld",
+        expected_exit=2,
+        changed_files="omni/model/views/orders.view",
+        server_mode="unused",
+        include_api_key=False,
     ),
     Scenario(
         name="contract_failure",
@@ -186,16 +206,21 @@ def route_request(state: FakeOmniState, path: str, query: dict[str, list[str]]) 
         if state.mode == "exposures_403":
             return {"error": "forbidden"}, 403
         return {
-            "exposures": [
+            "records": [
                 {
-                    "id": "dash-1",
-                    "name": "Executive Revenue",
-                    "url": "https://omni.example/dashboards/dash-1",
-                    "owner": {"name": "Alice", "email": "alice@example.com"},
-                    "depends_on": [{"name": "model.orders"}],
-                    "maturity": "high",
+                    "dashboard_identifier": "dash-1",
+                    "deduplication_name": "executive_revenue",
+                    "exposure": {
+                        "name": "executive_revenue",
+                        "label": "Executive Revenue",
+                        "type": "dashboard",
+                        "url": "https://omni.example/dashboards/dash-1",
+                        "owner": {"name": "Alice", "email": "alice@example.com"},
+                        "depends_on": ["model.orders"],
+                    },
                 }
-            ]
+            ],
+            "pageInfo": {"hasNextPage": False},
         }, 200
     return {"error": f"Unhandled fake Omni path: {path}"}, 404
 
@@ -305,11 +330,14 @@ def setup_repo(repo: Path, *, base_url: str, scenario: Scenario) -> None:
     )
     (repo / "omni/model/views").mkdir(parents=True)
     (repo / "omni/model/views/orders.view").write_text(BASE_FILES["views/orders.view"], encoding="utf-8")
-    config = scenario.config or """reporting:
+    config = (
+        scenario.config
+        or """reporting:
   formats: [json, markdown, sarif, junit]
 security:
   redaction_level: standard
 """
+    )
     (repo / ".omniflow.yml").write_text(config, encoding="utf-8")
     run(["git", "add", "."], cwd=repo)
     run(["git", "commit", "-q", "-m", "base"], cwd=repo)
@@ -344,16 +372,19 @@ def marker_body(scenario: Scenario) -> str:
 
 def run_omniflow(repo: Path, scenario: Scenario) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
+    env.pop("OMNI_API_KEY", None)
     env.update(
         {
             "PYTHONPATH": str(SRC),
-            "OMNI_API_KEY": "simulation-secret",
             "GITHUB_HEAD_REF": BRANCH_NAME,
             "GITHUB_BASE_REF": "main",
+            "GITHUB_EVENT_NAME": "pull_request",
             "GITHUB_EVENT_PATH": str(repo / "event.json"),
             "OMNIFLOW_CHANGED_FILES": scenario.changed_files,
         }
     )
+    if scenario.include_api_key:
+        env["OMNI_API_KEY"] = "simulation-secret"  # pragma: allowlist secret
     return subprocess.run(
         [sys.executable, "-m", "omniflow.cli", "run", "--auto", "--config", ".omniflow.yml"],
         cwd=repo,
@@ -391,7 +422,11 @@ def assert_result(scenario: Scenario, exit_code: int, artifacts: dict[str, Any])
     if "public/report.json" not in artifacts.get("files", []):
         errors.append("missing public/report.json")
     public_text = artifacts.get("public/report.json", "")
-    if "simulation-secret" in public_text or "alice@example.com" in public_text or "https://omni.example/dashboards" in public_text:
+    if (
+        "simulation-secret" in public_text
+        or "alice@example.com" in public_text
+        or "https://omni.example/dashboards" in public_text
+    ):
         errors.append("public report leaked secret/email/dashboard URL")
     if scenario.name == "strict_redaction" and "Executive Revenue" in public_text:
         errors.append("strict public report leaked content name")
@@ -401,6 +436,14 @@ def assert_result(scenario: Scenario, exit_code: int, artifacts: dict[str, Any])
         report = artifacts.get("public/report.json:json", {})
         if report.get("policy_decision") != "skipped":
             errors.append("non-Omni PR did not produce skipped policy decision")
+    if scenario.name == "fork_non_omni_without_secret":
+        report = artifacts.get("public/report.json:json", {})
+        if report.get("policy_decision") != "skipped":
+            errors.append("fork non-Omni PR did not skip without the Omni secret")
+    if scenario.name == "fork_omni_without_secret":
+        report = artifacts.get("public/report.json:json", {})
+        if report.get("policy_decision") != "fail" or report.get("exit_code") != 2:
+            errors.append("fork Omni PR did not fail closed without the Omni secret")
     return not errors, errors
 
 

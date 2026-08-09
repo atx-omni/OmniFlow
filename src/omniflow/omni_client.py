@@ -6,8 +6,9 @@ from typing import Any
 
 import requests
 
-from .exceptions import OmniAPIError, OmniAuthError
-from .security import redact
+from . import __version__
+from .exceptions import ConfigError, OmniAPIError, OmniAuthError
+from .security import redact, validate_base_url, validate_path_segment
 
 LOG = logging.getLogger(__name__)
 
@@ -21,10 +22,20 @@ class OmniClient:
         timeout: int = 60,
         session: requests.Session | None = None,
     ) -> None:
-        self.base_url = base_url.rstrip("/")
+        if not isinstance(api_key, str) or not api_key:
+            raise ConfigError("Omni API key must be a non-empty string")
+        if not isinstance(timeout, int) or not 1 <= timeout <= 300:
+            raise ConfigError("Omni API timeout must be between 1 and 300 seconds")
+        self.base_url = validate_base_url(base_url)
         self.timeout = timeout
         self.session = session or requests.Session()
-        self.session.headers.update({"Authorization": f"Bearer {api_key}"})
+        self.session.headers.update(
+            {
+                "Authorization": f"Bearer {api_key}",
+                "Accept": "application/json",
+                "User-Agent": f"omniflow/{__version__}",
+            }
+        )
 
     def get_model_yaml(
         self,
@@ -34,6 +45,7 @@ class OmniClient:
         include_checksums: bool = True,
         fully_resolved: bool = False,
     ) -> dict[str, Any]:
+        model_id = validate_path_segment(model_id, name="model_id")
         params: dict[str, Any] = {
             "mode": mode,
             "includeChecksums": str(include_checksums).lower(),
@@ -44,6 +56,7 @@ class OmniClient:
         return self._request("GET", f"/api/v1/models/{model_id}/yaml", params=params)
 
     def validate_model(self, model_id: str, branch_id: str | None = None) -> list[dict[str, Any]]:
+        model_id = validate_path_segment(model_id, name="model_id")
         params = {"branchId": branch_id} if branch_id else None
         payload = self._request("GET", f"/api/v1/models/{model_id}/validate", params=params)
         if not isinstance(payload, list):
@@ -59,6 +72,7 @@ class OmniClient:
         find: str | None = None,
         find_type: str | None = None,
     ) -> Any:
+        model_id = validate_path_segment(model_id, name="model_id")
         params: dict[str, Any] = {}
         if user_id:
             params["userId"] = user_id
@@ -92,30 +106,37 @@ class OmniClient:
         )
 
     def get_git_configuration(self, model_id: str) -> dict[str, Any]:
+        model_id = validate_path_segment(model_id, name="model_id")
         payload = self._request("GET", f"/api/v1/models/{model_id}/git")
         if not isinstance(payload, dict):
             raise OmniAPIError("Git configuration returned an unexpected response shape")
         return payload
 
-    def get_dbt_exposures(self, model_id: str) -> Any:
-        return self._request("GET", f"/api/v1/models/{model_id}/dbt-exposures")
+    def get_dbt_exposures(self, model_id: str, branch_id: str | None = None) -> dict[str, Any]:
+        model_id = validate_path_segment(model_id, name="model_id")
+        params = {"branch_id": branch_id} if branch_id else {}
+        records = self._paginate(f"/api/v1/models/{model_id}/dbt-exposures", params=params)
+        return {"records": records}
 
     def list_models(
         self,
         model_kind: str | None = None,
         base_model_id: str | None = None,
+        name: str | None = None,
     ) -> list[dict[str, Any]]:
         params: dict[str, Any] = {}
         if model_kind:
             params["modelKind"] = model_kind
         if base_model_id:
             params["baseModelId"] = base_model_id
+        if name:
+            params["name"] = name
         return self._paginate("/api/v1/models", params=params)
 
     def resolve_branch_id(self, model_id: str, branch_name: str | None) -> str | None:
         if not branch_name:
             return None
-        for record in self.list_models():
+        for record in self.list_models(model_kind="BRANCH", base_model_id=model_id, name=branch_name):
             if record.get("modelKind") != "BRANCH":
                 continue
             if record.get("baseModelId") != model_id:
@@ -131,17 +152,26 @@ class OmniClient:
         include_personal_folders: bool = False,
         user_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        params: dict[str, Any] = {}
+        # Content metadata is not branch-scoped in the documented API.
+        del branch_id
+        if include_personal_folders and labels and not user_id:
+            raise ConfigError("OMNI_USER_ID is required to apply label filtering to personal-folder content safely")
+        params: dict[str, Any] = {"include": "labels", "scope": "organization"}
         if labels:
-            params["include"] = "labels"
             params["labels"] = ",".join(labels)
-        return self._paginate("/api/v1/content", params=params)
+        records = self._paginate("/api/v1/content", params=params)
+        if include_personal_folders and user_id:
+            restricted_params = dict(params)
+            restricted_params.update({"scope": "restricted", "creatorId": user_id})
+            records.extend(self._paginate("/api/v1/content", params=restricted_params))
+        return records
 
     def _paginate(self, path: str, *, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         records: list[dict[str, Any]] = []
         cursor = None
         while True:
             page_params = dict(params or {})
+            page_params.setdefault("pageSize", 100)
             if cursor:
                 page_params["cursor"] = cursor
             payload = self._request("GET", path, params=page_params)
@@ -169,6 +199,7 @@ class OmniClient:
                     params=params,
                     json=json_payload,
                     timeout=self.timeout,
+                    allow_redirects=False,
                 )
             except requests.RequestException as exc:
                 last_error = exc
@@ -185,9 +216,7 @@ class OmniClient:
                     time.sleep(retry_after if retry_after is not None else 2**attempt)
                     continue
             if not response.ok:
-                raise OmniAPIError(
-                    f"Omni API request failed: {response.status_code} {redact(response.text[:500])}"
-                )
+                raise OmniAPIError(f"Omni API request failed: HTTP {response.status_code} for {method} {path}")
             try:
                 return response.json()
             except ValueError as exc:
@@ -213,4 +242,6 @@ def _content_validator_find_type(value: str) -> str:
         "VIEW": "VIEW",
         "TOPIC": "TOPIC",
     }
-    return aliases.get(normalized, normalized)
+    if normalized not in aliases:
+        raise ConfigError("Content Validator find_type must be VIEW, FIELD, or TOPIC")
+    return aliases[normalized]

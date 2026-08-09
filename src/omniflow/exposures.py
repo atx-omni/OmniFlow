@@ -1,28 +1,30 @@
 from __future__ import annotations
 
-import datetime as dt
 from typing import Any
 
 from .config import DbtExposureSettings
-from .exceptions import OmniCIError
+from .exceptions import OmniFlowError
 from .omni_client import OmniClient
 from .security import redact
+from .timestamps import utc_now_iso
 
 
 def run_dbt_exposure_enrichment(
     *,
     client: OmniClient,
     model_id: str,
+    branch_id: str | None,
     settings: DbtExposureSettings,
 ) -> tuple[dict[str, Any], int]:
     try:
-        payload = client.get_dbt_exposures(model_id)
+        payload = client.get_dbt_exposures(model_id, branch_id=branch_id)
         exposures = _normalize_exposures(payload)
         report = {
             "tool": "omniflow",
             "validator": "dbt_exposures",
-            "generated_at": dt.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "generated_at": utc_now_iso(),
             "model_id": model_id,
+            "branch_id": branch_id,
             "summary": {
                 "total_exposures": len(exposures),
                 "coverage_status": "available",
@@ -31,7 +33,7 @@ def run_dbt_exposure_enrichment(
             "issues": [],
         }
         return report, 0
-    except OmniCIError as exc:
+    except OmniFlowError as exc:
         issue = {
             "validator": "dbt_exposures",
             "severity": "error" if settings.fail_on_unavailable else "warning",
@@ -40,8 +42,9 @@ def run_dbt_exposure_enrichment(
         report = {
             "tool": "omniflow",
             "validator": "dbt_exposures",
-            "generated_at": dt.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "generated_at": utc_now_iso(),
             "model_id": model_id,
+            "branch_id": branch_id,
             "summary": {
                 "total_exposures": 0,
                 "coverage_status": "unavailable",
@@ -64,15 +67,26 @@ def _normalize_exposures(payload: Any) -> list[dict[str, Any]]:
     for record in records:
         if not isinstance(record, dict):
             continue
+        nested = record.get("exposure")
+        if nested is None and "exposure" in record:
+            continue
+        exposure = nested if isinstance(nested, dict) else record
         exposures.append(
             {
-                "id": record.get("id") or record.get("content_id") or record.get("dashboard_id"),
-                "name": record.get("name") or record.get("dashboard_name") or record.get("content_name"),
-                "type": record.get("type") or record.get("content_type") or "dashboard",
-                "url": record.get("url") or record.get("content_url"),
-                "owner": record.get("owner"),
-                "depends_on": _depends_on(record),
-                "maturity": record.get("maturity"),
+                "id": record.get("dashboard_identifier")
+                or exposure.get("id")
+                or exposure.get("content_id")
+                or exposure.get("dashboard_id"),
+                "deduplication_name": record.get("deduplication_name"),
+                "name": exposure.get("label")
+                or exposure.get("name")
+                or exposure.get("dashboard_name")
+                or exposure.get("content_name"),
+                "type": exposure.get("type") or exposure.get("content_type") or "dashboard",
+                "url": exposure.get("url") or exposure.get("content_url"),
+                "owner": exposure.get("owner"),
+                "depends_on": _depends_on(exposure),
+                "maturity": exposure.get("maturity"),
             }
         )
     return exposures

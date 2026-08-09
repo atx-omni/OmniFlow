@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import datetime as dt
 import hashlib
 import json
 from pathlib import Path
@@ -8,6 +7,7 @@ from typing import Any, Iterable
 
 from ..omni_client import OmniClient
 from ..security import redact
+from ..timestamps import utc_now_iso
 
 
 def load_json(path: str | Path) -> dict[str, Any] | None:
@@ -125,8 +125,18 @@ def issue_identity(issue: Any) -> str:
         try:
             comparable = dict(issue) if isinstance(issue, dict) else issue
             if isinstance(comparable, dict):
-                comparable.pop("document_labels", None)
-                comparable.pop("document_owner", None)
+                for key in (
+                    "document_labels",
+                    "document_owner",
+                    "document_name",
+                    "document_type",
+                    "document_url",
+                    "folder_name",
+                    "folder_path",
+                    "query_name",
+                    "raw_issue",
+                ):
+                    comparable.pop(key, None)
             value = json.dumps(comparable, sort_keys=True, separators=(",", ":"))
         except TypeError:
             value = str(issue)
@@ -175,9 +185,10 @@ def partition_issues(
 def index_content_records(records: Iterable[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     indexed: dict[str, dict[str, Any]] = {}
     for record in records:
-        identifier = record.get("identifier")
-        if isinstance(identifier, str) and identifier.strip():
-            indexed[identifier] = record
+        for key in ("identifier", "id"):
+            identifier = record.get(key)
+            if isinstance(identifier, str) and identifier.strip():
+                indexed[identifier] = record
     return indexed
 
 
@@ -208,8 +219,15 @@ def enrich_validator_payload(
             enriched_content.append(document)
             continue
         next_document = dict(document)
-        identifier = next_document.get("identifier")
-        content_record = content_records_by_identifier.get(identifier) if isinstance(identifier, str) else None
+        identifiers = (next_document.get("identifier"), next_document.get("document_id"))
+        content_record = next(
+            (
+                content_records_by_identifier[value]
+                for value in identifiers
+                if isinstance(value, str) and value in content_records_by_identifier
+            ),
+            None,
+        )
         if content_record:
             owner = extract_owner(content_record)
             if owner and not isinstance(next_document.get("owner"), dict):
@@ -251,18 +269,14 @@ def run_content_validation(
         user_id=user_id,
         include_personal_folders=include_personal_folders,
     )
-
-    if isinstance(payload, dict) and isinstance(payload.get("content"), list):
-        records = client.list_content(
-            labels=labels,
-            branch_id=branch_id,
-            include_personal_folders=include_personal_folders,
-            user_id=user_id,
-        )
-        records_by_identifier = index_content_records(records)
-        if labels:
-            payload = filter_validator_payload(payload, set(records_by_identifier))
-        payload = enrich_validator_payload(payload, records_by_identifier)
+    records = client.list_content(
+        labels=labels,
+        branch_id=branch_id,
+        include_personal_folders=include_personal_folders,
+        user_id=user_id,
+    )
+    records_by_identifier = index_content_records(records)
+    payload = _prepare_validator_payload(payload, labels, records_by_identifier)
 
     safe_issues = _sanitize_issues(
         extract_issues(payload),
@@ -270,10 +284,32 @@ def run_content_validation(
         allow_raw_response_output=allow_raw_response_output,
     )
     normalized = normalize_issues(safe_issues)
-    previous_payload = load_json(history_in) or {}
-    previous = compare_history_labels(previous_payload, labels) if previous_payload else []
+    comparison_source = "history"
+    if branch_id and fail_on_new_only:
+        baseline_payload = client.validate_content(
+            model_id,
+            branch_id=None,
+            user_id=user_id,
+            include_personal_folders=include_personal_folders,
+        )
+        baseline_payload = _prepare_validator_payload(baseline_payload, labels, records_by_identifier)
+        previous = normalize_issues(
+            _sanitize_issues(
+                extract_issues(baseline_payload),
+                redact_document_names=redact_document_names,
+                allow_raw_response_output=allow_raw_response_output,
+            )
+        )
+        comparison_source = "base_model"
+    else:
+        previous_payload = load_json(history_in) or {}
+        previous = compare_history_labels(previous_payload, labels) if previous_payload else []
     new_items, existing_items, resolved_items = partition_issues(normalized, previous)
-    generated_at = dt.datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    report_new = [_report_issue(item, state="new", severity="error") for item in new_items]
+    existing_severity = "info" if fail_on_new_only else "error"
+    report_existing = [_report_issue(item, state="existing", severity=existing_severity) for item in existing_items]
+    report_resolved = [_report_issue(item, state="resolved", severity="info", active=False) for item in resolved_items]
+    generated_at = utc_now_iso()
     report = {
         "tool": "omniflow",
         "validator": "content",
@@ -286,10 +322,11 @@ def run_content_validation(
         "new_issues": len(new_items),
         "existing_issues": len(existing_items),
         "resolved_issues": len(resolved_items),
-        "issues": normalized,
-        "new_issue_samples": new_items[:max_samples],
-        "existing_issue_samples": existing_items[:max_samples],
-        "resolved_issue_samples": resolved_items[:max_samples],
+        "comparison_source": comparison_source,
+        "issues": [*report_new, *report_existing, *report_resolved],
+        "new_issue_samples": report_new[:max_samples],
+        "existing_issue_samples": report_existing[:max_samples],
+        "resolved_issue_samples": report_resolved[:max_samples],
         "note": (
             "Omni validates the full model server-side; label filtering is applied locally "
             "after content metadata lookup."
@@ -309,6 +346,35 @@ def run_content_validation(
     )
     exit_code = 1 if (len(new_items) if fail_on_new_only else len(normalized)) > 0 else 0
     return report, exit_code
+
+
+def _prepare_validator_payload(
+    payload: Any,
+    labels: list[str],
+    records_by_identifier: dict[str, dict[str, Any]],
+) -> Any:
+    if not isinstance(payload, dict) or not isinstance(payload.get("content"), list):
+        return payload
+    if labels:
+        payload = filter_validator_payload(payload, set(records_by_identifier))
+    return enrich_validator_payload(payload, records_by_identifier)
+
+
+def _report_issue(
+    item: dict[str, Any],
+    *,
+    state: str,
+    severity: str,
+    active: bool = True,
+) -> dict[str, Any]:
+    return {
+        **item,
+        "validator": "content",
+        "severity": severity,
+        "message": item.get("summary") or "Omni content validation issue",
+        "state": state,
+        "active": active,
+    }
 
 
 def _sanitize_issues(

@@ -19,8 +19,8 @@ def render_markdown_report(report: dict[str, Any]) -> str:
         "",
         f"**{_decision_label(decision)}**",
         "",
-        f"- Policy decision: `{decision}`",
-        f"- Exit code reason: `{exit_reason}`",
+        f"- Policy decision: `{_safe_code(decision)}`",
+        f"- Exit code reason: `{_safe_code(exit_reason)}`",
         f"- Blocking issues: `{len(blocking)}`",
         f"- Downstream impacts: `{len(impacts)}`",
         f"- Coverage gaps: `{len(coverage_gaps)}`",
@@ -57,11 +57,11 @@ def render_markdown_report(report: dict[str, Any]) -> str:
         "",
         "## Audit Metadata",
         "",
-        f"- Tool version: `{report.get('tool_version', 'unknown')}`",
-        f"- Generated at: `{report.get('generated_at', '')}`",
-        f"- Git SHA: `{report.get('git_sha', '')}`",
-        f"- Git branch: `{report.get('git_branch', '')}`",
-        f"- Config hash: `{report.get('config_hash', '')}`",
+        f"- Tool version: `{_safe_code(report.get('tool_version', 'unknown'))}`",
+        f"- Generated at: `{_safe_code(report.get('generated_at', ''))}`",
+        f"- Git SHA: `{_safe_code(report.get('git_sha', ''))}`",
+        f"- Git branch: `{_safe_code(report.get('git_branch', ''))}`",
+        f"- Config hash: `{_safe_code(report.get('config_hash', ''))}`",
     ]
     lines.append("")
     return "\n".join(lines)
@@ -92,13 +92,14 @@ def _model_lines(report: dict[str, Any]) -> list[str]:
                 continue
             branch = model.get("branch_name") or model.get("branch_id") or ""
             lines.append(
-                f"- `{model.get('model_id', '')}` path `{model.get('model_path', '')}` branch `{branch}`"
+                f"- `{_safe_code(model.get('model_id', ''))}` path "
+                f"`{_safe_code(model.get('model_path', ''))}` branch `{_safe_code(branch)}`"
             )
         return lines or ["- Model context unavailable."]
     return [
-        f"- Model ID: `{report.get('model_id', '')}`",
-        f"- Model path: `{report.get('model_path', '')}`",
-        f"- Branch: `{report.get('branch_name') or report.get('branch_id') or ''}`",
+        f"- Model ID: `{_safe_code(report.get('model_id', ''))}`",
+        f"- Model path: `{_safe_code(report.get('model_path', ''))}`",
+        f"- Branch: `{_safe_code(report.get('branch_name') or report.get('branch_id') or '')}`",
     ]
 
 
@@ -109,7 +110,10 @@ def _issue_lines(issues: list[dict[str, Any]], *, empty: str, limit: int) -> lis
     for issue in issues[:limit]:
         severity = issue.get("severity") or issue.get("risk") or "info"
         location = issue.get("file") or issue.get("yaml_path") or issue.get("field") or issue.get("name") or ""
-        lines.append(f"- **{severity}** `{location}` {issue.get('message') or issue.get('summary') or ''}")
+        lines.append(
+            f"- **{_safe_text(severity)}** `{_safe_code(location)}` "
+            f"{_safe_text(issue.get('message') or issue.get('summary') or '')}"
+        )
     if len(issues) > limit:
         lines.append(f"- _{len(issues) - limit} more issue(s) omitted from PR summary._")
     return lines
@@ -123,7 +127,7 @@ def _impact_lines(impacts: list[dict[str, Any]]) -> list[str]:
         impact_level = issue.get("impact_level") or "unknown"
         target = issue.get("field") or issue.get("previous_field") or issue.get("name") or ""
         referenced = issue.get("referenced_content") if isinstance(issue.get("referenced_content"), list) else []
-        lines.append(f"- **{impact_level}** `{target}` referenced content: `{len(referenced)}`")
+        lines.append(f"- **{_safe_text(impact_level)}** `{_safe_code(target)}` referenced content: `{len(referenced)}`")
     if len(impacts) > 20:
         lines.append(f"- _{len(impacts) - 20} more impact(s) omitted from PR summary._")
     return lines
@@ -138,7 +142,9 @@ def _coverage_gaps(report: dict[str, Any]) -> list[dict[str, Any]]:
     for model_report in report.get("model_reports", []) if isinstance(report.get("model_reports"), list) else []:
         if not isinstance(model_report, dict):
             continue
-        for check_report in model_report.get("check_reports", []) if isinstance(model_report.get("check_reports"), list) else []:
+        for check_report in (
+            model_report.get("check_reports", []) if isinstance(model_report.get("check_reports"), list) else []
+        ):
             value = check_report.get("coverage_gaps") if isinstance(check_report, dict) else None
             if isinstance(value, list):
                 gaps.extend(item for item in value if isinstance(item, dict))
@@ -150,7 +156,10 @@ def _coverage_gap_lines(gaps: list[dict[str, Any]]) -> list[str]:
         return ["_No dependency coverage gaps._"]
     lines = []
     for gap in gaps[:10]:
-        lines.append(f"- `{gap.get('type', '')}` `{gap.get('name', '')}` {gap.get('message', '')}")
+        lines.append(
+            f"- `{_safe_code(gap.get('type', ''))}` `{_safe_code(gap.get('name', ''))}` "
+            f"{_safe_text(gap.get('message', ''))}"
+        )
     if len(gaps) > 10:
         lines.append(f"- _{len(gaps) - 10} more coverage gap(s) omitted from PR summary._")
     return lines
@@ -180,4 +189,26 @@ def _reviewer_actions(
 
 
 def _is_blocking(issue: dict[str, Any]) -> bool:
-    return issue.get("severity") == "error" or issue.get("impact_level") == "referenced_breaking"
+    return issue.get("active", True) and issue.get("severity") == "error"
+
+
+def _safe_text(value: Any) -> str:
+    text = _normalized_text(value)
+    for character in ("\\", "`", "*", "_", "{", "}", "[", "]", "(", ")", "#", "+", "-", ".", "!", "|", "~"):
+        text = text.replace(character, f"\\{character}")
+    return text.replace("@", "&#64;")
+
+
+def _safe_code(value: Any) -> str:
+    return _normalized_text(value).replace("`", "'").replace("@", "&#64;")
+
+
+def _normalized_text(value: Any) -> str:
+    return (
+        str(value or "")
+        .replace("\r", " ")
+        .replace("\n", " ")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )

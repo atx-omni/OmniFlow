@@ -14,7 +14,7 @@ class FakeExposureClient:
         self.payload = payload
         self.error = error
 
-    def get_dbt_exposures(self, model_id):
+    def get_dbt_exposures(self, model_id, *, branch_id=None):
         if self.error:
             raise self.error
         return self.payload
@@ -25,18 +25,24 @@ class ExposureArtifactTests(unittest.TestCase):
         report, exit_code = run_dbt_exposure_enrichment(
             client=FakeExposureClient(
                 {
-                    "exposures": [
+                    "records": [
                         {
-                            "id": "dash-1",
-                            "name": "Executive Revenue",
-                            "url": "https://omni.example/dash",
-                            "owner": {"name": "Alice", "email": "alice@example.com"},
-                            "depends_on": [{"name": "model.orders"}],
+                            "dashboard_identifier": "dash-1",
+                            "deduplication_name": "executive_revenue",
+                            "exposure": {
+                                "name": "executive_revenue",
+                                "label": "Executive Revenue",
+                                "type": "dashboard",
+                                "url": "https://omni.example/dash",
+                                "owner": {"name": "Alice", "email": "alice@example.com"},
+                                "depends_on": ["model.orders"],
+                            },
                         }
                     ]
                 }
             ),
             model_id="model-1",
+            branch_id="branch-1",
             settings=DbtExposureSettings(enabled=True),
         )
         self.assertEqual(exit_code, 0)
@@ -47,6 +53,7 @@ class ExposureArtifactTests(unittest.TestCase):
         report, exit_code = run_dbt_exposure_enrichment(
             client=FakeExposureClient(error=OmniAPIError("missing permission")),
             model_id="model-1",
+            branch_id=None,
             settings=DbtExposureSettings(enabled=True),
         )
         self.assertEqual(exit_code, 0)

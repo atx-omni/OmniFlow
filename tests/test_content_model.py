@@ -14,10 +14,13 @@ from omniflow.validators.model import parse_model_issues, run_model_validation
 class FakeClient:
     def __init__(self):
         self.content_payload = {}
+        self.base_content_payload = None
         self.content_records = []
         self.model_payload = []
 
     def validate_content(self, *args, **kwargs):
+        if kwargs.get("branch_id") is None and self.base_content_payload is not None:
+            return self.base_content_payload
         return self.content_payload
 
     def list_content(self, *args, **kwargs):
@@ -52,7 +55,13 @@ class ContentModelTests(unittest.TestCase):
 
     def test_issue_identity_ignores_metadata_enrichment(self):
         base = {"message": "Broken", "document_identifier": "dash-1"}
-        enriched = {**base, "document_labels": ["Verified"], "document_owner": {"name": "Alice"}}
+        enriched = {
+            **base,
+            "document_name": "Renamed dashboard",
+            "query_name": "Renamed query",
+            "document_labels": ["Verified"],
+            "document_owner": {"name": "Alice"},
+        }
         self.assertEqual(issue_identity(base), issue_identity(enriched))
 
     def test_content_validation_fail_on_new_only(self):
@@ -83,6 +92,48 @@ class ContentModelTests(unittest.TestCase):
         self.assertEqual(report["new_issues"], 1)
         self.assertEqual(exit_code, 1)
 
+    def test_branch_content_compares_to_base_model_without_persisted_history(self):
+        client = FakeClient()
+        client.content_payload = {
+            "content": [
+                {
+                    "identifier": "dash-1",
+                    "name": "Revenue",
+                    "queries_and_issues": [
+                        {"query_name": "Existing", "issues": [{"message": "Existing issue"}]},
+                        {"query_name": "New", "issues": [{"message": "New issue"}]},
+                    ],
+                }
+            ]
+        }
+        client.base_content_payload = {
+            "content": [
+                {
+                    "identifier": "dash-1",
+                    "name": "Revenue",
+                    "queries_and_issues": [{"query_name": "Existing", "issues": [{"message": "Existing issue"}]}],
+                }
+            ]
+        }
+        client.content_records = [{"identifier": "dash-1"}]
+        with tempfile.TemporaryDirectory() as tmp:
+            report, exit_code = run_content_validation(
+                client=client,
+                model_id="model-1",
+                branch_id="branch-1",
+                user_id=None,
+                include_personal_folders=False,
+                labels=[],
+                history_in=Path(tmp) / "missing-history.json",
+                history_out=Path(tmp) / "history.json",
+                report_out=Path(tmp) / "report.json",
+                fail_on_new_only=True,
+            )
+        self.assertEqual(report["comparison_source"], "base_model")
+        self.assertEqual(report["new_issues"], 1)
+        self.assertEqual(report["existing_issues"], 1)
+        self.assertEqual(exit_code, 1)
+
     def test_content_validation_strips_raw_issue_by_default(self):
         client = FakeClient()
         client.content_payload = {
@@ -91,7 +142,15 @@ class ContentModelTests(unittest.TestCase):
                     "identifier": "dash-1",
                     "name": "Revenue",
                     "queries_and_issues": [
-                        {"query_name": "Q1", "issues": [{"message": "Broken field", "secretish_detail": "raw"}]}
+                        {
+                            "query_name": "Q1",
+                            "issues": [
+                                {
+                                    "message": "Broken field",
+                                    "secretish_detail": "raw",  # pragma: allowlist secret
+                                }
+                            ],
+                        }
                     ],
                 }
             ]

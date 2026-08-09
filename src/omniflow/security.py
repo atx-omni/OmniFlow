@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from .exceptions import SecurityPolicyError
-
 
 SECRET_KEY_RE = re.compile(r"(api[_-]?key|token|secret|password)", re.IGNORECASE)
 SECRET_VALUE_RE = re.compile(
@@ -15,6 +17,10 @@ SECRET_VALUE_RE = re.compile(
     r"([?&](?:api[_-]?key|token|secret|password)=)[^&\s]+",
     re.IGNORECASE,
 )
+EMAIL_VALUE_RE = re.compile(r"(?<![\w.+-])[\w.+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?![\w.-])")
+URL_VALUE_RE = re.compile(r"https?://[^\s<>\]\[)('`\"]+", re.IGNORECASE)
+SAFE_PATH_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+SAFE_BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$")
 RAW_KEYS = {"raw", "raw_issue", "raw_payload", "raw_response", "payload"}
 STANDARD_PUBLIC_REDACT_KEYS = {
     "email",
@@ -37,6 +43,7 @@ STRICT_PUBLIC_REDACT_KEYS = STANDARD_PUBLIC_REDACT_KEYS | {
     "folder",
     "labels",
 }
+STRICT_TEXT_REDACT_KEYS = {"message", "summary"}
 
 
 def contains_secret_key(key: Any) -> bool:
@@ -76,7 +83,11 @@ def redact(value: Any) -> Any:
     if isinstance(value, list):
         return [redact(item) for item in value]
     if isinstance(value, str):
-        return SECRET_VALUE_RE.sub(lambda match: _redact_match(match), value)
+        redacted = SECRET_VALUE_RE.sub(lambda match: _redact_match(match), value)
+        secret = os.getenv("OMNI_API_KEY")
+        if secret and len(secret) >= 4:
+            redacted = redacted.replace(secret, "[REDACTED]")
+        return EMAIL_VALUE_RE.sub("[REDACTED_EMAIL]", URL_VALUE_RE.sub("[REDACTED_URL]", redacted))
     return value
 
 
@@ -94,7 +105,15 @@ def _public_safe(value: Any, *, strict: bool) -> Any:
             normalized = str(key).lower()
             if normalized in RAW_KEYS:
                 continue
-            if contains_secret_key(key) or normalized in redact_keys or normalized.endswith("_url") or normalized.endswith("_email"):
+            if strict and normalized in STRICT_TEXT_REDACT_KEYS and isinstance(item, str):
+                safe[key] = "[REDACTED]"
+                continue
+            if (
+                contains_secret_key(key)
+                or normalized in redact_keys
+                or normalized.endswith("_url")
+                or normalized.endswith("_email")
+            ):
                 safe[key] = "[REDACTED]"
             else:
                 safe[key] = _public_safe(item, strict=strict)
@@ -102,6 +121,51 @@ def _public_safe(value: Any, *, strict: bool) -> Any:
     if isinstance(value, list):
         return [_public_safe(item, strict=strict) for item in value]
     return redact(value)
+
+
+def validate_base_url(value: str) -> str:
+    parsed = urlparse(value)
+    is_loopback = parsed.hostname in {"127.0.0.1", "localhost", "::1"}
+    if parsed.scheme not in ({"https"} if not is_loopback else {"http", "https"}):
+        raise SecurityPolicyError("Omni base URL must use HTTPS (HTTP is allowed only for loopback testing)")
+    if not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise SecurityPolicyError("Omni base URL must contain only a trusted scheme, host, and optional port")
+    if parsed.path not in {"", "/"}:
+        raise SecurityPolicyError("Omni base URL must not include an API path")
+    return value.rstrip("/")
+
+
+def validate_path_segment(value: str, *, name: str) -> str:
+    if not SAFE_PATH_SEGMENT_RE.fullmatch(value):
+        raise SecurityPolicyError(f"{name} contains characters that are unsafe for an API path")
+    return value
+
+
+def validate_branch_name(value: str) -> str:
+    if (
+        not SAFE_BRANCH_RE.fullmatch(value)
+        or value.startswith("-")
+        or value.endswith(("/", ".", ".lock"))
+        or ".." in value
+        or "@{" in value
+        or "//" in value
+    ):
+        raise SecurityPolicyError("branch_name is not a safe Git branch name")
+    return value
+
+
+def validate_repo_output_path(value: str | Path) -> Path:
+    repo_root = Path.cwd().resolve()
+    candidate = repo_root / Path(value)
+    target = candidate.resolve()
+    try:
+        target.relative_to(repo_root)
+    except ValueError as exc:
+        raise SecurityPolicyError("OmniFlow output directory must resolve inside the repository") from exc
+    lexical = Path(os.path.abspath(candidate))
+    if target != lexical:
+        raise SecurityPolicyError("OmniFlow output paths must not traverse symbolic links")
+    return Path(value)
 
 
 def _redact_match(match: re.Match[str]) -> str:

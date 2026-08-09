@@ -1,0 +1,11 @@
+include CODE_OF_CONDUCT.md
+include CONTRIBUTING.md
+include LICENSE
+include README.md
+include SECURITY.md
+include action.yml
+include .omniflow.example.yml
+recursive-include .github *.yml
+recursive-include .omni *.json
+recursive-include scripts *.py
+recursive-include tests *.py

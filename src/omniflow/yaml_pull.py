@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any
 
-from .exceptions import ConfigError
+from .exceptions import ConfigError, OmniAPIError, SecurityPolicyError
 from .omni_client import OmniClient
 
 SUPPORTED_YAML_MODES = {"extension", "staged", "combined"}
@@ -33,12 +34,15 @@ def pull_yaml(
         fully_resolved=fully_resolved,
     )
     root = Path(output_dir)
+    _validate_yaml_root(root)
     root.mkdir(parents=True, exist_ok=True)
     files = _extract_file_map(payload)
+    if not files:
+        raise OmniAPIError("Omni model YAML response did not contain any authored files")
     checksums = _extract_checksums(payload)
     manifest_files: dict[str, dict[str, str | None]] = {}
     for file_name, text in files.items():
-        target = root / file_name
+        target = _safe_yaml_target(root, file_name)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text, encoding="utf-8")
         manifest_files[file_name] = {
@@ -52,8 +56,35 @@ def pull_yaml(
         "fully_resolved": fully_resolved,
         "files": manifest_files,
     }
-    (root / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    manifest_target = _safe_yaml_target(root, "manifest.json")
+    manifest_target.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return manifest
+
+
+def _validate_yaml_root(root: Path) -> None:
+    lexical = Path(os.path.abspath(root))
+    for component in (lexical, *lexical.parents):
+        if component.is_symlink() and os.access(component.parent, os.W_OK):
+            raise SecurityPolicyError("Omni YAML output paths must not traverse user-writable symbolic links")
+
+
+def _safe_yaml_target(root: Path, file_name: str) -> Path:
+    relative = Path(file_name)
+    if relative.is_absolute() or not file_name.strip() or ".." in relative.parts:
+        raise SecurityPolicyError("Omni YAML response contained an unsafe file path")
+    if root.is_symlink():
+        raise SecurityPolicyError("Omni YAML output directory must not be a symbolic link")
+    target = root / relative
+    current = root
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise SecurityPolicyError("Omni YAML response targeted a symbolic link")
+    try:
+        target.resolve().relative_to(root.resolve())
+    except ValueError as exc:
+        raise SecurityPolicyError("Omni YAML response attempted to write outside the output directory") from exc
+    return target
 
 
 def _extract_file_map(payload: dict[str, Any]) -> dict[str, str]:

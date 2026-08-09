@@ -28,7 +28,9 @@ contracts:
 """,
                 encoding="utf-8",
             )
-            with mock.patch.dict(os.environ, {"GITHUB_HEAD_REF": "feature/a", "OMNI_MODEL_ID": "model-env"}, clear=True):
+            with mock.patch.dict(
+                os.environ, {"GITHUB_HEAD_REF": "feature/a", "OMNI_MODEL_ID": "model-env"}, clear=True
+            ):
                 config = load_config(path)
         self.assertEqual(config.omni.model_id, "model-env")
         self.assertEqual(config.omni.branch_name, "feature/a")
@@ -50,6 +52,48 @@ contracts:
             path.write_text("omni:\n  api_key: nope\n", encoding="utf-8")
             with self.assertRaises(SecurityPolicyError):
                 load_config(path)
+
+    def test_rejects_secret_environment_expansion_from_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".omniflow.yml"
+            path.write_text("reporting:\n  output_dir: ${OMNI_API_KEY}\n", encoding="utf-8")
+            with mock.patch.dict(
+                os.environ,
+                {"OMNI_API_KEY": "do-not-expand"},  # pragma: allowlist secret
+                clear=True,
+            ):
+                with self.assertRaises(SecurityPolicyError):
+                    load_config(path)
+
+    def test_rejects_unsafe_raw_output_in_ci_policy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".omniflow.yml"
+            path.write_text("security:\n  allow_raw_response_output: true\n", encoding="utf-8")
+            with self.assertRaises(SecurityPolicyError):
+                load_config(path)
+
+    def test_rejects_output_directory_symlinked_outside_repository(self):
+        original = os.getcwd()
+        with tempfile.TemporaryDirectory() as repo, tempfile.TemporaryDirectory() as outside:
+            os.chdir(repo)
+            try:
+                Path(".omniflow").symlink_to(outside, target_is_directory=True)
+                with self.assertRaises(SecurityPolicyError):
+                    load_config()
+            finally:
+                os.chdir(original)
+
+    def test_rejects_output_directory_symlinked_within_repository(self):
+        original = os.getcwd()
+        with tempfile.TemporaryDirectory() as repo:
+            os.chdir(repo)
+            try:
+                Path("actual-output").mkdir()
+                Path(".omniflow").symlink_to("actual-output", target_is_directory=True)
+                with self.assertRaises(SecurityPolicyError):
+                    load_config()
+            finally:
+                os.chdir(original)
 
     def test_redacts_tokens_from_strings_and_mappings(self):
         self.assertEqual(redact("Authorization: Bearer abc123"), "Authorization: Bearer [REDACTED]")

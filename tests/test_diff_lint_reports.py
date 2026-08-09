@@ -1,14 +1,14 @@
-import json
 import tempfile
 import unittest
 from pathlib import Path
 
-from omniflow.exceptions import ConfigError
 from omniflow.diff.diff_engine import diff_graphs
 from omniflow.diff.semantic_graph import build_graph
 from omniflow.diff.yaml_loader import load_yaml_files
-from omniflow.reporting.markdown_report import render_markdown_report
+from omniflow.exceptions import ConfigError, SecurityPolicyError
+from omniflow.github.annotations import annotation_lines
 from omniflow.reporting.junit_report import to_junit
+from omniflow.reporting.markdown_report import render_markdown_report
 from omniflow.reporting.sarif_report import to_sarif
 from omniflow.validators.yaml_lint import has_error, lint_graph
 from omniflow.yaml_pull import pull_yaml
@@ -20,6 +20,11 @@ class FakeYamlClient:
             "files": {"views/orders.view": "name: orders\nfields:\n  id:\n    primary_key: true\n"},
             "checksums": {"views/orders.view": "abc"},
         }
+
+
+class UnsafeYamlClient:
+    def get_model_yaml(self, *args, **kwargs):
+        return {"files": {"../escaped.view": "name: escaped\n"}, "checksums": {}}
 
 
 class DiffLintReportTests(unittest.TestCase):
@@ -52,8 +57,74 @@ class DiffLintReportTests(unittest.TestCase):
                     mode="staged",
                 )
 
+    def test_yaml_pull_rejects_path_traversal_from_api_response(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(SecurityPolicyError):
+                pull_yaml(
+                    client=UnsafeYamlClient(),
+                    model_id="model-1",
+                    branch_id=None,
+                    output_dir=Path(tmp) / "yaml",
+                )
+            self.assertFalse((Path(tmp) / "escaped.view").exists())
+
+    def test_yaml_pull_rejects_symlinked_api_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "yaml"
+            root.mkdir()
+            outside = Path(tmp) / "outside.view"
+            outside.write_text("original\n", encoding="utf-8")
+            (root / "views").mkdir()
+            (root / "views/orders.view").symlink_to(outside)
+            with self.assertRaises(SecurityPolicyError):
+                pull_yaml(
+                    client=FakeYamlClient(),
+                    model_id="model-1",
+                    branch_id=None,
+                    output_dir=root,
+                )
+            self.assertEqual(outside.read_text(encoding="utf-8"), "original\n")
+
+    def test_yaml_pull_rejects_symlinked_parent_output_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            real_parent = Path(tmp) / "real"
+            real_parent.mkdir()
+            linked_parent = Path(tmp) / "linked"
+            linked_parent.symlink_to(real_parent, target_is_directory=True)
+            with self.assertRaises(SecurityPolicyError):
+                pull_yaml(
+                    client=FakeYamlClient(),
+                    model_id="model-1",
+                    branch_id=None,
+                    output_dir=linked_parent / "yaml",
+                )
+            self.assertFalse((real_parent / "yaml").exists())
+
+    def test_yaml_pull_rejects_symlinked_manifest_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "yaml"
+            root.mkdir()
+            outside = Path(tmp) / "outside.json"
+            outside.write_text("original\n", encoding="utf-8")
+            (root / "manifest.json").symlink_to(outside)
+            with self.assertRaises(SecurityPolicyError):
+                pull_yaml(
+                    client=FakeYamlClient(),
+                    model_id="model-1",
+                    branch_id=None,
+                    output_dir=root,
+                )
+            self.assertEqual(outside.read_text(encoding="utf-8"), "original\n")
+
     def test_semantic_diff_detects_deleted_field_and_type_change(self):
-        base = build_graph({"views/orders.view": {"name": "orders", "fields": {"id": {"type": "number"}, "revenue": {"type": "number"}}}})
+        base = build_graph(
+            {
+                "views/orders.view": {
+                    "name": "orders",
+                    "fields": {"id": {"type": "number"}, "revenue": {"type": "number"}},
+                }
+            }
+        )
         head = build_graph({"views/orders.view": {"name": "orders", "fields": {"id": {"type": "string"}}}})
         report = diff_graphs(base, head)
         types = {change["type"] for change in report["changes"]}
@@ -62,23 +133,211 @@ class DiffLintReportTests(unittest.TestCase):
         self.assertEqual(report["risk_level"], "breaking")
 
     def test_semantic_diff_detects_relationship_type_change(self):
-        base = build_graph({"relationships/order_items.relationships": {"relationships": {"orders": {"relationship_type": "many_to_one"}}}})
-        head = build_graph({"relationships/order_items.relationships": {"relationships": {"orders": {"relationship_type": "one_to_many"}}}})
+        base = build_graph(
+            {
+                "relationships/order_items.relationships": {
+                    "relationships": {"orders": {"relationship_type": "many_to_one"}}
+                }
+            }
+        )
+        head = build_graph(
+            {
+                "relationships/order_items.relationships": {
+                    "relationships": {"orders": {"relationship_type": "one_to_many"}}
+                }
+            }
+        )
         report = diff_graphs(base, head)
         types = {change["type"] for change in report["changes"]}
         self.assertIn("relationship_cardinality_changed", types)
+
+    def test_semantic_diff_parses_documented_top_level_relationship_list(self):
+        base = build_graph(
+            {
+                "relationships.yaml": [
+                    {
+                        "join_from_view": "orders",
+                        "join_to_view": "order_items",
+                        "relationship_type": "many_to_one",
+                    }
+                ]
+            }
+        )
+        head = build_graph(
+            {
+                "relationships.yaml": [
+                    {
+                        "join_from_view": "orders",
+                        "join_to_view": "order_items",
+                        "relationship_type": "one_to_many",
+                    }
+                ]
+            }
+        )
+        report = diff_graphs(base, head)
+        cardinality = next(
+            change for change in report["changes"] if change["type"] == "relationship_cardinality_changed"
+        )
+        self.assertEqual(cardinality["affected_views"], ["orders", "order_items"])
+        self.assertEqual(cardinality["risk"], "breaking")
+
+    def test_semantic_diff_parses_documented_topic_level_relationships(self):
+        base = build_graph(
+            {
+                "topics/orders.topic": {
+                    "base_view": "orders",
+                    "relationships": [
+                        {
+                            "join_from_view": "orders",
+                            "join_to_view": "users",
+                            "join_to_view_as": "buyers",
+                            "relationship_type": "many_to_one",
+                        }
+                    ],
+                }
+            }
+        )
+        head = build_graph(
+            {
+                "topics/orders.topic": {
+                    "base_view": "orders",
+                    "relationships": [
+                        {
+                            "join_from_view": "orders",
+                            "join_to_view": "users",
+                            "join_to_view_as": "buyers",
+                            "relationship_type": "one_to_many",
+                        }
+                    ],
+                }
+            }
+        )
+        report = diff_graphs(base, head)
+        cardinality = next(
+            change for change in report["changes"] if change["type"] == "relationship_cardinality_changed"
+        )
+        self.assertEqual(cardinality["affected_views"], ["orders", "users"])
+        self.assertEqual(cardinality["name"], "orders:->users:buyers")
+
+    def test_topic_join_visibility_tree_is_not_treated_as_a_relationship_definition(self):
+        graph = build_graph(
+            {
+                "topics/orders.topic": {
+                    "base_view": "orders",
+                    "joins": {"users": {}, "items": {"products": {}}},
+                }
+            }
+        )
+        self.assertEqual(graph.relationships, {})
+
+    def test_reordering_relationships_does_not_create_semantic_changes(self):
+        first = {
+            "join_from_view": "orders",
+            "join_to_view": "users",
+            "relationship_type": "many_to_one",
+        }
+        second = {
+            "join_from_view": "orders",
+            "join_to_view": "items",
+            "relationship_type": "one_to_many",
+        }
+        base = build_graph({"relationships.yaml": [first, second]})
+        head = build_graph({"relationships.yaml": [second, first]})
+        self.assertEqual(diff_graphs(base, head)["changes"], [])
+
+    def test_topic_and_global_relationships_with_same_endpoints_do_not_overwrite_each_other(self):
+        relationship = {
+            "join_from_view": "orders",
+            "join_to_view": "users",
+            "relationship_type": "many_to_one",
+        }
+        graph = build_graph(
+            {
+                "relationships.yaml": [relationship],
+                "topics/orders.topic": {"base_view": "orders", "relationships": [relationship]},
+            }
+        )
+        self.assertEqual(len(graph.relationships), 2)
 
     def test_rule_severity_handling(self):
         graph = build_graph({"views/orders.view": {"name": "orders", "fields": {"revenue": {"type": "number"}}}})
         issues = lint_graph(graph, configured_rules={"require_primary_keys": "error"})
         self.assertTrue(has_error(issues))
 
+    def test_default_lint_does_not_block_unreferenced_deletion(self):
+        base = build_graph(
+            {
+                "views/orders.view": {
+                    "name": "orders",
+                    "dimensions": {
+                        "id": {"primary_key": True, "description": "Order ID"},
+                        "legacy": {"description": "Legacy value"},
+                    },
+                }
+            }
+        )
+        head = build_graph(
+            {
+                "views/orders.view": {
+                    "name": "orders",
+                    "dimensions": {"id": {"primary_key": True, "description": "Order ID"}},
+                }
+            }
+        )
+        issues = lint_graph(head, diff_result=diff_graphs(base, head))
+        deletion = next(issue for issue in issues if issue["rule_id"] == "block_deleted_fields")
+        self.assertEqual(deletion["severity"], "warning")
+        self.assertFalse(has_error(issues))
+
+    def test_many_to_many_lint_reads_documented_relationship_type(self):
+        graph = build_graph(
+            {
+                "relationships.yaml": [
+                    {
+                        "join_from_view": "orders",
+                        "join_to_view": "customers",
+                        "relationship_type": "many_to_many",
+                    }
+                ]
+            }
+        )
+        issues = lint_graph(
+            graph,
+            configured_rules={"forbid_many_to_many_without_comment": "error"},
+        )
+        self.assertTrue(any(issue["rule_id"] == "forbid_many_to_many_without_comment" for issue in issues))
+        self.assertTrue(has_error(issues))
+
     def test_sarif_and_junit_output(self):
-        report = {"tool_version": "0.4.0", "issues": [{"rule_id": "x", "severity": "error", "file": "a.yml", "message": "bad"}]}
+        report = {
+            "tool_version": "0.4.0",
+            "issues": [{"rule_id": "x", "severity": "error", "file": "a.yml", "message": "bad"}],
+        }
         sarif = to_sarif(report)
         junit = to_junit(report)
         self.assertEqual(sarif["version"], "2.1.0")
         self.assertIn("<failure", junit)
+
+    def test_github_annotations_follow_policy_severity_and_escape_commands(self):
+        lines = annotation_lines(
+            [
+                {
+                    "severity": "warning",
+                    "risk": "breaking",
+                    "file": "views/orders:view,one.view",
+                    "message": "line one\nline two%",
+                },
+                {"severity": "error", "message": "blocked"},
+                {"severity": "info", "active": False, "message": "resolved"},
+            ]
+        )
+        self.assertTrue(lines[0].startswith("::warning "))
+        self.assertIn("%3A", lines[0])
+        self.assertIn("%2C", lines[0])
+        self.assertIn("%0A", lines[0])
+        self.assertIn("%25", lines[0])
+        self.assertTrue(lines[1].startswith("::error "))
+        self.assertEqual(len(lines), 2)
 
     def test_markdown_report_is_reviewer_friendly_for_contract_failure(self):
         report = {
@@ -121,6 +380,23 @@ class DiffLintReportTests(unittest.TestCase):
         self.assertIn("referenced content: `1`", markdown)
         self.assertIn("orders.margin", markdown)
         self.assertIn("Resolve blocking validation", markdown)
+
+    def test_markdown_report_escapes_model_controlled_markup_and_mentions(self):
+        report = {
+            "policy_decision": "fail",
+            "issues": [
+                {
+                    "severity": "error",
+                    "message": "[click](https://example.com) @maintainers **urgent** <img src=x>",
+                }
+            ],
+        }
+        markdown = render_markdown_report(report)
+        self.assertNotIn("[click](", markdown)
+        self.assertNotIn("@maintainers", markdown)
+        self.assertNotIn("<img", markdown)
+        self.assertIn("\\[click\\]", markdown)
+        self.assertIn("&#64;maintainers", markdown)
 
     def test_markdown_report_guides_skipped_non_omni_prs(self):
         markdown = render_markdown_report(

@@ -11,7 +11,7 @@ class ExitCodes:
     INTERNAL_ERROR = 6
 
 
-class OmniCIError(Exception):
+class OmniFlowError(Exception):
     exit_code = ExitCodes.INTERNAL_ERROR
 
     def __init__(self, message: str, *, exit_code: int | None = None) -> None:
@@ -20,18 +20,17 @@ class OmniCIError(Exception):
             self.exit_code = exit_code
 
 
-class ConfigError(OmniCIError):
+class ConfigError(OmniFlowError):
     exit_code = ExitCodes.CONFIGURATION_ERROR
 
 
-class SecurityPolicyError(OmniCIError):
+class SecurityPolicyError(OmniFlowError):
     exit_code = ExitCodes.SECURITY_POLICY_VIOLATION
 
 
-class OmniAPIError(OmniCIError):
+class OmniAPIError(OmniFlowError):
     exit_code = ExitCodes.OMNI_API_ERROR
 
 
-class OmniAuthError(OmniCIError):
+class OmniAuthError(OmniFlowError):
     exit_code = ExitCodes.AUTHORIZATION_ERROR
-

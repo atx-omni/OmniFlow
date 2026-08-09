@@ -1,14 +1,12 @@
 name: OmniFlow
 
 on:
-  pull_request:
+  pull_request_target:
   push:
     branches: [main]
   workflow_dispatch:
 
 permissions:
-  actions: read
-  checks: write
   contents: read
   pull-requests: write
   security-events: write
@@ -28,18 +26,18 @@ jobs:
           python-version: "3.11"
 
       - name: Run OmniFlow
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        if: github.event_name != 'pull_request_target' || github.event.pull_request.head.repo.full_name == github.repository
         uses: atx-omni/omniflow@<pinned-commit-sha>
         env:
           OMNI_API_KEY: ${{ secrets.OMNI_API_KEY }}
         with:
           config: .omniflow.yml
 
-      - name: Skip unsafe fork PR
-        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
-        run: |
-          mkdir -p .omniflow
-          printf '{"policy_decision":"skipped","reason":"Fork pull request cannot access OMNI_API_KEY safely."}\n' > .omniflow/report.json
+      - name: Route fork pull request without Omni secret
+        if: github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name != github.repository
+        uses: atx-omni/omniflow@<pinned-commit-sha>
+        with:
+          config: .omniflow.yml
 
       - name: Upload evidence artifacts
         if: always()
@@ -64,14 +62,16 @@ jobs:
           sarif_file: .omniflow/public/report.sarif
 
       - name: Comment on PR
-        if: always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && hashFiles('.omniflow/public/report.md') != ''
+        if: always() && github.event_name == 'pull_request_target' && hashFiles('.omniflow/public/report.md') != ''
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
+          set -euo pipefail
           MARKER='<!-- omniflow-report -->'
           BODY="$(printf '%s\n\n' "$MARKER"; cat .omniflow/public/report.md)"
-          EXISTING="$(gh pr view "$PR_NUMBER" --json comments --jq '.comments[] | select(.body | contains("<!-- omniflow-report -->")) | .id' | head -n 1)"
+          EXISTING="$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100" \
+            --jq '[.[] | select(.body | contains("<!-- omniflow-report -->"))][0].id // empty')"
           if [ -n "$EXISTING" ]; then
             gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${EXISTING}" -f body="$BODY" >/dev/null
           else

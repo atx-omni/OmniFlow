@@ -34,7 +34,9 @@ def to_sarif(report: dict[str, Any]) -> dict[str, Any]:
         "version": "2.1.0",
         "runs": [
             {
-                "tool": {"driver": {"name": "omniflow", "version": report.get("tool_version"), "rules": list(rules.values())}},
+                "tool": {
+                    "driver": {"name": "omniflow", "version": report.get("tool_version"), "rules": list(rules.values())}
+                },
                 "results": results,
             }
         ],
@@ -53,4 +55,3 @@ def _sarif_level(value: Any) -> str:
     if value in {"warning", "warn"}:
         return "warning"
     return "note"
-

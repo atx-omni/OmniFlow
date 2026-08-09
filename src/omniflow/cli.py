@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import argparse
-import datetime as dt
+import os
+import platform
 import shutil
 import sys
 from pathlib import Path
@@ -9,22 +10,23 @@ from typing import Any
 
 from . import __version__
 from .artifacts import public_dir, restricted_dir, write_artifact_manifest, write_public_json, write_public_reports
-from .config import load_config, require_api_key
+from .config import DEFAULT_REPORT_FORMATS, load_config, require_api_key
 from .contracts import evaluate_contracts
 from .diff.diff_engine import diff_graphs
 from .diff.semantic_graph import build_graph
 from .diff.yaml_loader import load_yaml_files
 from .discovery import ModelContext, discover_contexts
 from .downstream import generate_downstream_dependencies
-from .evidence import build_evidence
-from .exceptions import ConfigError, ExitCodes, OmniCIError
+from .exceptions import ConfigError, ExitCodes, OmniAuthError, OmniFlowError
 from .exposures import run_dbt_exposure_enrichment
-from .git import current_branch, current_sha, pr_number
+from .git import current_branch, current_sha, event_name, pr_number
+from .github.annotations import annotation_lines
 from .logging import configure_logging
 from .omni_client import OmniClient
 from .reporting.json_report import write_json_report
 from .reporting.writer import write_reports
-from .security import redact
+from .security import redact, validate_repo_output_path
+from .timestamps import utc_now_iso
 from .validators.content import run_content_validation
 from .validators.model import run_model_validation
 from .validators.yaml_lint import has_error, lint_graph
@@ -37,7 +39,7 @@ def main(argv: list[str] | None = None) -> int:
     configure_logging("DEBUG" if getattr(args, "verbose", False) else "INFO")
     try:
         return args.func(args)
-    except OmniCIError as exc:
+    except OmniFlowError as exc:
         print(redact(str(exc)), file=sys.stderr)
         return exc.exit_code
     except Exception as exc:
@@ -54,7 +56,10 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser = subcommands.add_parser("run", help="Run enabled configured checks")
     _add_config_arg(run_parser)
     _add_common_omni_args(run_parser)
-    run_parser.add_argument("--auto", action="store_true", help="Discover Omni model context from Omni-managed metadata")
+    run_parser.add_argument(
+        "--auto", action="store_true", help="Discover Omni model context from Omni-managed metadata"
+    )
+    run_parser.add_argument("--skip-reason", help=argparse.SUPPRESS)
     run_parser.set_defaults(func=cmd_run)
 
     content = subcommands.add_parser("content", help="Content validation commands")
@@ -68,6 +73,11 @@ def build_parser() -> argparse.ArgumentParser:
     content_validate.add_argument("--label", action="append", default=[])
     content_validate.add_argument("--labels", action="append", default=[])
     content_validate.add_argument("--fail-on-new-only", action=argparse.BooleanOptionalAction, default=None)
+    content_validate.add_argument(
+        "--unsafe-raw-output",
+        action="store_true",
+        help="Include raw issue objects for an explicit local debugging run",
+    )
     content_validate.set_defaults(func=cmd_content_validate)
 
     model = subcommands.add_parser("model", help="Model validation commands")
@@ -131,8 +141,17 @@ def _add_common_omni_args(parser: argparse.ArgumentParser) -> None:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    config = _override_config(load_config(args.config), args)
+    try:
+        config = _override_config(load_config(args.config), args)
+    except OmniFlowError as exc:
+        _write_unconfigured_failure_artifacts(output_dir=Path(".omniflow"), exc=exc)
+        raise
     output_dir = Path(config.reporting.output_dir)
+    _validate_run_output_layout(output_dir)
+    if args.skip_reason:
+        _write_skipped_artifacts(config=config, output_dir=output_dir, reason=args.skip_reason)
+        print(f"OmniFlow skipped: {args.skip_reason}")
+        return 0
     try:
         contexts = discover_contexts(
             auto=args.auto,
@@ -143,7 +162,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             branch_id=config.omni.branch_id,
             allow_skip=True,
         )
-    except OmniCIError as exc:
+    except OmniFlowError as exc:
         _write_setup_failure_artifacts(config=config, output_dir=output_dir, exc=exc)
         raise
     if not contexts:
@@ -155,13 +174,14 @@ def cmd_run(args: argparse.Namespace) -> int:
     exit_code = 0
     for context in contexts:
         context_output_dir = restricted_dir(output_dir) / _safe_context_dir(context)
+        _validate_context_output_layout(context_output_dir)
         try:
             context_report, context_exit = _run_context(
                 config=config,
                 context=context,
                 output_dir=context_output_dir,
             )
-        except OmniCIError as exc:
+        except OmniFlowError as exc:
             context_report, context_exit = _write_context_failure_artifacts(
                 config=config,
                 context=context,
@@ -176,12 +196,13 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     summary = _summarize(all_issues)
     report = _aggregate_report(config, contexts, exit_code, all_issues, summary, all_reports)
-    write_public_reports(
+    public_report = write_public_reports(
         report,
         output_dir=output_dir,
         formats=config.reporting.formats,
         redaction_level=config.security.redaction_level,
     )
+    _emit_github_annotations(public_report.get("issues", []), limit=config.security.max_report_samples)
     evidence = {
         "tool": "omniflow",
         "tool_version": __version__,
@@ -189,14 +210,18 @@ def cmd_run(args: argparse.Namespace) -> int:
         "git_sha": current_sha(),
         "git_branch": current_branch(),
         "pr_number": pr_number(),
+        "event_type": event_name(),
+        "runner": _runner_metadata(),
         "models": [_context_dict(context) for context in contexts],
         "validation_status": "failed" if exit_code else "passed",
         "policy_decision": "fail" if exit_code else "pass",
         "exit_code": exit_code,
-        "timestamp": dt.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "timestamp": utc_now_iso(),
     }
     write_public_json(output_dir / "evidence.json", evidence, redaction_level=config.security.redaction_level)
-    write_public_json(public_dir(output_dir) / "evidence.json", evidence, redaction_level=config.security.redaction_level)
+    write_public_json(
+        public_dir(output_dir) / "evidence.json", evidence, redaction_level=config.security.redaction_level
+    )
     write_artifact_manifest(
         output_dir=output_dir,
         restricted_artifacts_enabled=config.security.retain_restricted_artifacts,
@@ -206,7 +231,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     return exit_code
 
 
-def _write_setup_failure_artifacts(*, config, output_dir: Path, exc: OmniCIError) -> None:
+def _write_setup_failure_artifacts(*, config, output_dir: Path, exc: OmniFlowError) -> None:
     issue = {
         "severity": "error",
         "validator": "setup",
@@ -216,10 +241,12 @@ def _write_setup_failure_artifacts(*, config, output_dir: Path, exc: OmniCIError
     report = {
         "tool": "omniflow",
         "tool_version": __version__,
-        "generated_at": dt.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "generated_at": utc_now_iso(),
         "git_sha": current_sha(),
         "git_branch": current_branch(),
         "pr_number": pr_number(),
+        "event_type": event_name(),
+        "runner": _runner_metadata(),
         "models": [],
         "config_hash": config.hash,
         "summary": summary,
@@ -242,15 +269,19 @@ def _write_setup_failure_artifacts(*, config, output_dir: Path, exc: OmniCIError
         "git_sha": current_sha(),
         "git_branch": current_branch(),
         "pr_number": pr_number(),
+        "event_type": event_name(),
+        "runner": _runner_metadata(),
         "models": [],
         "validation_status": "failed",
         "policy_decision": "fail",
         "exit_code": exc.exit_code,
         "exit_code_reason": report["exit_code_reason"],
-        "timestamp": dt.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "timestamp": utc_now_iso(),
     }
     write_public_json(output_dir / "evidence.json", evidence, redaction_level=config.security.redaction_level)
-    write_public_json(public_dir(output_dir) / "evidence.json", evidence, redaction_level=config.security.redaction_level)
+    write_public_json(
+        public_dir(output_dir) / "evidence.json", evidence, redaction_level=config.security.redaction_level
+    )
     write_artifact_manifest(
         output_dir=output_dir,
         restricted_artifacts_enabled=config.security.retain_restricted_artifacts,
@@ -258,15 +289,22 @@ def _write_setup_failure_artifacts(*, config, output_dir: Path, exc: OmniCIError
     )
 
 
-def _write_skipped_artifacts(*, config, output_dir: Path) -> None:
+def _write_skipped_artifacts(
+    *,
+    config,
+    output_dir: Path,
+    reason: str = "no Omni PR context or changed Omni model files detected",
+) -> None:
     summary = _summarize([])
     report = {
         "tool": "omniflow",
         "tool_version": __version__,
-        "generated_at": dt.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "generated_at": utc_now_iso(),
         "git_sha": current_sha(),
         "git_branch": current_branch(),
         "pr_number": pr_number(),
+        "event_type": event_name(),
+        "runner": _runner_metadata(),
         "models": [],
         "config_hash": config.hash,
         "summary": summary,
@@ -274,7 +312,7 @@ def _write_skipped_artifacts(*, config, output_dir: Path) -> None:
         "model_reports": [],
         "policy_decision": "skipped",
         "exit_code": 0,
-        "exit_code_reason": "no Omni PR context or changed Omni model files detected",
+        "exit_code_reason": reason,
     }
     write_public_reports(
         report,
@@ -289,15 +327,19 @@ def _write_skipped_artifacts(*, config, output_dir: Path) -> None:
         "git_sha": current_sha(),
         "git_branch": current_branch(),
         "pr_number": pr_number(),
+        "event_type": event_name(),
+        "runner": _runner_metadata(),
         "models": [],
         "validation_status": "skipped",
         "policy_decision": "skipped",
         "exit_code": 0,
         "exit_code_reason": report["exit_code_reason"],
-        "timestamp": dt.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "timestamp": utc_now_iso(),
     }
     write_public_json(output_dir / "evidence.json", evidence, redaction_level=config.security.redaction_level)
-    write_public_json(public_dir(output_dir) / "evidence.json", evidence, redaction_level=config.security.redaction_level)
+    write_public_json(
+        public_dir(output_dir) / "evidence.json", evidence, redaction_level=config.security.redaction_level
+    )
     write_artifact_manifest(
         output_dir=output_dir,
         restricted_artifacts_enabled=config.security.retain_restricted_artifacts,
@@ -379,7 +421,7 @@ def _run_context(
         lint_report = {
             "tool": "omniflow",
             "validator": "semantic_lint",
-            "generated_at": dt.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "generated_at": utc_now_iso(),
             "model_id": context.model_id,
             "branch_id": branch_id,
             "issues": lint_issues,
@@ -418,6 +460,7 @@ def _run_context(
         exposure_report, exposure_exit = run_dbt_exposure_enrichment(
             client=client,
             model_id=context.model_id,
+            branch_id=branch_id,
             settings=config.dbt_exposures,
         )
         write_json_report(output_dir / "dbt-exposures.json", exposure_report)
@@ -437,7 +480,7 @@ def _write_context_failure_artifacts(
     config,
     context: ModelContext,
     output_dir: Path,
-    exc: OmniCIError,
+    exc: OmniFlowError,
 ) -> tuple[dict[str, Any], int]:
     issue = {
         "severity": "error",
@@ -457,7 +500,9 @@ def cmd_content_validate(args: argparse.Namespace) -> int:
     client, branch_id = _client_and_branch(config)
     output_dir = Path(config.reporting.output_dir)
     labels = _labels_from_args(args) or config.content_validation.labels
-    fail_on_new_only = config.content_validation.fail_on_new_only if args.fail_on_new_only is None else args.fail_on_new_only
+    fail_on_new_only = (
+        config.content_validation.fail_on_new_only if args.fail_on_new_only is None else args.fail_on_new_only
+    )
     report, exit_code = run_content_validation(
         client=client,
         model_id=_required(config.omni.model_id, "omni.model_id"),
@@ -471,7 +516,7 @@ def cmd_content_validate(args: argparse.Namespace) -> int:
         fail_on_new_only=fail_on_new_only,
         max_samples=config.security.max_report_samples,
         redact_document_names=config.security.redact_document_names,
-        allow_raw_response_output=config.security.allow_raw_response_output,
+        allow_raw_response_output=args.unsafe_raw_output,
     )
     print(
         "Content validator results: "
@@ -484,7 +529,9 @@ def cmd_content_validate(args: argparse.Namespace) -> int:
 def cmd_model_validate(args: argparse.Namespace) -> int:
     config = _override_config(load_config(args.config), args)
     client, branch_id = _client_and_branch(config)
-    fail_on_warnings = config.model_validation.fail_on_warnings if args.fail_on_warnings is None else args.fail_on_warnings
+    fail_on_warnings = (
+        config.model_validation.fail_on_warnings if args.fail_on_warnings is None else args.fail_on_warnings
+    )
     report, exit_code = run_model_validation(
         client=client,
         model_id=_required(config.omni.model_id, "omni.model_id"),
@@ -514,10 +561,11 @@ def cmd_yaml_pull(args: argparse.Namespace) -> int:
 
 def cmd_exposures_pull(args: argparse.Namespace) -> int:
     config = _override_config(load_config(args.config), args)
-    client, _ = _client_and_branch(config)
+    client, branch_id = _client_and_branch(config)
     report, exit_code = run_dbt_exposure_enrichment(
         client=client,
         model_id=_required(config.omni.model_id, "omni.model_id"),
+        branch_id=branch_id,
         settings=config.dbt_exposures,
     )
     output_path = Path(args.out or Path(config.reporting.output_dir) / "dbt-exposures.json")
@@ -547,11 +595,7 @@ def cmd_report(args: argparse.Namespace) -> int:
 
 def cmd_doctor(args: argparse.Namespace) -> int:
     config = _override_config(load_config(args.config), args)
-    missing = []
     api_key = require_api_key()
-    if not api_key:
-        missing.append("OMNI_API_KEY")
-    contexts = []
     if args.auto:
         contexts = discover_contexts(
             auto=True,
@@ -562,22 +606,40 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             branch_id=config.omni.branch_id,
         )
         if not contexts:
-            missing.append(".omni/flow.json model context")
+            raise ConfigError("Missing .omni/flow.json model context")
     else:
-        if not config.omni.base_url:
-            missing.append("--base-url or OMNI_BASE_URL")
-        if not config.omni.model_id:
-            missing.append("--model-id or OMNI_MODEL_ID")
-    if missing:
-        raise ConfigError(f"Missing required values: {', '.join(missing)}")
+        contexts = [
+            ModelContext(
+                base_url=_required(config.omni.base_url, "--base-url or OMNI_BASE_URL"),
+                model_id=_required(config.omni.model_id, "--model-id or OMNI_MODEL_ID"),
+                model_path=getattr(args, "model_path", None) or "",
+                branch_name=config.omni.branch_name,
+                branch_id=config.omni.branch_id,
+            )
+        ]
     issues = []
+    warnings = []
     for context in contexts:
-        client = OmniClient(base_url=context.base_url, api_key=api_key, timeout=config.omni.timeout)
-        git_config = client.get_git_configuration(context.model_id)
-        issues.extend(_git_configuration_issues(context, git_config))
+        client, branch_id = _client_and_branch_for_context(context, config.omni.timeout, api_key=api_key)
+        client.get_model_yaml(
+            context.model_id,
+            branch_id=branch_id,
+            include_checksums=False,
+        )
+        try:
+            git_config = client.get_git_configuration(context.model_id)
+        except OmniAuthError:
+            warnings.append(
+                f"Model {context.model_id}: Git configuration verification was skipped because the token "
+                "does not allow this metadata read. Core model access succeeded."
+            )
+        else:
+            issues.extend(_git_configuration_issues(context, git_config))
     if issues:
         raise ConfigError("Omni Git configuration mismatch: " + "; ".join(issues))
-    print(f"omniflow doctor passed: {len(contexts) or 1} model context(s) ready")
+    for warning in warnings:
+        print(f"omniflow doctor warning: {warning}", file=sys.stderr)
+    print(f"omniflow doctor passed: {len(contexts)} model context(s) ready")
     return 0
 
 
@@ -592,10 +654,10 @@ def _client_and_branch(config):
     return _client_and_branch_for_context(context, config.omni.timeout)
 
 
-def _client_and_branch_for_context(context: ModelContext, timeout: int):
+def _client_and_branch_for_context(context: ModelContext, timeout: int, *, api_key: str | None = None):
     client = OmniClient(
         base_url=context.base_url,
-        api_key=require_api_key(),
+        api_key=api_key or require_api_key(),
         timeout=timeout,
     )
     branch_id = context.branch_id or client.resolve_branch_id(context.model_id, context.branch_name)
@@ -604,6 +666,7 @@ def _client_and_branch_for_context(context: ModelContext, timeout: int):
             f"Could not resolve Omni branch '{context.branch_name}' for model {context.model_id}. "
             "Verify the Omni PR branch exists and the API key can list model branches."
         )
+    context.branch_id = branch_id
     return client, branch_id
 
 
@@ -628,14 +691,23 @@ def _labels_from_args(args: argparse.Namespace) -> list[str]:
     return labels
 
 
-def _base_report(config, context: ModelContext, branch_id: str | None, exit_code: int, issues: list[dict[str, Any]], summary: dict[str, Any]) -> dict[str, Any]:
+def _base_report(
+    config,
+    context: ModelContext,
+    branch_id: str | None,
+    exit_code: int,
+    issues: list[dict[str, Any]],
+    summary: dict[str, Any],
+) -> dict[str, Any]:
     return {
         "tool": "omniflow",
         "tool_version": __version__,
-        "generated_at": dt.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "generated_at": utc_now_iso(),
         "git_sha": current_sha(),
         "git_branch": current_branch(),
         "pr_number": pr_number(),
+        "event_type": event_name(),
+        "runner": _runner_metadata(),
         "omni_base_url": context.base_url,
         "model_id": context.model_id,
         "model_path": context.model_path,
@@ -654,10 +726,12 @@ def _aggregate_report(config, contexts, exit_code, issues, summary, reports):
     return {
         "tool": "omniflow",
         "tool_version": __version__,
-        "generated_at": dt.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "generated_at": utc_now_iso(),
         "git_sha": current_sha(),
         "git_branch": current_branch(),
         "pr_number": pr_number(),
+        "event_type": event_name(),
+        "runner": _runner_metadata(),
         "models": [_context_dict(context) for context in contexts],
         "config_hash": config.hash,
         "summary": summary,
@@ -670,14 +744,20 @@ def _aggregate_report(config, contexts, exit_code, issues, summary, reports):
 
 
 def _summarize(issues: list[dict[str, Any]]) -> dict[str, Any]:
+    active = [issue for issue in issues if issue.get("active", True)]
+    risk_order = ["info", "warning", "governance_sensitive", "security_sensitive", "breaking"]
+    risks = [issue.get("risk", "info") for issue in active]
     return {
-        "total_issues": len(issues),
-        "errors": sum(1 for issue in issues if issue.get("severity") == "error"),
-        "warnings": sum(1 for issue in issues if issue.get("severity") in {"warning", "warn"}),
+        "total_issues": len(active),
+        "errors": sum(1 for issue in active if issue.get("severity") == "error"),
+        "warnings": sum(1 for issue in active if issue.get("severity") in {"warning", "warn"}),
         "new_issues": sum(1 for issue in issues if issue.get("state") == "new"),
         "existing_issues": sum(1 for issue in issues if issue.get("state") == "existing"),
         "resolved_issues": sum(1 for issue in issues if issue.get("state") == "resolved"),
-        "risk_level": "breaking" if any(issue.get("risk") == "breaking" for issue in issues) else "info",
+        "risk_level": max(
+            risks or ["info"],
+            key=lambda risk: risk_order.index(risk) if risk in risk_order else 0,
+        ),
     }
 
 
@@ -736,6 +816,97 @@ def _normalize_git_config_value(value: Any) -> str:
     return str(value).strip().strip("/").lower()
 
 
+def _runner_metadata() -> dict[str, Any]:
+    return {
+        "os": platform.platform(),
+        "python": platform.python_version(),
+        "github_actions": os.getenv("GITHUB_ACTIONS") == "true",
+    }
+
+
+def _emit_github_annotations(issues: list[dict[str, Any]], *, limit: int) -> None:
+    if os.getenv("GITHUB_ACTIONS") != "true":
+        return
+    for line in annotation_lines(issues[:limit]):
+        print(line)
+
+
+def _validate_run_output_layout(output_dir: Path) -> None:
+    report_names = ("report.json", "report.md", "report.sarif", "junit.xml", "evidence.json")
+    for path in (output_dir, public_dir(output_dir), restricted_dir(output_dir)):
+        validate_repo_output_path(path)
+    for name in report_names:
+        validate_repo_output_path(output_dir / name)
+        validate_repo_output_path(public_dir(output_dir) / name)
+    validate_repo_output_path(output_dir / "artifact-manifest.json")
+
+
+def _validate_context_output_layout(output_dir: Path) -> None:
+    validate_repo_output_path(output_dir)
+    for name in (
+        "report.json",
+        "history.json",
+        "content-report.json",
+        "semantic-diff.json",
+        "dependencies.json",
+        "contract-impact.json",
+        "dbt-exposures.json",
+    ):
+        validate_repo_output_path(output_dir / name)
+    for name in ("yaml-base", "yaml-head"):
+        validate_repo_output_path(output_dir / name)
+        validate_repo_output_path(output_dir / name / "manifest.json")
+
+
+def _write_unconfigured_failure_artifacts(*, output_dir: Path, exc: OmniFlowError) -> None:
+    _validate_run_output_layout(output_dir)
+    issue = {"severity": "error", "validator": "setup", "message": redact(str(exc))}
+    report = {
+        "tool": "omniflow",
+        "tool_version": __version__,
+        "generated_at": utc_now_iso(),
+        "git_sha": current_sha(),
+        "git_branch": current_branch(),
+        "pr_number": pr_number(),
+        "event_type": event_name(),
+        "runner": _runner_metadata(),
+        "config_hash": None,
+        "summary": _summarize([issue]),
+        "issues": [issue],
+        "model_reports": [],
+        "policy_decision": "fail",
+        "exit_code": exc.exit_code,
+        "exit_code_reason": _exit_code_reason(exc.exit_code),
+    }
+    write_public_reports(
+        report,
+        output_dir=output_dir,
+        formats=DEFAULT_REPORT_FORMATS,
+        redaction_level="standard",
+    )
+    evidence = {
+        "tool": "omniflow",
+        "tool_version": __version__,
+        "config_hash": None,
+        "git_sha": current_sha(),
+        "git_branch": current_branch(),
+        "pr_number": pr_number(),
+        "event_type": event_name(),
+        "runner": _runner_metadata(),
+        "models": [],
+        "validation_status": "failed",
+        "policy_decision": "fail",
+        "exit_code": exc.exit_code,
+        "exit_code_reason": _exit_code_reason(exc.exit_code),
+        "timestamp": utc_now_iso(),
+    }
+    write_public_json(output_dir / "evidence.json", evidence, redaction_level="standard")
+    write_public_json(public_dir(output_dir) / "evidence.json", evidence, redaction_level="standard")
+    write_artifact_manifest(
+        output_dir=output_dir,
+        restricted_artifacts_enabled=False,
+        redaction_level="standard",
+    )
 
 
 if __name__ == "__main__":

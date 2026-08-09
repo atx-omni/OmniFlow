@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import datetime as dt
 from typing import Any
 
 from .exceptions import OmniAPIError
 from .omni_client import OmniClient
 from .security import redact
+from .timestamps import utc_now_iso
 
 
 def generate_downstream_dependencies(
@@ -33,17 +33,7 @@ def generate_downstream_dependencies(
                 include_personal_folders=include_personal_folders,
             )
         except OmniAPIError as exc:
-            if dependencies:
-                mode = "targeted_partial"
-                coverage_gaps.append(
-                    {
-                        "type": search["type"],
-                        "name": search["name"],
-                        "message": redact(str(exc)),
-                    }
-                )
-                continue
-            mode = "full_validation_fallback"
+            mode = "targeted_partial" if dependencies else "targeted_unavailable"
             coverage_gaps.append(
                 {
                     "type": search["type"],
@@ -51,12 +41,7 @@ def generate_downstream_dependencies(
                     "message": redact(str(exc)),
                 }
             )
-            payload = client.validate_content(
-                model_id,
-                branch_id=branch_id,
-                user_id=user_id,
-                include_personal_folders=include_personal_folders,
-            )
+            continue
         for dependency in _dependencies_from_payload(payload, search):
             identity = (
                 dependency.get("content_id"),
@@ -67,14 +52,11 @@ def generate_downstream_dependencies(
                 continue
             seen.add(identity)
             dependencies.append(dependency)
-        if mode == "full_validation_fallback":
-            break
-
     return {
         "version": 1,
         "model_id": model_id,
         "branch_id": branch_id,
-        "generated_at": dt.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "generated_at": utc_now_iso(),
         "generation_mode": mode,
         "searches": searches,
         "coverage_gaps": coverage_gaps,
@@ -94,6 +76,10 @@ def _searches_from_diff(diff_result: dict[str, Any]) -> list[dict[str, str]]:
             _append_search(searches, seen, "view", change["name"])
         if change.get("type", "").startswith("topic_") and isinstance(change.get("name"), str):
             _append_search(searches, seen, "topic", change["name"])
+        if str(change.get("type", "")).startswith("relationship_"):
+            for view_name in change.get("affected_views", []):
+                if isinstance(view_name, str) and view_name:
+                    _append_search(searches, seen, "view", view_name)
     return searches
 
 
@@ -102,14 +88,13 @@ def _coverage_gaps_from_diff(diff_result: dict[str, Any]) -> list[dict[str, str]
     for change in diff_result.get("changes", []):
         if not isinstance(change, dict):
             continue
-        if str(change.get("type", "")).startswith("relationship_"):
+        if str(change.get("type", "")).startswith("relationship_") and not change.get("affected_views"):
             gaps.append(
                 {
                     "type": "relationship",
                     "name": str(change.get("name") or change.get("field") or ""),
                     "message": (
-                        "Omni Content Validator supports direct VIEW, FIELD, and TOPIC searches. "
-                        "Relationship impact requires derived field/view/topic coverage."
+                        "Relationship impact could not be derived because the semantic diff did not identify joined views."
                     ),
                 }
             )

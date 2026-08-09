@@ -7,11 +7,11 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 jobs:
-  build-sign-sbom:
+  build:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
 
@@ -19,11 +19,25 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install release dependencies
+        run: |
+          python -m pip install --disable-pip-version-check --no-input --upgrade "pip==26.1.2"
+          python -m pip install --disable-pip-version-check --no-input -e ".[dev]"
+
+      - name: Verify release candidate
+        run: |
+          PACKAGE_VERSION="$(python -c 'import omniflow; print(omniflow.__version__)')"
+          test "$GITHUB_REF_NAME" = "v$PACKAGE_VERSION"
+          python -m pytest --cov=omniflow --cov-report=term-missing
+          ruff check .
+          bandit -c pyproject.toml -r src
+          python -m pip_audit --local
+          python scripts/simulate_alpha.py
+
       - name: Build distributions
         run: |
-          python -m pip install build
           python -m build
-          python -m pip hash dist/* > dist/checksums.txt
+          twine check dist/*
 
       - name: Generate SBOM
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610
@@ -32,13 +46,69 @@ jobs:
           format: spdx-json
           output-file: dist/omniflow.spdx.json
 
-      - name: Sign distributions
-        uses: sigstore/gh-action-sigstore-python@f7ad0af51a5648d09a20d00370f0a91c3bdf8f84
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum omniflow_ci-*.whl omniflow_ci-*.tar.gz omniflow.spdx.json > SHA256SUMS
+
+      - name: Stage PyPI distributions
+        run: |
+          mkdir pypi-dist
+          cp dist/omniflow_ci-*.whl dist/omniflow_ci-*.tar.gz pypi-dist/
+
+      - name: Upload PyPI distributions
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          inputs: ./dist/*
+          name: omniflow-pypi-distributions
+          path: pypi-dist/
+          if-no-files-found: error
 
       - name: Upload release artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: omniflow-release-artifacts
           path: dist/
+          if-no-files-found: error
+
+  publish-pypi:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/p/omniflow-ci
+    permissions:
+      id-token: write
+    steps:
+      - name: Download verified distributions
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        with:
+          name: omniflow-pypi-distributions
+          path: dist
+
+      - name: Publish to PyPI with attestations
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33
+
+  publish-github:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Download verified release artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        with:
+          name: omniflow-release-artifacts
+          path: dist
+
+      - name: Sign release artifacts
+        uses: sigstore/gh-action-sigstore-python@f7ad0af51a5648d09a20d00370f0a91c3bdf8f84
+        with:
+          inputs: ./dist/*
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes

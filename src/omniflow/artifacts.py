@@ -7,7 +7,6 @@ from typing import Any
 from .reporting.writer import write_reports
 from .security import public_safe
 
-
 PUBLIC_DIR = "public"
 RESTRICTED_DIR = "restricted"
 
@@ -53,19 +52,18 @@ def write_artifact_manifest(
     redaction_level: str,
 ) -> None:
     root = Path(output_dir)
+    public_artifacts = [
+        f"{PUBLIC_DIR}/{name}"
+        for name in ("report.json", "report.md", "report.sarif", "junit.xml", "evidence.json")
+        if (root / PUBLIC_DIR / name).is_file()
+    ]
     manifest = {
         "version": 1,
         "public_dir": PUBLIC_DIR,
         "restricted_dir": RESTRICTED_DIR,
         "restricted_artifacts_enabled": restricted_artifacts_enabled,
         "redaction_level": redaction_level,
-        "public_artifacts": [
-            f"{PUBLIC_DIR}/report.json",
-            f"{PUBLIC_DIR}/report.md",
-            f"{PUBLIC_DIR}/report.sarif",
-            f"{PUBLIC_DIR}/junit.xml",
-            f"{PUBLIC_DIR}/evidence.json",
-        ],
+        "public_artifacts": public_artifacts,
         "restricted_artifacts": [
             f"{RESTRICTED_DIR}/<model_id>/yaml-base/",
             f"{RESTRICTED_DIR}/<model_id>/yaml-head/",
@@ -75,4 +73,6 @@ def write_artifact_manifest(
             f"{RESTRICTED_DIR}/<model_id>/content-report.json",
         ],
     }
-    (root / "artifact-manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    (root / "artifact-manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )

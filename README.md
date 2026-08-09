@@ -1,21 +1,42 @@
 # OmniFlow
 
-OmniFlow is a local-first, security-first CI/CD orchestrator for Omni semantic-layer development. It is designed for the Omni-created pull request workflow: the PR supplies non-secret model context, GitHub Actions runs `omniflow run --auto`, and reviewers get validation, downstream contract impact, governance, and audit evidence before merge.
+OmniFlow is an open-source, local-first CI gate for Omni semantic-layer development. It runs in a customer's GitHub repository when an Omni branch opens a pull request, validates the model and its downstream content, and produces review and audit evidence before merge.
 
-## Customer Quickstart
+> **Status:** Controlled alpha. The local test and simulation suites are automated, but a real Omni-created pull request is still required before using OmniFlow as a production merge gate.
 
-1. Add the OmniFlow GitHub workflow to the connected git repository.
-2. Store `OMNI_API_KEY` as a GitHub Actions secret.
-3. Use the copied workflow from `.github/workflow-examples/omniflow.yml`.
-4. Open a pull request from Omni.
+## What OmniFlow Checks
 
-The default action command is:
+- Omni model validation, with separate error and warning policy
+- Omni Content Validator results, including branch-to-base comparison for new-only policy
+- Authored Models, Topics, Views, fields, and global or topic-level Relationship YAML
+- Semantic lint rules for descriptions, primary keys, labels, topic owners, cardinality, and governance
+- Breaking semantic changes and the dashboards, reports, and queries that reference them
+- Optional, branch-aware dbt exposure metadata
+- JSON, Markdown, SARIF, JUnit, and evidence artifacts
 
-```bash
-omniflow run --auto
-```
+OmniFlow does not execute warehouse queries, store query results, merge pull requests, or deploy model files directly.
 
-For alpha testing, install OmniFlow through the pinned GitHub Action checkout:
+## End-User Flow
+
+1. A developer works in an Omni model branch and selects **Create pull request**.
+2. Omni creates the GitHub pull request.
+3. GitHub Actions starts OmniFlow from the trusted base-branch workflow.
+4. Non-Omni pull requests are routed to a successful `skipped` result.
+5. OmniFlow selects the changed model from trusted base-branch metadata and resolves the Omni branch from the GitHub head branch.
+6. It pulls base and branch YAML, validates the model and content, computes the semantic diff, and searches Omni for downstream references.
+7. The pull request receives a redacted reviewer summary; detailed artifacts remain restricted to the runner unless explicitly uploaded.
+8. GitHub branch protection blocks merge when required OmniFlow checks fail.
+9. After review and approval, the pull request is merged. Omni's configured pull-request webhook promotes the Omni branch and publishes associated draft content.
+
+The final promotion is Omni Git integration behavior, not an OmniFlow API write. See [Omni Branch Mode](https://docs.omni.co/content/develop/branch-mode) and [Git integration settings](https://docs.omni.co/integrations/git/settings).
+
+## Repository Setup
+
+### 1. Add The Workflow
+
+Copy `.github/workflow-examples/omniflow.yml` into the customer repository as `.github/workflows/omniflow.yml`, then replace `<pinned-commit-sha>` with a reviewed OmniFlow commit SHA.
+
+The action installs from that pinned checkout during alpha testing:
 
 ```yaml
 - uses: atx-omni/omniflow@<pinned-commit-sha>
@@ -23,72 +44,105 @@ For alpha testing, install OmniFlow through the pinned GitHub Action checkout:
     OMNI_API_KEY: ${{ secrets.OMNI_API_KEY }}
 ```
 
-Do not use `pip install omniflow` for alpha testing unless this project has been explicitly published to PyPI under the expected version.
+Do not install an unpinned branch. Do not use `pip install omniflow-ci` until a signed version has been published and verified on PyPI. The distribution uses `omniflow-ci` because the unrelated `omniflow` project name is already registered; the command remains `omniflow`.
 
-No customer-managed `base_url`, `model_id`, or `branch_name` is required in policy config. OmniFlow uses trusted repo metadata or explicit CI environment values for Omni host identity, and it can read the `omniflow-context` PR marker when present for model and branch selection.
+### 2. Add The API Secret
 
-## PR Context And Metadata
+Create a GitHub Actions secret named `OMNI_API_KEY`. The token must be able to list model branches, read model YAML, validate the model, run the Content Validator, and retrieve content labels. The optional dbt exposures endpoint requires Connection Admin permissions according to the [Omni API reference](https://docs.omni.co/api/dbt/get-dbt-exposures).
 
-Optional PR marker:
+Use the least-privilege token that satisfies the enabled checks. Never place credentials in repository files.
 
-```html
-<!-- omniflow-context {"model_id":"uuid","model_path":"omni/my_model","branch_name":"feature/my-change"} -->
+### 3. Commit Trusted Model Identity Once
+
+Commit `.omni/flow.json` to the protected base branch:
+
+```json
+{
+  "version": 1,
+  "models": [
+    {
+      "base_url": "https://customer.omniapp.co",
+      "model_id": "00000000-0000-0000-0000-000000000000",
+      "model_path": "omni/my_model",
+      "base_branch": "main",
+      "git_provider": "github",
+      "web_url": "https://github.com/org/repo"
+    }
+  ]
+}
 ```
 
-Trusted fallback metadata:
+This is non-secret bootstrap metadata, not per-PR configuration. Branch identity is discovered automatically. Omni's public documentation guarantees a branch-content link in an Omni-created PR description, but it does not currently document a stable machine-readable PR payload containing the Omni host and model ID. Until a live PR proves a safe contract, OmniFlow deliberately does not send a token to a host parsed from PR text.
 
-- `.omni/flow.json`: non-secret model/repository identity for one or more Omni models.
+### 4. Add Optional Policy
 
-An example file is included at `.omni/flow.example.json`.
-
-The PR marker must not provide `base_url`. OmniFlow only accepts Omni host identity from trusted sources such as `.omni/flow.json`, `OMNI_BASE_URL`, or explicit CLI flags. This prevents a pull request body from redirecting CI secrets to an untrusted host.
-
-## PR Routing
-
-OmniFlow is safe to install in repositories that also receive dbt, docs, or application-code pull requests. When `omniflow run --auto` does not find an Omni PR marker and cannot match changed files to Omni-managed metadata, it exits `0` with a skipped policy decision and still writes evidence artifacts.
-
-Malformed Omni metadata, secret-like keys, or an Omni PR marker that cannot be resolved still fail the run. This keeps non-Omni work quiet while preserving strong gates for semantic-layer changes.
-
-## Downstream Impact Generation
-
-OmniFlow does not require customers to commit a dependency graph. During `omniflow run --auto`, it:
-
-1. Pulls base and branch YAML from Omni.
-2. Computes a semantic diff.
-3. Calls Omni Content Validator search for changed fields, views, topics, and relationship references.
-4. Generates `.omniflow/<model_id>/dependencies.json` as an evidence artifact.
-5. Evaluates contract impact against that generated artifact.
-
-If targeted dependency search is unavailable, OmniFlow falls back to full content validation impact and records that fallback mode in the artifact.
-
-## Optional Policy Config
-
-`.omniflow.yml` is optional and controls policy only:
+`.omniflow.yml` is optional. Defaults run model validation, content validation, semantic lint, semantic diff, and downstream contracts. Start with `.omniflow.example.yml` when customization is needed.
 
 ```yaml
 contracts:
-  enabled: true
   fail_on:
     deleted_referenced_fields: true
     renamed_referenced_fields: true
     referenced_field_type_changes: true
     referenced_join_cardinality_changes: true
+    coverage_gaps: true
 
 checks:
   content_validation:
-    enabled: true
     fail_on_new_only: true
-
   model_validation:
-    enabled: true
     fail_on_warnings: false
-
-  dbt_exposures:
-    enabled: false
-    fail_on_unavailable: false
 ```
 
-If any config or Omni-managed metadata key matches `api_key`, `token`, `secret`, or `password`, OmniFlow fails before running.
+### 5. Protect The Base Branch
+
+Make the OmniFlow job a required GitHub check and require pull-request approval. Confirm the Omni pull-request webhook is configured; Omni documents that it is required to keep Git and Omni branches synchronized.
+
+## Trust And Routing
+
+The example uses GitHub's `pull_request_target` event but never checks out or executes proposed PR code. OmniFlow retrieves changed filenames through GitHub's API and reads `.omni/flow.json`, `.omniflow.yml`, and the workflow itself from the trusted base branch. This prevents a same-repository pull request from changing `base_url`, disabling gates, enabling unsafe output, replacing the action, or redirecting `OMNI_API_KEY`.
+
+Do not add steps that check out and execute pull-request code in this privileged workflow. Keep ordinary dbt tests and application builds in separate `pull_request` workflows without the Omni secret.
+
+An optional marker can select a model for a content-only or otherwise ambiguous pull request:
+
+```html
+<!-- omniflow-context {"model_id":"uuid","model_path":"omni/my_model","branch_name":"feature/my-change"} -->
+```
+
+The marker cannot provide `base_url`; its model and path must match trusted metadata; and its branch must match the GitHub head branch. Omni does not currently document this marker, so it must be added by customer automation if used.
+
+Fork pull requests never receive the Omni secret. Non-Omni fork changes skip cleanly; fork changes that touch Omni files fail closed because they cannot be validated without a trusted secret. A maintainer can move the proposed change to a same-repository branch for a full run. Omni-like files outside registered model paths also fail closed so stale or missing routing metadata cannot silently bypass validation.
+
+## Downstream Contracts
+
+For every changed field, view, or topic, OmniFlow uses the documented Content Validator `find` and `find_type` parameters to retrieve content that references that semantic element. Relationship changes are mapped to their joined views and searched as view references.
+
+Referenced deleted or renamed fields, referenced type changes, and referenced relationship cardinality changes fail by default. Unreferenced breaking changes remain warnings. A failed or incomplete dependency search is a blocking coverage gap by default; OmniFlow never labels every full-validator result as a reference to the failed element.
+
+Default semantic-lint findings are advisory. Teams can promote individual rules to `error` in `.omniflow.yml`; the built-in gate does not turn an unreferenced deletion into a failure by itself.
+
+The Content Validator still validates the model server-side. Label filtering is applied locally after content metadata lookup. See the [Content Validator API](https://docs.omni.co/api/content-validator/validate-content).
+
+## Evidence And Privacy
+
+Each run writes root and redacted public summaries:
+
+```text
+.omniflow/
+  report.json
+  report.md
+  report.sarif
+  junit.xml
+  evidence.json
+  artifact-manifest.json
+  public/
+  restricted/<model_id>/
+```
+
+Public reports exclude API keys, raw payloads, email addresses, document URLs, and folder paths. `security.redaction_level: strict` also removes content names, query names, owners, labels, and free-text messages. Restricted artifacts are not uploaded by the example workflow.
+
+Raw response output cannot be enabled in CI policy. The explicit `--unsafe-raw-output` option exists only on the local `content validate` debugging command.
 
 ## CLI
 
@@ -102,60 +156,39 @@ omniflow exposures pull --base-url https://example.omniapp.co --model-id <id>
 omniflow diff --base path/to/base/yaml --head path/to/head/yaml
 ```
 
-Explicit identity flags are retained for debugging and local advanced usage only.
+Explicit identity flags are for local debugging. The customer workflow uses `omniflow run --auto`.
 
-## Evidence Artifacts
+Exit codes are `0` success, `1` validation failure, `2` configuration error, `3` authentication or authorization error, `4` Omni API error, `5` security policy violation, and `6` internal error.
 
-`omniflow run --auto` writes:
-
-- `.omniflow/report.json`
-- `.omniflow/report.md`
-- `.omniflow/report.sarif`
-- `.omniflow/junit.xml`
-- `.omniflow/evidence.json`
-- `.omniflow/public/`
-- `.omniflow/restricted/`
-- per-model semantic diff and contract impact artifacts
-
-Reports include IDs, names, owners, labels, paths, summaries, risk levels, config hash, git SHA, branch, PR number, model ID, and policy decision. Reports must not include API keys, raw query results, or raw Omni payloads.
-
-The example GitHub workflow uploads only `.omniflow/public/` summary artifacts and `.omniflow/artifact-manifest.json` by default. Per-model YAML pulls, dependency graphs, exposure details, and detailed contract artifacts live under `.omniflow/restricted/` and remain local CI workspace files unless a team explicitly chooses to upload restricted audit artifacts.
-
-Set `security.redaction_level: strict` for regulated environments that need content names, query names, owner metadata, URLs, folder paths, and labels redacted from public artifacts.
-
-## Exit Codes
-
-- `0`: success
-- `1`: validation failed
-- `2`: configuration error
-- `3`: authentication/authorization error
-- `4`: Omni API error
-- `5`: security policy violation
-- `6`: internal tool error
-
-## Security Notes
-
-- Do not place Omni API keys in `.omniflow.yml`, `.omni/flow.json`, or PR metadata.
-- Use least-privilege Omni tokens for CI.
-- Keep `security.allow_raw_response_output` disabled unless debugging in a controlled environment.
-- Use `security.redact_document_names: true` in stricter environments.
-- GitHub Actions must avoid exposing secrets to unsafe fork PRs.
-
-## Alpha Simulation
-
-Before testing against a live Omni-created pull request, run the local fake-Omni simulation harness:
+## Local Verification
 
 ```bash
-python3 scripts/simulate_alpha.py
+python3.11 -m venv .venv
+. .venv/bin/activate
+python -m pip install --upgrade "pip==26.1.2"
+python -m pip install -e ".[dev]"
+pytest --cov=omniflow
+ruff check .
+bandit -c pyproject.toml -r src
+python scripts/simulate_alpha.py
+python -m build
+twine check dist/*
 ```
 
-The simulation creates temporary Git repos, starts a local fake Omni API server, runs `omniflow run --auto`, and verifies:
+The simulation covers same-repository and fork routing, contract failures, strict redaction, missing branches, malicious PR metadata, and optional API failures. It does not replace the live gate for actual Omni PR metadata, tenant permissions, branch mapping, Content Validator coverage, GitHub annotations/comments, or webhook promotion.
 
-- non-Omni PR skip behavior
-- referenced contract failure behavior
-- strict public report redaction
-- missing branch fail-closed behavior
-- unsafe PR marker rejection
-- dbt exposure API unavailable warning behavior
+## Maintainer Release Setup
 
-This catches OmniFlow implementation regressions, but it does not replace a real Omni-created PR test. Live testing is still required to validate the actual GitHub event payload, Omni PR body shape, tenant permissions, branch resolution, and real API response shapes.
+Before the first public release, configure a pending PyPI Trusted Publisher for project `omniflow-ci`, owner `atx-omni`, repository `omniflow`, workflow `release.yml`, and environment `pypi`. Protect that GitHub environment with required maintainer approval. A `vX.Y.Z` tag matching the package version then builds once, publishes the verified distributions to PyPI with attestations, and signs the SBOM, checksums, wheel, and source archive for the GitHub release.
+
+PyPI pending publishers do not reserve a name until the first successful upload, so the initial release should follow setup promptly.
+
+## Official References
+
+- [Omni model YAML API](https://docs.omni.co/api/models/get-model-yaml)
+- [Omni model validation API](https://docs.omni.co/api/models/validate-model)
+- [Omni Content Validator API](https://docs.omni.co/api/content-validator/validate-content)
+- [Omni dbt exposures API](https://docs.omni.co/api/dbt/get-dbt-exposures)
+- [Omni Git integration best practices](https://docs.omni.co/integrations/git/best-practices)
+- [GitHub secure workflow guidance](https://docs.github.com/en/actions/reference/security/secure-use)
+- [PyPI Trusted Publisher setup](https://docs.pypi.org/trusted-publishers/creating-a-project-through-oidc/)

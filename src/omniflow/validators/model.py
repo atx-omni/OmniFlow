@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import datetime as dt
 from typing import Any
 
 from ..omni_client import OmniClient
+from ..timestamps import utc_now_iso
 
 
 def parse_model_issues(payload: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -35,7 +35,7 @@ def run_model_validation(
     report = {
         "tool": "omniflow",
         "validator": "model",
-        "generated_at": dt.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "generated_at": utc_now_iso(),
         "model_id": model_id,
         "branch_id": branch_id,
         "summary": {
