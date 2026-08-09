@@ -3,10 +3,15 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from omniflow.cli import _client_and_branch_for_context, _git_configuration_issues, _write_context_failure_artifacts
+from omniflow.cli import (
+    _client_and_branch_for_context,
+    _git_configuration_issues,
+    _write_context_failure_artifacts,
+    _write_setup_failure_artifacts,
+)
 from omniflow.config import load_config
 from omniflow.discovery import ModelContext
-from omniflow.exceptions import ConfigError, OmniAPIError
+from omniflow.exceptions import ConfigError, OmniAPIError, SecurityPolicyError
 
 
 class FakeClient:
@@ -88,6 +93,17 @@ class CliOrchestrationTests(unittest.TestCase):
         self.assertEqual(exit_code, 4)
         self.assertEqual(report["exit_code_reason"], "Omni API error")
         self.assertEqual(report["issues"][0]["validator"], "context")
+
+    def test_setup_failure_writes_security_policy_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_setup_failure_artifacts(
+                config=load_config(None),
+                output_dir=Path(tmp),
+                exc=SecurityPolicyError("unsafe marker"),
+            )
+            report = (Path(tmp) / "public/report.json").read_text(encoding="utf-8")
+        self.assertIn("security policy violation", report)
+        self.assertIn("unsafe marker", report)
 
 
 if __name__ == "__main__":

@@ -140,3 +140,22 @@ Set `security.redaction_level: strict` for regulated environments that need cont
 - Keep `security.allow_raw_response_output` disabled unless debugging in a controlled environment.
 - Use `security.redact_document_names: true` in stricter environments.
 - GitHub Actions must avoid exposing secrets to unsafe fork PRs.
+
+## Alpha Simulation
+
+Before testing against a live Omni-created pull request, run the local fake-Omni simulation harness:
+
+```bash
+python3 scripts/simulate_alpha.py
+```
+
+The simulation creates temporary Git repos, starts a local fake Omni API server, runs `omniflow run --auto`, and verifies:
+
+- non-Omni PR skip behavior
+- referenced contract failure behavior
+- strict public report redaction
+- missing branch fail-closed behavior
+- unsafe PR marker rejection
+- dbt exposure API unavailable warning behavior
+
+This catches OmniFlow implementation regressions, but it does not replace a real Omni-created PR test. Live testing is still required to validate the actual GitHub event payload, Omni PR body shape, tenant permissions, branch resolution, and real API response shapes.

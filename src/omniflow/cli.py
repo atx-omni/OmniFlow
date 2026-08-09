@@ -227,7 +227,7 @@ def _write_setup_failure_artifacts(*, config, output_dir: Path, exc: OmniCIError
         "model_reports": [],
         "policy_decision": "fail",
         "exit_code": exc.exit_code,
-        "exit_code_reason": "configuration error" if exc.exit_code == ExitCodes.CONFIG_ERROR else "setup failed",
+        "exit_code_reason": _exit_code_reason(exc.exit_code),
     }
     write_public_reports(
         report,
