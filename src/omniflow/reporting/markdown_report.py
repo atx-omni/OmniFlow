@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from ..security import secure_write_text
+
 
 def render_markdown_report(report: dict[str, Any]) -> str:
     summary = report.get("summary", {})
@@ -69,8 +71,7 @@ def render_markdown_report(report: dict[str, Any]) -> str:
 
 def write_markdown_report(path: str | Path, report: dict[str, Any]) -> None:
     target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(render_markdown_report(report), encoding="utf-8")
+    secure_write_text(target, render_markdown_report(report))
 
 
 def _decision_label(decision: str) -> str:

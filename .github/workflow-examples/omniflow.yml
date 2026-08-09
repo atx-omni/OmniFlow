@@ -11,14 +11,20 @@ permissions:
   pull-requests: write
   security-events: write
 
+concurrency:
+  group: omniflow-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   omniflow:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          fetch-depth: 0
+          fetch-depth: 1
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
@@ -28,10 +34,9 @@ jobs:
       - name: Run OmniFlow
         if: github.event_name != 'pull_request_target' || github.event.pull_request.head.repo.full_name == github.repository
         uses: atx-omni/OmniFlow@<pinned-commit-sha>
-        env:
-          OMNI_API_KEY: ${{ secrets.OMNI_API_KEY }}
         with:
           config: .omniflow.yml
+          omni-api-key: ${{ secrets.OMNI_API_KEY }}
 
       - name: Route fork pull request without Omni secret
         if: github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name != github.repository
@@ -69,9 +74,10 @@ jobs:
         run: |
           set -euo pipefail
           MARKER='<!-- omniflow-report -->'
-          BODY="$(printf '%s\n\n' "$MARKER"; cat .omniflow/public/report.md)"
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          BODY="$(printf '%s\n\nRun: %s\n\n' "$MARKER" "$RUN_URL"; cat .omniflow/public/report.md)"
           EXISTING="$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100" \
-            --jq '[.[] | select(.body | contains("<!-- omniflow-report -->"))][0].id // empty')"
+            --jq '[.[] | select(.user.login == "github-actions[bot]") | select(.body | contains("<!-- omniflow-report -->"))][0].id // empty')"
           if [ -n "$EXISTING" ]; then
             gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${EXISTING}" -f body="$BODY" >/dev/null
           else

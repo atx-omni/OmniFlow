@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from ..security import secure_write_text
+
 
 def to_sarif(report: dict[str, Any]) -> dict[str, Any]:
     issues = report.get("issues", [])
@@ -45,8 +47,7 @@ def to_sarif(report: dict[str, Any]) -> dict[str, Any]:
 
 def write_sarif_report(path: str | Path, report: dict[str, Any]) -> None:
     target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(to_sarif(report), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    secure_write_text(target, json.dumps(to_sarif(report), indent=2, sort_keys=True) + "\n")
 
 
 def _sarif_level(value: Any) -> str:

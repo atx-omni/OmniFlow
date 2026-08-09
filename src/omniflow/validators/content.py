@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from ..omni_client import OmniClient
-from ..security import redact
+from ..security import redact, secure_write_text
 from ..timestamps import utc_now_iso
 
 
@@ -19,8 +19,7 @@ def load_json(path: str | Path) -> dict[str, Any] | None:
 
 def write_json(path: str | Path, payload: dict[str, Any]) -> None:
     target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    secure_write_text(target, json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
 def extract_label_names(record: dict[str, Any]) -> list[str] | None:

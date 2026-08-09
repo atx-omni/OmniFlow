@@ -46,4 +46,4 @@ security:
   max_report_samples: 20
   redact_document_names: false
   redaction_level: standard
-  retain_restricted_artifacts: true
+  retain_restricted_artifacts: false

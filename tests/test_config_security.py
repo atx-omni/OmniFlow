@@ -5,11 +5,22 @@ from pathlib import Path
 from unittest import mock
 
 from omniflow.config import load_config
-from omniflow.exceptions import SecurityPolicyError
+from omniflow.exceptions import ConfigError, SecurityPolicyError
 from omniflow.security import public_safe, redact
 
 
 class ConfigSecurityTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "symbolic links require POSIX support")
+    def test_rejects_symbolic_link_policy_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "policy.yml"
+            target.write_text("checks: {}\n", encoding="utf-8")
+            link = root / ".omniflow.yml"
+            link.symlink_to(target)
+            with self.assertRaises(ConfigError):
+                load_config(link)
+
     def test_config_precedence_and_env_expansion(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / ".omniflow.yml"
@@ -45,6 +56,34 @@ contracts:
         self.assertIsNone(config.omni.base_url)
         self.assertIsNone(config.omni.model_id)
         self.assertTrue(config.model_validation.enabled)
+        self.assertFalse(config.security.retain_restricted_artifacts)
+
+    def test_rejects_unknown_top_level_and_nested_policy_keys(self):
+        for body in (
+            "unknown_section: {}\n",
+            "security:\n  redact_log: true\n",
+            "checks:\n  model_validation:\n    fail_on_warning: true\n",
+        ):
+            with self.subTest(body=body):
+                with tempfile.TemporaryDirectory() as tmp:
+                    path = Path(tmp) / ".omniflow.yml"
+                    path.write_text(body, encoding="utf-8")
+                    with self.assertRaises(ConfigError):
+                        load_config(path)
+
+    def test_rejects_cyclic_yaml_alias_in_policy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".omniflow.yml"
+            path.write_text("security: &loop\n  child: *loop\n", encoding="utf-8")
+            with self.assertRaises(SecurityPolicyError):
+                load_config(path)
+
+    def test_rejects_oversized_trusted_policy_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".omniflow.yml"
+            path.write_text("#" + ("x" * (1024 * 1024)), encoding="utf-8")
+            with self.assertRaises(ConfigError):
+                load_config(path)
 
     def test_rejects_secret_like_config_keys(self):
         with tempfile.TemporaryDirectory() as tmp:

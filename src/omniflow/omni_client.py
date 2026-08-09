@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import logging
 import time
+from collections.abc import Mapping
 from typing import Any
 
 import requests
@@ -11,6 +13,9 @@ from .exceptions import ConfigError, OmniAPIError, OmniAuthError
 from .security import redact, validate_base_url, validate_path_segment
 
 LOG = logging.getLogger(__name__)
+MAX_RESPONSE_BYTES = 64 * 1024 * 1024
+MAX_PAGINATION_PAGES = 500
+MAX_PAGINATION_RECORDS = 50_000
 
 
 class OmniClient:
@@ -168,18 +173,35 @@ class OmniClient:
 
     def _paginate(self, path: str, *, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         records: list[dict[str, Any]] = []
-        cursor = None
-        while True:
+        record_count = 0
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        for _page in range(MAX_PAGINATION_PAGES):
             page_params = dict(params or {})
             page_params.setdefault("pageSize", 100)
             if cursor:
                 page_params["cursor"] = cursor
             payload = self._request("GET", path, params=page_params)
             page_records = payload.get("records", []) if isinstance(payload, dict) else []
-            records.extend([item for item in page_records if isinstance(item, dict)])
-            cursor = payload.get("pageInfo", {}).get("nextCursor") if isinstance(payload, dict) else None
+            if not isinstance(page_records, list):
+                raise OmniAPIError("Omni pagination returned an unexpected records shape")
+            record_count += len(page_records)
+            if record_count > MAX_PAGINATION_RECORDS:
+                raise OmniAPIError("Omni pagination exceeded the 50,000 record safety limit")
+            records.extend(item for item in page_records if isinstance(item, dict))
+            page_info = payload.get("pageInfo", {}) if isinstance(payload, dict) else {}
+            if not isinstance(page_info, dict):
+                raise OmniAPIError("Omni pagination returned an unexpected pageInfo shape")
+            next_cursor = page_info.get("nextCursor")
+            if next_cursor is not None and (not isinstance(next_cursor, str) or not next_cursor.strip()):
+                raise OmniAPIError("Omni pagination returned an invalid cursor")
+            cursor = next_cursor.strip() if isinstance(next_cursor, str) else None
             if not cursor:
                 return records
+            if cursor in seen_cursors:
+                raise OmniAPIError("Omni pagination repeated a cursor and was stopped")
+            seen_cursors.add(cursor)
+        raise OmniAPIError("Omni pagination exceeded the 500 page safety limit")
 
     def _request(
         self,
@@ -200,6 +222,7 @@ class OmniClient:
                     json=json_payload,
                     timeout=self.timeout,
                     allow_redirects=False,
+                    stream=True,
                 )
             except requests.RequestException as exc:
                 last_error = exc
@@ -209,18 +232,21 @@ class OmniClient:
                 continue
 
             if response.status_code in {401, 403}:
+                _close_response(response)
                 raise OmniAuthError(f"Omni authorization failed: {response.status_code}")
             if response.status_code == 429 or 500 <= response.status_code < 600:
                 if attempt < 3:
                     retry_after = _retry_after_seconds(response.headers.get("Retry-After"))
+                    _close_response(response)
                     time.sleep(retry_after if retry_after is not None else 2**attempt)
                     continue
             if not response.ok:
+                _close_response(response)
                 raise OmniAPIError(f"Omni API request failed: HTTP {response.status_code} for {method} {path}")
             try:
-                return response.json()
-            except ValueError as exc:
-                raise OmniAPIError(f"Omni API did not return JSON: {exc}") from exc
+                return _bounded_response_json(response)
+            finally:
+                _close_response(response)
 
         LOG.debug("Final Omni request error: %s", redact(str(last_error)))
         raise OmniAPIError("Omni API request failed after retries")
@@ -245,3 +271,48 @@ def _content_validator_find_type(value: str) -> str:
     if normalized not in aliases:
         raise ConfigError("Content Validator find_type must be VIEW, FIELD, or TOPIC")
     return aliases[normalized]
+
+
+def _bounded_response_json(response: Any) -> Any:
+    content_length = response.headers.get("Content-Length") if isinstance(response.headers, Mapping) else None
+    if content_length is not None:
+        try:
+            if int(content_length) > MAX_RESPONSE_BYTES:
+                raise OmniAPIError("Omni API response exceeded the 64 MiB safety limit")
+        except ValueError:
+            pass
+
+    iter_content = getattr(response, "iter_content", None)
+    if callable(iter_content):
+        body = bytearray()
+        try:
+            for chunk in iter_content(chunk_size=64 * 1024):
+                if not chunk:
+                    continue
+                body.extend(chunk)
+                if len(body) > MAX_RESPONSE_BYTES:
+                    raise OmniAPIError("Omni API response exceeded the 64 MiB safety limit")
+        except requests.RequestException as exc:
+            raise OmniAPIError("Omni API response could not be read safely") from exc
+        try:
+            return json.loads(body)
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise OmniAPIError("Omni API did not return valid JSON") from exc
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise OmniAPIError("Omni API did not return valid JSON") from exc
+    try:
+        encoded_size = len(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+    except (TypeError, ValueError) as exc:
+        raise OmniAPIError("Omni API did not return a valid JSON value") from exc
+    if encoded_size > MAX_RESPONSE_BYTES:
+        raise OmniAPIError("Omni API response exceeded the 64 MiB safety limit")
+    return payload
+
+
+def _close_response(response: Any) -> None:
+    close = getattr(response, "close", None)
+    if callable(close):
+        close()

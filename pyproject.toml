@@ -23,8 +23,8 @@ classifiers = [
   "Topic :: Software Development :: Quality Assurance",
 ]
 dependencies = [
-  "PyYAML>=6.0,<7",
-  "requests>=2.31.0,<3",
+  "PyYAML>=6.0.3,<7",
+  "requests>=2.34.2,<3",
 ]
 
 [project.optional-dependencies]

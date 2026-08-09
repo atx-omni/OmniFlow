@@ -1,7 +1,8 @@
 import unittest
+from unittest import mock
 
 from omniflow.exceptions import ConfigError, OmniAPIError
-from omniflow.omni_client import OmniClient
+from omniflow.omni_client import MAX_RESPONSE_BYTES, OmniClient
 
 FAKE_API_KEY = "secret"  # pragma: allowlist secret
 
@@ -29,6 +30,25 @@ class FakeSession:
         return self.responses.pop(0)
 
 
+class InvalidJsonResponse(FakeResponse):
+    def json(self):
+        raise ValueError("private response fragment")
+
+
+class StreamingResponse(FakeResponse):
+    def __init__(self, chunks):
+        super().__init__(None)
+        self.chunks = chunks
+        self.closed = False
+
+    def iter_content(self, chunk_size):
+        del chunk_size
+        yield from self.chunks
+
+    def close(self):
+        self.closed = True
+
+
 class OmniClientTests(unittest.TestCase):
     def test_branch_resolution(self):
         session = FakeSession(
@@ -45,6 +65,7 @@ class OmniClientTests(unittest.TestCase):
         )
         client = OmniClient(base_url="https://omni.example", api_key=FAKE_API_KEY, session=session)
         self.assertEqual(client.resolve_branch_id("model-1", "feature/a"), "branch-1")
+        self.assertTrue(session.calls[0][2]["stream"])
 
     def test_retries_429(self):
         session = FakeSession([FakeResponse({}, status_code=429), FakeResponse([], status_code=200)])
@@ -63,6 +84,60 @@ class OmniClientTests(unittest.TestCase):
         with self.assertRaises(OmniAPIError) as raised:
             client.validate_model("model-1")
         self.assertNotIn("sensitive customer payload", str(raised.exception))
+
+    def test_rejects_oversized_and_invalid_json_responses_without_echoing_body(self):
+        oversized = FakeResponse([], headers={"Content-Length": str(MAX_RESPONSE_BYTES + 1)})
+        client = OmniClient(
+            base_url="https://omni.example",
+            api_key=FAKE_API_KEY,
+            session=FakeSession([oversized]),
+        )
+        with self.assertRaises(OmniAPIError):
+            client.validate_model("model-1")
+
+        client = OmniClient(
+            base_url="https://omni.example",
+            api_key=FAKE_API_KEY,
+            session=FakeSession([InvalidJsonResponse(None)]),
+        )
+        with self.assertRaises(OmniAPIError) as raised:
+            client.validate_model("model-1")
+        self.assertNotIn("private response fragment", str(raised.exception))
+
+    def test_streamed_response_limit_closes_connection(self):
+        response = StreamingResponse([b"123", b"45"])
+        client = OmniClient(
+            base_url="https://omni.example",
+            api_key=FAKE_API_KEY,
+            session=FakeSession([response]),
+        )
+        with mock.patch("omniflow.omni_client.MAX_RESPONSE_BYTES", 4):
+            with self.assertRaises(OmniAPIError):
+                client.validate_model("model-1")
+        self.assertTrue(response.closed)
+
+    def test_pagination_rejects_repeated_cursor_and_record_overflow(self):
+        repeated = FakeSession(
+            [
+                FakeResponse({"records": [], "pageInfo": {"nextCursor": "same"}}),
+                FakeResponse({"records": [], "pageInfo": {"nextCursor": "same"}}),
+            ]
+        )
+        client = OmniClient(base_url="https://omni.example", api_key=FAKE_API_KEY, session=repeated)
+        with self.assertRaises(OmniAPIError):
+            client.list_models()
+
+        overflow = FakeSession([FakeResponse({"records": [{"id": "a"}, {"id": "b"}], "pageInfo": {}})])
+        client = OmniClient(base_url="https://omni.example", api_key=FAKE_API_KEY, session=overflow)
+        with mock.patch("omniflow.omni_client.MAX_PAGINATION_RECORDS", 1):
+            with self.assertRaises(OmniAPIError):
+                client.list_models()
+
+        malformed = FakeSession([FakeResponse({"records": ["bad", "records"], "pageInfo": {}})])
+        client = OmniClient(base_url="https://omni.example", api_key=FAKE_API_KEY, session=malformed)
+        with mock.patch("omniflow.omni_client.MAX_PAGINATION_RECORDS", 1):
+            with self.assertRaises(OmniAPIError):
+                client.list_models()
 
     def test_rejects_invalid_timeout_and_find_type(self):
         with self.assertRaises(ConfigError):

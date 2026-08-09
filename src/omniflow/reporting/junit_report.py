@@ -6,6 +6,8 @@ from typing import Any
 # ElementTree is used only to serialize reports; no untrusted XML is parsed.
 from xml.etree import ElementTree  # nosec B405
 
+from ..security import secure_write_text
+
 
 def to_junit(report: dict[str, Any]) -> str:
     issues = report.get("issues", [])
@@ -33,8 +35,7 @@ def to_junit(report: dict[str, Any]) -> str:
 
 def write_junit_report(path: str | Path, report: dict[str, Any]) -> None:
     target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(to_junit(report) + "\n", encoding="utf-8")
+    secure_write_text(target, to_junit(report) + "\n")
 
 
 def _is_failure(issue: dict[str, Any]) -> bool:

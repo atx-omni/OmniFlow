@@ -1,0 +1,11 @@
+* @atx-omni
+
+/.github/ @atx-omni
+/action.yml @atx-omni
+/requirements/ @atx-omni
+/pyproject.toml @atx-omni
+/SECURITY.md @atx-omni
+/src/omniflow/security.py @atx-omni
+/src/omniflow/trust.py @atx-omni
+/src/omniflow/discovery.py @atx-omni
+/src/omniflow/omni_client.py @atx-omni

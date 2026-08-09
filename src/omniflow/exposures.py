@@ -73,20 +73,24 @@ def _normalize_exposures(payload: Any) -> list[dict[str, Any]]:
         exposure = nested if isinstance(nested, dict) else record
         exposures.append(
             {
-                "id": record.get("dashboard_identifier")
-                or exposure.get("id")
-                or exposure.get("content_id")
-                or exposure.get("dashboard_id"),
-                "deduplication_name": record.get("deduplication_name"),
-                "name": exposure.get("label")
-                or exposure.get("name")
-                or exposure.get("dashboard_name")
-                or exposure.get("content_name"),
-                "type": exposure.get("type") or exposure.get("content_type") or "dashboard",
-                "url": exposure.get("url") or exposure.get("content_url"),
-                "owner": exposure.get("owner"),
+                "id": _text(
+                    record.get("dashboard_identifier")
+                    or exposure.get("id")
+                    or exposure.get("content_id")
+                    or exposure.get("dashboard_id")
+                ),
+                "deduplication_name": _text(record.get("deduplication_name")),
+                "name": _text(
+                    exposure.get("label")
+                    or exposure.get("name")
+                    or exposure.get("dashboard_name")
+                    or exposure.get("content_name")
+                ),
+                "type": _text(exposure.get("type") or exposure.get("content_type")) or "dashboard",
+                "url": _text(exposure.get("url") or exposure.get("content_url"), maximum=2_048),
+                "owner": _owner(exposure.get("owner")),
                 "depends_on": _depends_on(exposure),
-                "maturity": exposure.get("maturity"),
+                "maturity": _text(exposure.get("maturity")),
             }
         )
     return exposures
@@ -111,9 +115,35 @@ def _depends_on(record: dict[str, Any]) -> list[str]:
     depends_on = []
     for item in value:
         if isinstance(item, str):
-            depends_on.append(item)
+            name = _text(item, maximum=1_024)
+            if name:
+                depends_on.append(name)
         elif isinstance(item, dict):
             name = item.get("name") or item.get("unique_id") or item.get("id")
-            if isinstance(name, str):
-                depends_on.append(name)
+            normalized = _text(name, maximum=1_024)
+            if normalized:
+                depends_on.append(normalized)
+        if len(depends_on) >= 10_000:
+            break
     return depends_on
+
+
+def _owner(value: Any) -> dict[str, str] | None:
+    if isinstance(value, str):
+        name = _text(value)
+        return {"name": name} if name else None
+    if not isinstance(value, dict):
+        return None
+    owner = {}
+    for key in ("id", "name"):
+        normalized = _text(value.get(key))
+        if normalized:
+            owner[key] = normalized
+    return owner or None
+
+
+def _text(value: Any, *, maximum: int = 500) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return normalized[:maximum] if normalized else None

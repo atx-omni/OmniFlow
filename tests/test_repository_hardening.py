@@ -27,7 +27,7 @@ def nested_uses(value: Any) -> list[str]:
 
 
 class RepositoryHardeningTests(unittest.TestCase):
-    def test_distribution_name_does_not_collide_with_existing_pypi_project(self):
+    def test_distribution_and_cli_names_are_explicit(self):
         pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
         self.assertEqual(pyproject["project"]["name"], "omniflow-ci")
         self.assertEqual(pyproject["project"]["scripts"]["omniflow"], "omniflow.cli:main")
@@ -40,6 +40,8 @@ class RepositoryHardeningTests(unittest.TestCase):
             for use in nested_uses(payload):
                 if use == "atx-omni/OmniFlow@<pinned-commit-sha>":
                     continue
+                if use.startswith("./"):
+                    continue
                 self.assertRegex(use, PINNED_USE_RE, msg=f"Unpinned action in {path}: {use}")
 
     def test_composite_action_does_not_interpolate_inputs_inside_shell_scripts(self):
@@ -48,15 +50,31 @@ class RepositoryHardeningTests(unittest.TestCase):
         self.assertFalse(any("${{ inputs." in script for script in scripts))
         self.assertTrue(any("--skip-reason" in script for script in scripts))
 
-    def test_example_workflow_fetches_history_and_uploads_only_public_evidence(self):
+    def test_example_workflow_uses_minimal_checkout_and_uploads_only_public_evidence(self):
         text = (ROOT / ".github/workflow-examples/omniflow.yml").read_text(encoding="utf-8")
-        self.assertIn("fetch-depth: 0", text)
+        self.assertIn("fetch-depth: 1", text)
+        self.assertIn("persist-credentials: false", text)
+        self.assertIn("timeout-minutes: 30", text)
+        self.assertIn("cancel-in-progress: true", text)
         self.assertIn("pull_request_target:", text)
         self.assertNotIn("ref: ${{ github.event.pull_request.head", text)
         self.assertIn("Route fork pull request without Omni secret", text)
         self.assertNotIn("skip-reason: Fork pull requests", text)
+        self.assertIn("omni-api-key: ${{ secrets.OMNI_API_KEY }}", text)
+        self.assertNotIn("env:\n          OMNI_API_KEY:", text)
+        self.assertIn('.user.login == "github-actions[bot]"', text)
         self.assertIn(".omniflow/public/report.json", text)
         self.assertNotIn(".omniflow/restricted/", text)
+
+    def test_every_checkout_disables_persisted_credentials(self):
+        paths = sorted((ROOT / ".github/workflows").glob("*.yml"))
+        paths.append(ROOT / ".github/workflow-examples/omniflow.yml")
+        for path in paths:
+            payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+            for job in payload.get("jobs", {}).values():
+                for step in job.get("steps", []):
+                    if str(step.get("uses", "")).startswith("actions/checkout@"):
+                        self.assertFalse(step.get("with", {}).get("persist-credentials"), msg=str(path))
 
     def test_legacy_package_and_packaging_shims_are_absent(self):
         self.assertFalse((ROOT / "setup.py").exists())
@@ -77,20 +95,58 @@ class RepositoryHardeningTests(unittest.TestCase):
 
     def test_release_is_audited_and_has_explicit_repository_context(self):
         text = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
-        self.assertIn("python -m pip_audit --local", text)
+        self.assertIn("--require-hashes --only-binary=:all:", text)
+        self.assertIn("requirements/release-py311-linux-x86_64.txt", text)
+        self.assertIn("compare/${GITHUB_SHA}...main", text)
+        self.assertIn("name: github-release", text)
         self.assertIn("GH_REPO: ${{ github.repository }}", text)
+        self.assertNotIn("publish-pypi", text)
+        self.assertNotIn("gh-action-pypi-publish", text)
 
     def test_build_and_ci_use_patched_setuptools(self):
         pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
         self.assertIn("setuptools>=83,<84", pyproject["build-system"]["requires"])
 
-        for path in [
-            ROOT / "action.yml",
-            ROOT / ".github/workflows/dependency-scan.yml",
-            ROOT / ".github/workflows/release.yml",
-            ROOT / ".github/workflows/test.yml",
-        ]:
+        for path in [ROOT / ".github/workflows/dependency-scan.yml", ROOT / ".github/workflows/test.yml"]:
             self.assertIn("setuptools==83.0.0", path.read_text(encoding="utf-8"), msg=str(path))
+        lock = (ROOT / "requirements/action-py311-linux-x86_64.txt").read_text(encoding="utf-8")
+        self.assertIn("setuptools==83.0.0", lock)
+
+    def test_action_install_is_hash_locked_and_token_is_runtime_only(self):
+        action = yaml.safe_load((ROOT / "action.yml").read_text(encoding="utf-8"))
+        self.assertNotIn("version", action["inputs"])
+        self.assertIn("omni-api-key", action["inputs"])
+        install = next(step for step in action["runs"]["steps"] if step["name"] == "Install OmniFlow")
+        run = next(step for step in action["runs"]["steps"] if step["name"] == "Run OmniFlow")
+        self.assertIn("--require-hashes", install["run"])
+        self.assertIn("--only-binary=:all:", install["run"])
+        self.assertIn("--no-deps --no-build-isolation", install["run"])
+        self.assertIn("PIP_NO_INDEX=1", install["run"])
+        self.assertNotIn("OMNI_API_KEY", install.get("env", {}))
+        self.assertEqual(run["env"]["OMNI_API_KEY"], "${{ inputs['omni-api-key'] }}")
+        self.assertNotIn("omniflow-ci==", (ROOT / "action.yml").read_text(encoding="utf-8"))
+
+    def test_action_and_release_locks_pin_every_requirement_with_sha256(self):
+        for relative in (
+            "requirements/action-py311-linux-x86_64.txt",
+            "requirements/release-py311-linux-x86_64.txt",
+        ):
+            text = (ROOT / relative).read_text(encoding="utf-8")
+            requirements = [line for line in text.splitlines() if "==" in line and not line.lstrip().startswith("#")]
+            hashes = [line for line in text.splitlines() if "--hash=sha256:" in line]
+            self.assertTrue(requirements, msg=relative)
+            self.assertEqual(len(requirements), len(hashes), msg=relative)
+
+    def test_security_critical_files_have_codeowners(self):
+        text = (ROOT / ".github/CODEOWNERS").read_text(encoding="utf-8")
+        for path in ("/.github/", "/action.yml", "/requirements/", "/pyproject.toml", "/SECURITY.md"):
+            self.assertIn(path, text)
+
+    def test_actions_security_scanner_is_enabled(self):
+        text = (ROOT / ".github/workflows/actions-security.yml").read_text(encoding="utf-8")
+        self.assertIn("zizmorcore/zizmor-action@", text)
+        self.assertIn("version: 1.29.0", text)
+        self.assertIn("advanced-security: false", text)
 
     def test_simulator_uses_deterministic_base_branch(self):
         text = (ROOT / "scripts/simulate_alpha.py").read_text(encoding="utf-8")

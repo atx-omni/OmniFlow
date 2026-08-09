@@ -8,6 +8,8 @@ from typing import Any
 
 from .exceptions import ConfigError, OmniAPIError, SecurityPolicyError
 from .omni_client import OmniClient
+from .security import secure_mkdir, secure_write_text
+from .yaml_security import MAX_YAML_FILE_BYTES, MAX_YAML_FILES, MAX_YAML_TOTAL_BYTES
 
 SUPPORTED_YAML_MODES = {"extension", "staged", "combined"}
 
@@ -35,16 +37,15 @@ def pull_yaml(
     )
     root = Path(output_dir)
     _validate_yaml_root(root)
-    root.mkdir(parents=True, exist_ok=True)
     files = _extract_file_map(payload)
     if not files:
         raise OmniAPIError("Omni model YAML response did not contain any authored files")
+    validated_files = _validate_file_map(root, files)
+    secure_mkdir(root, enforce_private=True)
     checksums = _extract_checksums(payload)
     manifest_files: dict[str, dict[str, str | None]] = {}
-    for file_name, text in files.items():
-        target = _safe_yaml_target(root, file_name)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(text, encoding="utf-8")
+    for file_name, text, target in validated_files:
+        secure_write_text(target, text)
         manifest_files[file_name] = {
             "checksum": checksums.get(file_name),
             "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
@@ -57,8 +58,24 @@ def pull_yaml(
         "files": manifest_files,
     }
     manifest_target = _safe_yaml_target(root, "manifest.json")
-    manifest_target.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    secure_write_text(manifest_target, json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     return manifest
+
+
+def _validate_file_map(root: Path, files: dict[str, str]) -> list[tuple[str, str, Path]]:
+    if len(files) > MAX_YAML_FILES:
+        raise SecurityPolicyError("Omni YAML response contains more than 5,000 authored files")
+    total_bytes = 0
+    validated: list[tuple[str, str, Path]] = []
+    for file_name, text in files.items():
+        size = len(text.encode("utf-8"))
+        if size > MAX_YAML_FILE_BYTES:
+            raise SecurityPolicyError(f"Omni YAML file '{file_name[:240]}' exceeds the 5 MiB safety limit")
+        total_bytes += size
+        if total_bytes > MAX_YAML_TOTAL_BYTES:
+            raise SecurityPolicyError("Omni YAML response exceeds the 50 MiB aggregate safety limit")
+        validated.append((file_name, text, _safe_yaml_target(root, file_name)))
+    return validated
 
 
 def _validate_yaml_root(root: Path) -> None:
@@ -69,6 +86,8 @@ def _validate_yaml_root(root: Path) -> None:
 
 
 def _safe_yaml_target(root: Path, file_name: str) -> Path:
+    if len(file_name) > 1_024 or "\x00" in file_name or "\n" in file_name or "\r" in file_name:
+        raise SecurityPolicyError("Omni YAML response contained an unsafe file path")
     relative = Path(file_name)
     if relative.is_absolute() or not file_name.strip() or ".." in relative.parts:
         raise SecurityPolicyError("Omni YAML response contained an unsafe file path")

@@ -1,4 +1,6 @@
 import json
+import os
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -48,6 +50,8 @@ class ExposureArtifactTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(report["summary"]["total_exposures"], 1)
         self.assertEqual(report["exposures"][0]["depends_on"], ["model.orders"])
+        self.assertEqual(report["exposures"][0]["owner"], {"name": "Alice"})
+        self.assertNotIn("email", report["exposures"][0]["owner"])
 
     def test_dbt_exposure_enrichment_degrades_to_warning_by_default(self):
         report, exit_code = run_dbt_exposure_enrichment(
@@ -71,6 +75,9 @@ class ExposureArtifactTests(unittest.TestCase):
             write_public_reports(report, output_dir=tmp, formats=["json", "markdown"], redaction_level="strict")
             root_report = json.loads((Path(tmp) / "report.json").read_text(encoding="utf-8"))
             public_report = json.loads((Path(tmp) / "public/report.json").read_text(encoding="utf-8"))
+            if os.name == "posix":
+                self.assertEqual(stat.S_IMODE((Path(tmp) / "report.json").stat().st_mode), 0o600)
+                self.assertEqual(stat.S_IMODE((Path(tmp) / "public").stat().st_mode), 0o700)
         self.assertEqual(root_report, public_report)
         self.assertEqual(root_report["issues"][0]["content_name"], "[REDACTED]")
         self.assertEqual(root_report["issues"][0]["owner"], "[REDACTED]")

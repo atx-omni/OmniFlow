@@ -21,6 +21,11 @@ from .trust import read_trusted_repo_text
 FLOW_PATH = Path(".omni/flow.json")
 PR_MARKER_RE = re.compile(r"<!--\s*omniflow-context\s+({.*?})\s*-->", re.DOTALL)
 PR_MARKER_KEYS = {"model_id", "model_path", "branch_name", "base_url"}
+FLOW_KEYS = {"version", "models"}
+MODEL_KEYS = {"base_url", "model_id", "model_path", "base_branch", "git_provider", "web_url"}
+MAX_FLOW_MODELS = 500
+MAX_MARKER_BYTES = 4 * 1024
+MAX_CHANGED_FILES = 10_000
 
 
 @dataclass
@@ -110,6 +115,7 @@ def load_flow_metadata(path: str | Path = FLOW_PATH, *, missing_ok: bool = False
     if not isinstance(payload, dict):
         raise ConfigError(f"Metadata file {candidate} must contain a JSON object")
     reject_secret_keys(payload, source=str(candidate))
+    _reject_unknown_keys(payload, FLOW_KEYS, f"Metadata file {candidate}")
     models = payload.get("models")
     if not isinstance(models, list) or not models:
         raise ConfigError(f"Metadata file {candidate} must include a non-empty models list")
@@ -117,6 +123,8 @@ def load_flow_metadata(path: str | Path = FLOW_PATH, *, missing_ok: bool = False
         raise ConfigError(f"Metadata file {candidate} must use version 1")
     if any(not isinstance(item, dict) for item in models):
         raise ConfigError(f"Metadata file {candidate} models must all be JSON objects")
+    if len(models) > MAX_FLOW_MODELS:
+        raise SecurityPolicyError(f"Metadata file {candidate} contains more than 500 models")
     contexts = [_model_from_payload(item, branch_name=None) for item in models]
     model_ids = [context.model_id for context in contexts]
     model_paths = [context.model_path for context in contexts]
@@ -138,11 +146,16 @@ def load_pr_marker() -> dict[str, Any]:
     body = (event.get("pull_request") or {}).get("body") or ""
     if not isinstance(body, str):
         return {}
-    match = PR_MARKER_RE.search(body)
-    if not match:
+    matches = PR_MARKER_RE.findall(body)
+    if not matches:
         return {}
+    if len(matches) > 1:
+        raise ConfigError("Pull request contains more than one omniflow-context marker")
+    marker_json = matches[0]
+    if len(marker_json.encode("utf-8")) > MAX_MARKER_BYTES:
+        raise SecurityPolicyError("OmniFlow PR marker exceeds the 4 KiB safety limit")
     try:
-        payload = json.loads(match.group(1))
+        payload = json.loads(marker_json)
     except json.JSONDecodeError as exc:
         raise ConfigError(f"OmniFlow PR marker contains invalid JSON: {exc.msg}") from exc
     if not isinstance(payload, dict):
@@ -167,6 +180,8 @@ def get_changed_files(base_branch: str | None = None) -> list[str]:
 
     if os.getenv("GITHUB_EVENT_NAME") == "pull_request_target":
         return _github_pull_request_files()
+    if os.getenv("GITHUB_EVENT_NAME") == "push":
+        return _push_event_files()
 
     candidates = []
     if os.getenv("GITHUB_BASE_REF"):
@@ -251,6 +266,7 @@ def select_model_contexts(
 def _model_from_payload(
     payload: dict[str, Any], *, branch_name: str | None, require_model_path: bool = True
 ) -> ModelContext:
+    _reject_unknown_keys(payload, MODEL_KEYS, "OmniFlow model context")
     keys = ("base_url", "model_id", "model_path") if require_model_path else ("base_url", "model_id")
     for key in keys:
         if not isinstance(payload.get(key), str) or not payload[key].strip():
@@ -259,7 +275,10 @@ def _model_from_payload(
     model_id = validate_path_segment(payload["model_id"].strip(), name="model_id")
     normalized_model_path = str(payload.get("model_path") or "").strip().strip("/")
     if normalized_model_path and (
-        Path(normalized_model_path).is_absolute() or ".." in Path(normalized_model_path).parts
+        Path(normalized_model_path).is_absolute()
+        or ".." in Path(normalized_model_path).parts
+        or len(normalized_model_path) > 1_024
+        or any(character in normalized_model_path for character in ("\x00", "\r", "\n", "\\"))
     ):
         raise ConfigError("OmniFlow model_path must stay inside the repository")
     base_branch = payload.get("base_branch")
@@ -267,14 +286,29 @@ def _model_from_payload(
         if not isinstance(base_branch, str) or not base_branch.strip():
             raise ConfigError("OmniFlow base_branch must be a non-empty string when provided")
         base_branch = validate_branch_name(base_branch.strip())
+    git_provider = _optional_metadata_string(payload.get("git_provider"), "git_provider")
+    if git_provider and git_provider.lower() != "github":
+        raise ConfigError("OmniFlow git_provider must be 'github'")
+    web_url = _optional_metadata_string(payload.get("web_url"), "web_url", maximum=2_048)
+    if web_url:
+        parsed_web_url = urlparse(web_url)
+        if (
+            parsed_web_url.scheme != "https"
+            or not parsed_web_url.hostname
+            or parsed_web_url.username
+            or parsed_web_url.password
+            or parsed_web_url.query
+            or parsed_web_url.fragment
+        ):
+            raise ConfigError("OmniFlow web_url must be a trusted HTTPS repository URL")
     return ModelContext(
         base_url=base_url,
         model_id=model_id,
         model_path=normalized_model_path,
         branch_name=branch_name,
         base_branch=base_branch,
-        git_provider=payload.get("git_provider"),
-        web_url=payload.get("web_url"),
+        git_provider=git_provider,
+        web_url=web_url,
     )
 
 
@@ -390,3 +424,44 @@ def _github_pull_request_files() -> list[str]:
             "GitHub returned an incomplete pull request file list; OmniFlow cannot route the change safely"
         )
     return files
+
+
+def _push_event_files() -> list[str]:
+    event = github_event_payload()
+    commits = event.get("commits")
+    if not isinstance(commits, list):
+        raise ConfigError("GitHub push event did not contain a changed-file inventory")
+    expected = event.get("size")
+    if isinstance(expected, int) and len(commits) < expected:
+        raise ConfigError("GitHub push event contained an incomplete commit inventory")
+    files: list[str] = []
+    for commit in commits:
+        if not isinstance(commit, dict):
+            raise ConfigError("GitHub push event contained an invalid commit record")
+        for key in ("added", "modified", "removed"):
+            values = commit.get(key, [])
+            if not isinstance(values, list):
+                raise ConfigError("GitHub push event contained an invalid changed-file list")
+            for value in values:
+                if not isinstance(value, str) or not value.strip():
+                    continue
+                normalized = value.strip()
+                if normalized not in files:
+                    files.append(normalized)
+                if len(files) > MAX_CHANGED_FILES:
+                    raise SecurityPolicyError("GitHub push event contains more than 10,000 changed files")
+    return files
+
+
+def _reject_unknown_keys(payload: dict[str, Any], allowed: set[str], source: str) -> None:
+    unknown = sorted(str(key) for key in payload if key not in allowed)
+    if unknown:
+        raise ConfigError(f"{source} contains unsupported key(s): {', '.join(unknown)}")
+
+
+def _optional_metadata_string(value: Any, name: str, *, maximum: int = 255) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip() or len(value.strip()) > maximum:
+        raise ConfigError(f"OmniFlow {name} must be a non-empty string no longer than {maximum} characters")
+    return value.strip()
