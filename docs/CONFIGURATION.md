@@ -7,6 +7,7 @@ OmniFlow separates trusted model identity, optional policy, and secrets so each 
 | Model identity and routing | `.omni/flow.json` | Yes for `omniflow run --auto` |
 | Validation and reporting policy | `.omniflow.yml` | No |
 | Omni API key | `OMNI_API_KEY` environment variable or GitHub Actions secret | Yes for Omni validation |
+| AI repair API key | `OMNIFLOW_REPAIR_API_KEY` protected GitHub environment secret | Only for optional AI Repair |
 | Pull-request branch | GitHub event context | Discovered automatically |
 
 ## Trusted Model Identity
@@ -148,6 +149,30 @@ security:
 - Unknown configuration keys fail closed so misspelled security or policy settings cannot be silently ignored.
 - Personal folders are excluded by default.
 
+## Unreleased AI Repair Scaffold
+
+AI Repair is disabled by default, is not part of `omniflow run --auto`, and is not supported for customer installation until Omni publishes a Modeling Agent API contract.
+
+```yaml
+repairs:
+  ai:
+    enabled: true
+    allow_query_execution: true
+    max_changed_files: 3
+    max_changed_lines: 200
+    poll_timeout_seconds: 300
+```
+
+| Setting | Default | Allowed range or behavior |
+| --- | --- | --- |
+| `enabled` | `false` | Must be explicitly enabled on the trusted base branch. |
+| `allow_query_execution` | `false` | Must be `true` because Omni's AI Jobs API may execute queries and has no documented no-query switch. |
+| `max_changed_files` | `3` | `1` through `20`; additions and deletions are rejected regardless. |
+| `max_changed_lines` | `200` | `1` through `2000`, counting added and removed lines. |
+| `poll_timeout_seconds` | `300` | `30` through `900`; timeout triggers AI-job cancellation before rollback. |
+
+The repair token is read only from `OMNIFLOW_REPAIR_API_KEY`; it cannot be placed in policy. Use the separate protected workflow in [the AI Repair guide](AI_REPAIR.md). The normal validation action never receives this token.
+
 ## Local Debugging Overrides
 
 Explicit identity flags such as `--base-url`, `--model-id`, `--model-path`, `--branch-name`, and `--branch-id` are intended for local debugging. The customer workflow should use:
@@ -157,3 +182,5 @@ omniflow run --auto --config .omniflow.yml
 ```
 
 The API key is always read from `OMNI_API_KEY`. Never add it to either configuration file.
+
+`omniflow repair ai --auto` is intentionally not a local debug shortcut. It additionally requires a trusted same-repository `pull_request_target` label event, protected workflow, GitHub token, and `OMNIFLOW_REPAIR_API_KEY`.

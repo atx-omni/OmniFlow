@@ -93,6 +93,34 @@ Confirm that the workflow:
 - Has outbound access to Python package dependencies.
 - Has not changed the action's hash-locked dependency file or replaced the trusted installation step.
 
+## AI Repair Results
+
+AI Repair is an unreleased maintainer scaffold and must not be enabled for customer use. See [the AI Repair guide](AI_REPAIR.md) for the release blocker. Never troubleshoot repair by pasting model YAML, the AI prompt, a result summary, or a token into a GitHub issue.
+
+### Missing `OMNIFLOW_REPAIR_API_KEY`
+
+Confirm the secret exists inside the protected `omniflow-ai-repair` GitHub environment, the workflow job names that environment, and the action passes it through `repair-api-key`. Do not substitute `OMNI_API_KEY`.
+
+### AI Repair Is Disabled Or Query Execution Is Not Acknowledged
+
+Both `repairs.ai.enabled` and `repairs.ai.allow_query_execution` must be `true` in trusted base-branch policy. The second value acknowledges that Omni's documented AI Jobs API may execute queries and has no no-query switch. Do not enable it merely to clear an error without completing the security review.
+
+### Repair Was Already Attempted For This SHA
+
+One AI attempt is allowed per pull-request head SHA. Review the prior bot-authored repair comment and evidence. Make a reviewed manual correction or push a new commit before requesting another repair; do not delete the marker to bypass the control.
+
+### `rolled_back`
+
+The AI job, safety inspection, forced model validation, or full configured gate failed, and OmniFlow verified restoration of the original authored YAML. Review the public repair evidence and correct the model manually or create a new reviewed commit.
+
+### `manual_review_required`
+
+OmniFlow could not confirm cancellation or the Git commit result. It deliberately did not overwrite an active or ambiguous branch state. Inspect the Omni branch, AI job, and GitHub PR before any new label, merge, or deployment.
+
+### `rollback_failed`
+
+Stop merge and deployment activity. A concurrent edit or API failure prevented exact rollback verification. Compare the current Omni branch with the PR and reconcile it manually. Rotate the repair PAT if credential misuse is suspected.
+
 ## Exit Codes
 
 | Code | Meaning |
