@@ -1,12 +1,19 @@
 name: OmniFlow
 description: Security-first validation for Omni semantic-layer changes.
 inputs:
+  mode:
+    description: Operation to run. Supported values are validate and repair.
+    required: false
+    default: validate
   config:
     description: Path to .omniflow.yml
     required: false
     default: .omniflow.yml
   omni-api-key:
     description: Dedicated least-privilege Omni personal access token. Exposed only to the validation step.
+    required: false
+  repair-api-key:
+    description: Separate write-capable Omni PAT. Exposed only to the opt-in repair step.
     required: false
   skip-reason:
     description: Record a successful skipped run without exposing the Omni API key.
@@ -35,8 +42,30 @@ runs:
         PIP_NO_INDEX=1 python -m pip install --no-deps --no-build-isolation "$GITHUB_ACTION_PATH"
         python -m pip check
 
+    - name: Validate action mode
+      shell: bash
+      env:
+        OMNIFLOW_INPUT_MODE: ${{ inputs.mode }}
+        OMNIFLOW_INPUT_SKIP_REASON: ${{ inputs['skip-reason'] }}
+      run: |
+        set -euo pipefail
+        case "$OMNIFLOW_INPUT_MODE" in
+          validate)
+            ;;
+          repair)
+            if [ -n "$OMNIFLOW_INPUT_SKIP_REASON" ]; then
+              echo "skip-reason is supported only in validate mode" >&2
+              exit 2
+            fi
+            ;;
+          *)
+            echo "mode must be validate or repair" >&2
+            exit 2
+            ;;
+        esac
+
     - name: Record skipped run
-      if: inputs['skip-reason'] != ''
+      if: inputs.mode == 'validate' && inputs['skip-reason'] != ''
       shell: bash
       env:
         OMNIFLOW_INPUT_CONFIG: ${{ inputs.config }}
@@ -47,7 +76,7 @@ runs:
           --skip-reason "$OMNIFLOW_INPUT_SKIP_REASON"
 
     - name: Run OmniFlow
-      if: inputs['skip-reason'] == ''
+      if: inputs.mode == 'validate' && inputs['skip-reason'] == ''
       shell: bash
       env:
         OMNI_API_KEY: ${{ inputs['omni-api-key'] }}
@@ -56,3 +85,14 @@ runs:
       run: |
         set -euo pipefail
         omniflow run --auto --config "$OMNIFLOW_INPUT_CONFIG"
+
+    - name: Run OmniFlow AI repair
+      if: inputs.mode == 'repair'
+      shell: bash
+      env:
+        OMNIFLOW_REPAIR_API_KEY: ${{ inputs['repair-api-key'] }}
+        OMNIFLOW_INPUT_CONFIG: ${{ inputs.config }}
+        OMNIFLOW_GITHUB_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        omniflow repair ai --auto --config "$OMNIFLOW_INPUT_CONFIG"

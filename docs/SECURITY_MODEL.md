@@ -14,6 +14,8 @@ The supported customer path is the pinned GitHub Action in [the installation gui
 
 OmniFlow does not currently publish an official PyPI package. A floating branch, floating tag, third-party package, modified dependency lock, or workflow that executes pull-request-head code with the Omni token is outside the supported security boundary.
 
+The AI Repair development scaffold is outside the supported customer security boundary. It must remain disabled until Omni publishes the required Modeling Agent API contract. Its proposed controls are documented in [the AI Repair guide](AI_REPAIR.md).
+
 ## Trust Boundaries
 
 The privileged `pull_request_target` workflow checks out the trusted base revision. OmniFlow reads `.omni/flow.json` and `.omniflow.yml` from that base revision and obtains changed filenames through GitHub's API. It does not check out or execute the proposed pull-request revision.
@@ -26,6 +28,8 @@ Non-Omni pull requests return a successful `skipped` decision. Fork pull request
 
 The GitHub workflow passes a dedicated Omni PAT as an action input. The composite action exposes it as `OMNI_API_KEY` only for the validation process, after installation completes. Install and skip steps do not receive the token as an environment variable.
 
+The unreleased AI Repair scaffold uses a different `OMNIFLOW_REPAIR_API_KEY` during maintainer testing, exposed only to the repair process after protected-environment approval. It must never reuse the routine validation PAT. A dedicated Modeler-scoped user limited to a non-production model is the conservative development starting point; any narrower custom role remains unverified.
+
 Omni documents that Organization API Keys have Organization Admin permissions. Use a PAT from a dedicated user whose access is limited to the models and content being validated. Omni tokens do not expire automatically, so maintainers must define rotation, revocation, and access-review procedures.
 
 OmniFlow rejects secret-like configuration keys and environment expansion of secret-like names. Logs, errors, public reports, Markdown, annotations, and support guidance redact credentials and common sensitive metadata.
@@ -34,7 +38,11 @@ OmniFlow rejects secret-like configuration keys and environment expansion of sec
 
 OmniFlow sends authenticated requests only to the HTTPS origin in trusted metadata. Redirects are disabled, TLS verification remains enabled, request timeouts are bounded, retries apply only to throttling and transient server errors, and response bodies are never included in API errors.
 
-The current orchestrated API client uses read-only GET operations. OmniFlow does not query a warehouse, capture query results, merge pull requests, or write model YAML to Omni.
+The normal orchestrated validation client uses read-only GET operations. It does not query a warehouse, capture query results, merge pull requests, or write model YAML to Omni.
+
+The optional AI Repair path uses documented AI-job, YAML-write/delete, and Git-commit endpoints against an existing development branch. Omni documents that AI jobs may execute queries and does not expose a no-query switch on that endpoint. OmniFlow never calls the AI result stream, stores no result summary or raw query data, cancels a non-terminal job before rollback, rejects sensitive or out-of-scope YAML changes, reruns every configured gate, and never approves, merges, or deploys.
+
+Non-idempotent AI creation, YAML mutation, deletion, and Git commit requests are not retried. AI cancellation is documented as idempotent. Ambiguous job creation, cancellation, commit, concurrent edit, or rollback results fail closed for manual review.
 
 API responses, pagination, trusted files, YAML files, YAML totals, nesting, aliases, and model counts have explicit safety limits. Repeated pagination cursors, cyclic YAML aliases, unsafe paths, symbolic-link output targets, unknown policy keys, and ambiguous routing fail closed.
 
@@ -43,6 +51,8 @@ API responses, pagination, trusted files, YAML files, YAML totals, nesting, alia
 Public reports remove credentials, raw payloads, emails, document URLs, and folder paths. Strict redaction additionally removes names, owners, labels, and free-text messages.
 
 Restricted YAML, dependency, semantic-diff, content, and contract files are deleted by default. When a local operator explicitly enables retention, OmniFlow creates owner-only directories and files. The official workflow uploads only the public directory and artifact manifest.
+
+AI Repair keeps pre- and post-change YAML snapshots in process memory. Public repair evidence contains metadata and counts only. The AI prompt, authored YAML, AI result summary, chat URL, progress, error body, and query data are not persisted by OmniFlow.
 
 Do not retain restricted artifacts on a persistent or shared self-hosted runner. A self-hosted runner is outside the recommended alpha path unless it is isolated, ephemeral, access-controlled, and cleaned after every job.
 
@@ -61,6 +71,9 @@ Repository security automation includes tests, Ruff, Bandit, pip-audit, gitleaks
 - Rotate and revoke the Omni PAT according to policy.
 - Verify the first real Omni-created pull request and post-merge Omni promotion before making the check mandatory.
 - Never upload restricted artifacts or raw Omni responses to a public issue.
+- Keep AI Repair disabled until the normal validation workflow has passed a real Omni-created PR.
+- Require protected-environment approval for every AI repair and review the resulting PR diff independently.
+- Revoke the repair PAT and stop merge activity immediately after `rollback_failed` or an ambiguous write outcome.
 
 ## Reporting A Vulnerability
 
