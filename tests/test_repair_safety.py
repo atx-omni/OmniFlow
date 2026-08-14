@@ -61,12 +61,48 @@ class RepairSafetyTests(unittest.TestCase):
 
     def test_validation_targets_must_be_existing_documented_files(self):
         captured = snapshot(MemoryYamlClient({"orders.view": "name: orders\n"}))
-        issues = [{"message": "bad", "is_warning": False, "yaml_path": "orders.view"}]
+        issues = [{"message": "bad", "is_warning": False, "yaml_path": "orders.view,measures,total"}]
         self.assertEqual(repair_target_files(issues, captured), ("orders.view",))
         with self.assertRaises(SecurityPolicyError):
             repair_target_files([{"is_warning": False, "yaml_path": "missing.view"}], captured)
         with self.assertRaises(SecurityPolicyError):
             repair_target_files([{"is_warning": False, "yaml_path": "nested/orders.view"}], captured)
+
+    def test_validation_targets_resolve_omni_semantic_names_to_nested_authored_files(self):
+        captured = snapshot(
+            MemoryYamlClient(
+                {"omni_dbt_marts/fact_order_items.view": "name: omni_dbt_marts__fact_order_items\n"}
+            )
+        )
+        issues = [
+            {
+                "message": "Field not found",
+                "is_warning": False,
+                "yaml_path": (
+                    "omni_dbt_marts__fact_order_items.view,"
+                    "measures,omniflow_ai_repair_test_revenue"
+                ),
+            }
+        ]
+        self.assertEqual(
+            repair_target_files(issues, captured),
+            ("omni_dbt_marts/fact_order_items.view",),
+        )
+
+    def test_validation_target_aliases_must_resolve_uniquely(self):
+        captured = snapshot(
+            MemoryYamlClient(
+                {
+                    "a__b/c.view": "name: first\n",
+                    "a/b__c.view": "name: second\n",
+                }
+            )
+        )
+        with self.assertRaisesRegex(SecurityPolicyError, "ambiguously"):
+            repair_target_files(
+                [{"is_warning": False, "yaml_path": "a__b__c.view,dimensions,id"}],
+                captured,
+            )
 
     def test_safe_scoped_metadata_change_passes_inspection(self):
         client = MemoryYamlClient({"orders.view": "name: orders\ndescription: old\n"})

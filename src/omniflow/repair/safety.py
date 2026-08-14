@@ -79,9 +79,7 @@ def repair_target_files(validation_issues: list[dict[str, Any]], snapshot: Model
         yaml_path = issue.get("yaml_path")
         if not isinstance(yaml_path, str) or not yaml_path.strip():
             raise SecurityPolicyError("Every model validation error must identify an authored YAML file")
-        file_name = yaml_path.strip()
-        if file_name not in snapshot.files:
-            raise SecurityPolicyError("A model validation error references an authored YAML file that was not fetched")
+        file_name = _resolve_authored_file_name(yaml_path, snapshot)
         try:
             validate_editable_yaml_file_name(file_name)
         except ConfigError as exc:
@@ -90,6 +88,19 @@ def repair_target_files(validation_issues: list[dict[str, Any]], snapshot: Model
             ) from exc
         targets.add(file_name)
     return tuple(sorted(targets))
+
+
+def _resolve_authored_file_name(yaml_path: str, snapshot: ModelSnapshot) -> str:
+    reference = yaml_path.split(",", 1)[0].strip()
+    if reference in snapshot.files:
+        return reference
+
+    matches = sorted(file_name for file_name in snapshot.files if file_name.replace("/", "__") == reference)
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise SecurityPolicyError("A model validation error maps ambiguously to multiple authored YAML files")
+    raise SecurityPolicyError("A model validation error references an authored YAML file that was not fetched")
 
 
 def compare_snapshots(before: ModelSnapshot, after: ModelSnapshot) -> SnapshotDiff:
