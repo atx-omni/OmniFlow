@@ -7,6 +7,7 @@ on: # zizmor: ignore[dangerous-triggers] trusted-base workflow never executes PR
   workflow_dispatch:
 
 permissions:
+  actions: read
   contents: read
   pull-requests: write
   security-events: write
@@ -60,7 +61,9 @@ jobs:
           include-hidden-files: true
 
       - name: Upload SARIF
-        if: always() && hashFiles('.omniflow/public/report.sarif') != ''
+        # Enable only when GitHub Code Security is available by setting the
+        # repository variable OMNIFLOW_UPLOAD_SARIF to true.
+        if: always() && vars.OMNIFLOW_UPLOAD_SARIF == 'true' && hashFiles('.omniflow/public/report.sarif') != ''
         continue-on-error: true
         uses: github/codeql-action/upload-sarif@dc73d59c2d7bd4f8194098a91219eeee6d8a1719
         with:

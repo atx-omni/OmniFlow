@@ -2,7 +2,7 @@
 
 OmniFlow is an open-source, local-first CI gate for Omni semantic-layer development. It runs in a customer's GitHub repository when an Omni branch opens a pull request, validates the model and its downstream content, and produces review and audit evidence before merge.
 
-> **Status:** Controlled alpha. The local test and simulation suites are automated, but a real Omni-created pull request is still required before using OmniFlow as a production merge gate.
+> **Status:** Controlled alpha. The complete Omni-created PR, validation, evidence, merge, and Omni synchronization path has passed on a maintainer-controlled non-production model. Each adopter must still complete the live installation gate against its own model, permissions, GitHub plan, and branch protections before making OmniFlow a required check.
 
 ## Quick Start
 
@@ -17,6 +17,8 @@ The complete walkthrough is in [Install OmniFlow In A GitHub Repository](docs/IN
 7. Create a harmless model change in an Omni branch, select **Create pull request**, and confirm OmniFlow validates the resulting GitHub pull request.
 
 After the first live run succeeds, make the OmniFlow check required in GitHub branch protection. Continue with the [installation checklist](docs/INSTALLATION.md#step-9-verify-the-installation) before treating OmniFlow as a merge gate.
+
+The workflow always preserves `report.sarif` in the evidence artifact. Repositories with GitHub Code Security enabled can additionally set the repository variable `OMNIFLOW_UPLOAD_SARIF=true` to publish those results into GitHub code scanning.
 
 ## What OmniFlow Checks
 
@@ -116,6 +118,8 @@ checks:
 
 Make the OmniFlow job a required GitHub check and require pull-request approval. Confirm the Omni pull-request webhook is configured; Omni documents that it is required to keep Git and Omni branches synchronized.
 
+GitHub may require a Team or Enterprise organization plan to enforce rulesets or classic branch protection on a private repository. If enforcement is unavailable, use OmniFlow only for controlled testing until the repository plan or visibility supports the required protections.
+
 ### 6. AI Repair Development Status
 
 Do not install AI Repair for customer use. The repository contains a guarded development scaffold, but the documented AI Jobs API is query-oriented and does not expose the Modeling Agent's branch-editing behavior. See [AI Repair Development Scaffold](docs/AI_REPAIR.md) for the blocker and safety design.
@@ -213,7 +217,7 @@ python -m build
 twine check dist/*
 ```
 
-The simulation covers same-repository and fork routing, contract failures, strict redaction, missing branches, malicious PR metadata, and optional API failures. It does not replace the live gate for actual Omni PR metadata, tenant permissions, branch mapping, Content Validator coverage, GitHub annotations/comments, or webhook promotion.
+The simulation covers same-repository and fork routing, contract failures, strict redaction, missing branches, malicious PR metadata, and optional API failures. The maintainers have also completed one end-to-end live validation on a non-production model. Neither result replaces the adopter-specific live gate for actual Omni PR metadata, tenant permissions, branch mapping, Content Validator coverage, GitHub annotations/comments, branch-protection enforcement, or webhook promotion.
 
 ## Maintainer Release Setup
 

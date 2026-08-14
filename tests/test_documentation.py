@@ -55,6 +55,8 @@ class DocumentationTests(unittest.TestCase):
             "Create pull request",
             "Protect The Base Branch",
             "Verify The Installation",
+            "OMNIFLOW_UPLOAD_SARIF",
+            "Team or Enterprise",
         ]:
             self.assertIn(required_text, text)
         self.assertLess(text.index("Protect The Base Branch"), text.index("Create And Store A Dedicated Omni PAT"))
