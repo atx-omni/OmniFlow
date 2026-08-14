@@ -104,6 +104,43 @@ class RepairSafetyTests(unittest.TestCase):
                 captured,
             )
 
+    def test_validation_target_resolves_unique_nested_topic_basename(self):
+        captured = snapshot(
+            MemoryYamlClient(
+                {
+                    "Omni Training/coffee_shop_command_center.topic": (
+                        "base_view: omni_dbt_marts__fact_order_items\n"
+                    )
+                }
+            )
+        )
+        issues = [
+            {
+                "message": "No such view having base_view",
+                "is_warning": False,
+                "yaml_path": "coffee_shop_command_center.topic,base_view",
+            }
+        ]
+        self.assertEqual(
+            repair_target_files(issues, captured),
+            ("Omni Training/coffee_shop_command_center.topic",),
+        )
+
+    def test_validation_target_basename_must_resolve_uniquely(self):
+        captured = snapshot(
+            MemoryYamlClient(
+                {
+                    "Finance/orders.topic": "base_view: finance_orders\n",
+                    "Operations/orders.topic": "base_view: operations_orders\n",
+                }
+            )
+        )
+        with self.assertRaisesRegex(SecurityPolicyError, "ambiguously"):
+            repair_target_files(
+                [{"is_warning": False, "yaml_path": "orders.topic,base_view"}],
+                captured,
+            )
+
     def test_safe_scoped_metadata_change_passes_inspection(self):
         client = MemoryYamlClient({"orders.view": "name: orders\ndescription: old\n"})
         before = snapshot(client)

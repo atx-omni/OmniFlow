@@ -100,6 +100,15 @@ def _resolve_authored_file_name(yaml_path: str, snapshot: ModelSnapshot) -> str:
         return matches[0]
     if len(matches) > 1:
         raise SecurityPolicyError("A model validation error maps ambiguously to multiple authored YAML files")
+
+    if "/" not in reference:
+        basename_matches = sorted(
+            file_name for file_name in snapshot.files if file_name.rsplit("/", 1)[-1] == reference
+        )
+        if len(basename_matches) == 1:
+            return basename_matches[0]
+        if len(basename_matches) > 1:
+            raise SecurityPolicyError("A model validation error maps ambiguously to multiple authored YAML files")
     raise SecurityPolicyError("A model validation error references an authored YAML file that was not fetched")
 
 
