@@ -1,7 +1,7 @@
 import unittest
 from unittest import mock
 
-from omniflow.exceptions import ConfigError, OmniAPIError
+from omniflow.exceptions import ConfigError, OmniAPIError, SecurityPolicyError
 from omniflow.omni_client import MAX_RESPONSE_BYTES, OmniClient
 
 FAKE_API_KEY = "secret"  # pragma: allowlist secret
@@ -316,6 +316,31 @@ class OmniClientTests(unittest.TestCase):
             },
         )
 
+    def test_yaml_writes_accept_safe_nested_authored_file_paths(self):
+        session = FakeSession(
+            [
+                FakeResponse({"fileName": "Omni Training/orders.view", "success": True}),
+                FakeResponse({"fileName": "Omni Training/orders.view", "success": True}),
+            ]
+        )
+        client = OmniClient(base_url="https://omni.example", api_key=FAKE_API_KEY, session=session)
+        client.update_model_yaml(
+            "model-1",
+            branch_id="branch-1",
+            file_name="Omni Training/orders.view",
+            yaml_text="name: orders\n",
+            previous_checksum="checksum-1",
+            commit_message="OmniFlow rollback",
+        )
+        client.delete_model_yaml(
+            "model-1",
+            branch_id="branch-1",
+            file_name="Omni Training/orders.view",
+            commit_message="OmniFlow rollback",
+        )
+        self.assertEqual(session.calls[0][2]["json"]["fileName"], "Omni Training/orders.view")
+        self.assertEqual(session.calls[1][2]["params"]["fileName"], "Omni Training/orders.view")
+
     def test_non_idempotent_writes_are_never_retried(self):
         for call in ("ai", "yaml", "delete", "commit"):
             with self.subTest(call=call):
@@ -372,6 +397,45 @@ class OmniClientTests(unittest.TestCase):
                 "model-1",
                 branch_id="branch-1",
                 commit_message="line one\nline two",
+            )
+
+    def test_yaml_writes_reject_unsafe_or_unsupported_authored_file_paths(self):
+        client = OmniClient(base_url="https://omni.example", api_key=FAKE_API_KEY, session=FakeSession([]))
+        unsafe_names = (
+            "../orders.view",
+            "/orders.view",
+            "nested//orders.view",
+            "nested/./orders.view",
+            "nested\\orders.view",
+            "nested/orders.view\nother.view",
+        )
+        for file_name in unsafe_names:
+            with self.subTest(file_name=file_name), self.assertRaises(SecurityPolicyError):
+                client.update_model_yaml(
+                    "model-1",
+                    branch_id="branch-1",
+                    file_name=file_name,
+                    yaml_text="name: orders\n",
+                    previous_checksum="checksum-1",
+                    commit_message="Rollback",
+                )
+        with self.assertRaises(ConfigError):
+            client.update_model_yaml(
+                "model-1",
+                branch_id="branch-1",
+                file_name="nested/orders.yaml",
+                yaml_text="name: orders\n",
+                previous_checksum="checksum-1",
+                commit_message="Rollback",
+            )
+        with self.assertRaises(ConfigError):
+            client.update_model_yaml(
+                "model-1",
+                branch_id="branch-1",
+                file_name="nested/model",
+                yaml_text="name: model\n",
+                previous_checksum="checksum-1",
+                commit_message="Rollback",
             )
 
 
