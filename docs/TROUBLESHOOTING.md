@@ -80,9 +80,17 @@ Confirm that:
 
 The validation result is still available in the check and public artifact even if commenting fails.
 
-### SARIF Upload Failed
+### SARIF Was Not Uploaded To Code Scanning
 
-Confirm that the workflow has `security-events: write` permission and that GitHub code scanning is available for the repository. The official example marks SARIF upload as non-blocking so a platform feature limitation does not hide the OmniFlow validation result.
+The official workflow always includes `report.sarif` in the public evidence artifact. Publishing it into GitHub code scanning is opt-in because GitHub Code Security is not available for every repository or plan.
+
+To enable code-scanning upload:
+
+1. Confirm GitHub Code Security is enabled for the repository.
+2. Add a repository Actions variable named `OMNIFLOW_UPLOAD_SARIF` with the value `true`.
+3. Confirm the workflow has `actions: read` and `security-events: write` permissions.
+
+The upload remains non-blocking so a GitHub platform or subscription limitation cannot hide the OmniFlow validation result.
 
 ### Package Installation Failed
 

@@ -58,6 +58,8 @@ class RepositoryHardeningTests(unittest.TestCase):
         self.assertIn("timeout-minutes: 30", text)
         self.assertIn("cancel-in-progress: true", text)
         self.assertIn("pull_request_target:", text)
+        self.assertIn("actions: read", text)
+        self.assertIn("security-events: write", text)
         self.assertNotIn("ref: ${{ github.event.pull_request.head", text)
         self.assertIn("Route fork pull request without Omni secret", text)
         self.assertNotIn("skip-reason: Fork pull requests", text)
@@ -65,6 +67,8 @@ class RepositoryHardeningTests(unittest.TestCase):
         self.assertNotIn("env:\n          OMNI_API_KEY:", text)
         self.assertIn('.user.login == "github-actions[bot]"', text)
         self.assertIn(".omniflow/public/report.json", text)
+        self.assertIn("vars.OMNIFLOW_UPLOAD_SARIF == 'true'", text)
+        self.assertIn("continue-on-error: true", text)
         self.assertNotIn(".omniflow/restricted/", text)
 
     def test_every_checkout_disables_persisted_credentials(self):

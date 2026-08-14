@@ -59,6 +59,7 @@ This file contains routing metadata, not credentials. Commit it to the protected
 3. Replace both occurrences of `<pinned-commit-sha>` with the same reviewed, full 40-character OmniFlow commit SHA.
 4. If the protected branch is not `main`, update `branches: [main]` in the workflow.
 5. Optionally copy [`.omniflow.example.yml`](../.omniflow.example.yml) to `.omniflow.yml` and review every changed gate with the model owners.
+6. If GitHub Code Security is enabled for the repository, add a repository Actions variable named `OMNIFLOW_UPLOAD_SARIF` with the value `true`. Leave it unset otherwise; `report.sarif` is still included in the public evidence artifact.
 
 The action reference should look like this:
 
@@ -89,6 +90,8 @@ Example CODEOWNERS entries:
 ```
 
 Do not continue to the secret step until these protections are active. A user who can change a privileged workflow can otherwise redirect or expose its repository secrets.
+
+GitHub may require a Team or Enterprise organization plan to enforce rulesets or classic branch protection on private repositories. If GitHub shows that rules will not be enforced, do not represent OmniFlow as a production merge gate. Controlled testing may continue only with tightly limited collaborator access and explicit acceptance of this temporary limitation.
 
 ## Step 5: Merge The Setup Into The Base Branch
 
@@ -149,6 +152,7 @@ The installation is ready for controlled alpha use when all of these are true:
 - [ ] `.omni/flow.json` is on the protected base branch.
 - [ ] `.github/workflows/omniflow.yml` is on the protected base branch.
 - [ ] Both action references use the same full OmniFlow commit SHA.
+- [ ] `OMNIFLOW_UPLOAD_SARIF=true` is set only when GitHub Code Security is enabled; otherwise SARIF remains artifact-only.
 - [ ] Workflow and trusted metadata CODEOWNERS were active before the credential was stored.
 - [ ] `OMNI_API_KEY` is a dedicated least-privilege PAT and exists only in GitHub Actions secrets.
 - [ ] The action runs on Linux x86_64 with Python 3.11 and uses its checked-in hash lock unchanged.
