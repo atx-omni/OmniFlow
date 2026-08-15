@@ -469,6 +469,9 @@ class DiffLintReportTests(unittest.TestCase):
         )
         self.assertIn("Skipped: no Omni semantic-layer changes were detected.", markdown)
         self.assertIn("No reviewer action needed", markdown)
+        self.assertIn("Not evaluated because no Omni semantic-layer changes were detected.", markdown)
+        self.assertNotIn("Model ID: ``", markdown)
+        self.assertNotIn("dbt exposure enrichment was not enabled", markdown)
 
 
 if __name__ == "__main__":

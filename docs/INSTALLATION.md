@@ -69,7 +69,7 @@ uses: atx-omni/OmniFlow@0123456789abcdef0123456789abcdef01234567
 
 Do not use `@main`, a floating tag, or an unpinned GitHub branch. OmniFlow does not currently publish an official PyPI package. The supported action installs from the pinned checkout with a hash-locked Python 3.11 Linux dependency set.
 
-The example workflow uses `pull_request_target` so it can read policy from the trusted base branch. It never checks out or executes proposed pull-request code. Do not add a pull-request-head checkout or execute scripts from the proposed branch in this privileged workflow.
+The example workflow uses `pull_request_target` so it can read policy from the trusted base branch. It never checks out or executes proposed pull-request code. A credential-free preflight selects the Omni model context before the action exposes `OMNI_API_KEY` to the validation process, so non-Omni pull requests skip without injecting the token. Do not add a pull-request-head checkout or execute scripts from the proposed branch in this privileged workflow.
 
 ## Step 4: Add Ownership And Protect The Base Branch
 

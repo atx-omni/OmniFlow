@@ -75,8 +75,20 @@ runs:
         omniflow run --auto --config "$OMNIFLOW_INPUT_CONFIG" \
           --skip-reason "$OMNIFLOW_INPUT_SKIP_REASON"
 
-    - name: Run OmniFlow
+    - name: Route OmniFlow run
+      id: route
       if: inputs.mode == 'validate' && inputs['skip-reason'] == ''
+      shell: bash
+      env:
+        OMNIFLOW_INPUT_CONFIG: ${{ inputs.config }}
+        OMNIFLOW_GITHUB_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        omniflow route --auto --config "$OMNIFLOW_INPUT_CONFIG" \
+          --format github >> "$GITHUB_OUTPUT"
+
+    - name: Run OmniFlow
+      if: inputs.mode == 'validate' && inputs['skip-reason'] == '' && steps.route.outputs.should_run == 'true'
       shell: bash
       env:
         OMNI_API_KEY: ${{ inputs['omni-api-key'] }}

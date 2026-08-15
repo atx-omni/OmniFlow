@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import platform
 import shutil
@@ -66,6 +67,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_parser.add_argument("--skip-reason", help=argparse.SUPPRESS)
     run_parser.set_defaults(func=cmd_run)
+
+    route_parser = subcommands.add_parser(
+        "route",
+        help="Determine whether an automatic run contains Omni semantic-layer changes",
+    )
+    _add_config_arg(route_parser)
+    _add_common_omni_args(route_parser)
+    route_parser.add_argument(
+        "--auto", action="store_true", help="Discover Omni model context from Omni-managed metadata"
+    )
+    route_parser.add_argument("--format", choices=("text", "json", "github"), default="text")
+    route_parser.set_defaults(func=cmd_route)
 
     content = subcommands.add_parser("content", help="Content validation commands")
     content_sub = content.add_subparsers(required=True)
@@ -246,6 +259,53 @@ def cmd_run(args: argparse.Namespace) -> int:
     )
     print(f"OmniFlow complete: models={len(contexts)} issues={summary['total_issues']} exit_code={exit_code}")
     return exit_code
+
+
+def cmd_route(args: argparse.Namespace) -> int:
+    """Perform trusted discovery before the Omni credential enters a process."""
+    try:
+        config = _override_config(load_config(args.config), args)
+    except OmniFlowError as exc:
+        _write_unconfigured_failure_artifacts(output_dir=Path(".omniflow"), exc=exc)
+        raise
+    output_dir = Path(config.reporting.output_dir)
+    _validate_run_output_layout(output_dir)
+    if not config.security.retain_restricted_artifacts:
+        _purge_restricted_path(restricted_dir(output_dir))
+    try:
+        contexts = discover_contexts(
+            auto=args.auto,
+            base_url=config.omni.base_url,
+            model_id=config.omni.model_id,
+            model_path=getattr(args, "model_path", None),
+            branch_name=config.omni.branch_name,
+            branch_id=config.omni.branch_id,
+            allow_skip=True,
+        )
+    except OmniFlowError as exc:
+        _write_setup_failure_artifacts(config=config, output_dir=output_dir, exc=exc)
+        raise
+
+    should_run = bool(contexts)
+    reason = "" if should_run else "no Omni PR context or changed Omni model files detected"
+    if not should_run:
+        _write_skipped_artifacts(config=config, output_dir=output_dir, reason=reason)
+
+    payload = {
+        "should_run": should_run,
+        "reason": reason,
+        "model_count": len(contexts),
+    }
+    if args.format == "github":
+        print(f"should_run={'true' if should_run else 'false'}")
+        print(f"reason={reason}")
+        print(f"model_count={len(contexts)}")
+    elif args.format == "json":
+        print(json.dumps(payload, sort_keys=True))
+    else:
+        decision = "run" if should_run else "skip"
+        print(f"OmniFlow route: {decision} (models={len(contexts)})")
+    return 0
 
 
 def _write_setup_failure_artifacts(*, config, output_dir: Path, exc: OmniFlowError) -> None:

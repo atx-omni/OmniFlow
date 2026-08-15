@@ -12,7 +12,7 @@ OmniFlow uses four evidence layers. A green result in one layer must not be pres
 | Capability | Automated evidence | Required live evidence |
 | --- | --- | --- |
 | Omni and non-Omni PR routing | Unit tests and simulator | One dbt-only or application-only PR skips; one Omni PR runs |
-| Trusted model discovery | Unit tests for single, multi-model, marker, push, fork, and ambiguity paths | Omni-created PR resolves the expected model and branch |
+| Trusted model discovery | Unit tests plus an orchestrated two-model simulator run for marker, push, fork, and ambiguity paths | Omni-created PR resolves the expected model and branch |
 | Model validation | Unit parser and policy tests | Valid and intentionally invalid branch checks |
 | Content validation | Unit extraction, labels, history, base comparison, and redaction tests | Tenant Content Validator completes with expected scope |
 | YAML pull | Unit security and manifest tests | Authored and fully resolved pulls complete with checksums |
@@ -22,7 +22,7 @@ OmniFlow uses four evidence layers. A green result in one layer must not be pres
 | JSON, Markdown, SARIF, and JUnit | Unit render tests and packaged action tests | Public artifact downloads open and contain only redacted evidence |
 | GitHub annotations and PR summary | Unit escaping tests | A controlled PR displays warnings or errors and updates one bot comment |
 | AI Repair development scaffold | Unit rollback and safety tests | Maintainer-only non-production failure, repair, rerun, and rollback exercises |
-| Release supply chain | Workflow and repository hardening tests | Protected release environment produces signed artifacts, checksums, and SBOM |
+| Release supply chain | Workflow and repository hardening tests plus manual signed preflight | Protected release environment produces signed artifacts, checksums, and SBOM |
 
 ## Local Regression Gate
 
@@ -62,6 +62,7 @@ dbt exposure enrichment supplements OmniFlow's targeted Content Validator contra
 - Do not run `--unsafe-raw-output` against customer content as a routine test. Its behavior is covered with synthetic payloads.
 - Do not send secrets to fork pull requests. Fork routing is proven with withheld-secret tests and should fail closed for Omni changes.
 - Do not test AI rollback or destructive model changes against production models.
-- Do not publish a release merely to test release automation. Use the protected release gate for intentional versions only.
+- Dispatch the Release workflow on protected `main` to test the build, SPDX SBOM, checksums, and keyless signatures without publishing a release.
+- Do not publish a release merely to test release automation. Use a version tag and the protected release gate only for intentional versions.
 
 Record the workflow URL, commit SHA, policy decision, artifact hash or retention ID, and any coverage gaps for each adopter live gate. A local pass does not establish tenant permissions, branch protection, or production readiness.
