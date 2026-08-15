@@ -98,7 +98,7 @@ An unreferenced breaking change remains visible as risk but does not fail the de
 - `enabled`: defaults to `false`.
 - `fail_on_unavailable`: defaults to `false`.
 
-The Omni dbt exposures endpoint has its own permission requirement. This check supplements downstream contract analysis; it does not replace Content Validator reference searches.
+The Omni dbt exposures endpoint has its own permission requirement. Reports distinguish dashboard records analyzed, mapped exposures, unmapped dashboards, and `available`, `partial`, or `unavailable` coverage. The endpoint covers published shared dashboards; private dashboards and workbooks are outside its documented scope. This check supplements downstream contract analysis; it does not replace Content Validator reference searches or run dbt commands.
 
 ## Semantic Lint
 

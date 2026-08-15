@@ -408,12 +408,22 @@ class DiffLintReportTests(unittest.TestCase):
             ],
             "model_reports": [
                 {
+                    "model_id": "model-1",
                     "check_reports": [
                         {
                             "coverage_gaps": [
                                 {"type": "field", "name": "orders.margin", "message": "targeted search unavailable"}
                             ]
-                        }
+                        },
+                        {
+                            "validator": "dbt_exposures",
+                            "summary": {
+                                "total_records": 4,
+                                "total_exposures": 3,
+                                "unmapped_dashboards": 1,
+                                "coverage_status": "partial",
+                            },
+                        },
                     ]
                 }
             ],
@@ -425,6 +435,9 @@ class DiffLintReportTests(unittest.TestCase):
         self.assertIn("## Downstream Contract Impact", markdown)
         self.assertIn("referenced content: `1`", markdown)
         self.assertIn("orders.margin", markdown)
+        self.assertIn("## dbt Exposure Coverage", markdown)
+        self.assertIn("`3` mapped exposure(s) across `4` dashboard record(s)", markdown)
+        self.assertIn("unmapped `1`; coverage `partial`", markdown)
         self.assertIn("Resolve blocking validation", markdown)
 
     def test_markdown_report_escapes_model_controlled_markup_and_mentions(self):

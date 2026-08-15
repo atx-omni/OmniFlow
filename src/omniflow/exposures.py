@@ -18,7 +18,30 @@ def run_dbt_exposure_enrichment(
 ) -> tuple[dict[str, Any], int]:
     try:
         payload = client.get_dbt_exposures(model_id, branch_id=branch_id)
-        exposures = _normalize_exposures(payload)
+        records = _exposure_records(payload)
+        exposures = _normalize_exposures(records)
+        unmapped_dashboards = sum(1 for record in records if _is_unmapped_exposure_record(record))
+        coverage_status = "partial" if unmapped_dashboards else "available"
+        coverage_gaps = []
+        issues = []
+        if unmapped_dashboards:
+            message = (
+                f"{unmapped_dashboards} published dashboard record(s) did not map to dbt model dependencies."
+            )
+            coverage_gaps.append(
+                {
+                    "type": "dbt_exposures",
+                    "name": model_id,
+                    "message": message,
+                }
+            )
+            issues.append(
+                {
+                    "validator": "dbt_exposures",
+                    "severity": "warning",
+                    "message": message,
+                }
+            )
         report = {
             "tool": "omniflow",
             "validator": "dbt_exposures",
@@ -26,11 +49,15 @@ def run_dbt_exposure_enrichment(
             "model_id": model_id,
             "branch_id": branch_id,
             "summary": {
+                "total_records": len(records),
                 "total_exposures": len(exposures),
-                "coverage_status": "available",
+                "unmapped_dashboards": unmapped_dashboards,
+                "coverage_status": coverage_status,
+                "coverage_scope": "published_shared_dashboards",
             },
             "exposures": exposures,
-            "issues": [],
+            "coverage_gaps": coverage_gaps,
+            "issues": issues,
         }
         return report, 0
     except OmniFlowError as exc:
@@ -46,8 +73,11 @@ def run_dbt_exposure_enrichment(
             "model_id": model_id,
             "branch_id": branch_id,
             "summary": {
+                "total_records": 0,
                 "total_exposures": 0,
+                "unmapped_dashboards": 0,
                 "coverage_status": "unavailable",
+                "coverage_scope": "published_shared_dashboards",
             },
             "coverage_gaps": [
                 {
@@ -94,6 +124,10 @@ def _normalize_exposures(payload: Any) -> list[dict[str, Any]]:
             }
         )
     return exposures
+
+
+def _is_unmapped_exposure_record(record: Any) -> bool:
+    return isinstance(record, dict) and "exposure" in record and record.get("exposure") is None
 
 
 def _exposure_records(payload: Any) -> list[Any]:
