@@ -78,6 +78,7 @@ def write_artifact_manifest(
             f"{RESTRICTED_DIR}/<model_id>/semantic-diff.json",
             f"{RESTRICTED_DIR}/<model_id>/contract-impact.json",
             f"{RESTRICTED_DIR}/<model_id>/content-report.json",
+            f"{RESTRICTED_DIR}/<model_id>/dbt-exposures.json",
         ],
     }
     secure_write_text(root / "artifact-manifest.json", json.dumps(manifest, indent=2, sort_keys=True) + "\n")

@@ -14,6 +14,7 @@ def render_markdown_report(report: dict[str, Any]) -> str:
     blocking = [issue for issue in issues if _is_blocking(issue)]
     impacts = [issue for issue in issues if issue.get("validator") == "contracts" or issue.get("impact_level")]
     coverage_gaps = _coverage_gaps(report)
+    dbt_exposure_summaries = _dbt_exposure_summaries(report)
     lines = [
         "# OmniFlow",
         "",
@@ -42,6 +43,10 @@ def render_markdown_report(report: dict[str, Any]) -> str:
         "## Coverage Gaps",
         "",
         *_coverage_gap_lines(coverage_gaps),
+        "",
+        "## dbt Exposure Coverage",
+        "",
+        *_dbt_exposure_lines(dbt_exposure_summaries),
         "",
         "## Validation Summary",
         "",
@@ -163,6 +168,40 @@ def _coverage_gap_lines(gaps: list[dict[str, Any]]) -> list[str]:
         )
     if len(gaps) > 10:
         lines.append(f"- _{len(gaps) - 10} more coverage gap(s) omitted from PR summary._")
+    return lines
+
+
+def _dbt_exposure_summaries(report: dict[str, Any]) -> list[dict[str, Any]]:
+    summaries = []
+    if report.get("validator") == "dbt_exposures" and isinstance(report.get("summary"), dict):
+        summaries.append({"model_id": report.get("model_id", ""), "summary": report["summary"]})
+    for model_report in report.get("model_reports", []) if isinstance(report.get("model_reports"), list) else []:
+        if not isinstance(model_report, dict):
+            continue
+        for check_report in (
+            model_report.get("check_reports", []) if isinstance(model_report.get("check_reports"), list) else []
+        ):
+            if not isinstance(check_report, dict) or check_report.get("validator") != "dbt_exposures":
+                continue
+            summary = check_report.get("summary")
+            if isinstance(summary, dict):
+                summaries.append({"model_id": model_report.get("model_id", ""), "summary": summary})
+    return summaries
+
+
+def _dbt_exposure_lines(summaries: list[dict[str, Any]]) -> list[str]:
+    if not summaries:
+        return ["_dbt exposure enrichment was not enabled for this run._"]
+    lines = []
+    for entry in summaries:
+        summary = entry["summary"]
+        lines.append(
+            f"- Model `{_safe_code(entry.get('model_id', ''))}`: "
+            f"`{summary.get('total_exposures', 0)}` mapped exposure(s) across "
+            f"`{summary.get('total_records', summary.get('total_exposures', 0))}` dashboard record(s); "
+            f"unmapped `{summary.get('unmapped_dashboards', 0)}`; "
+            f"coverage `{_safe_code(summary.get('coverage_status', 'unknown'))}`."
+        )
     return lines
 
 

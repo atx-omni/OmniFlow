@@ -7,6 +7,7 @@ MARKDOWN_LINK_RE = re.compile(r"(?<!!)\[[^\]]+\]\(([^)]+)\)")
 REQUIRED_DOCUMENTS = [
     "docs/INSTALLATION.md",
     "docs/CONFIGURATION.md",
+    "docs/TESTING.md",
     "docs/TROUBLESHOOTING.md",
     "docs/SECURITY_MODEL.md",
     "docs/AI_REPAIR.md",

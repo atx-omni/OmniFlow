@@ -48,10 +48,43 @@ class ExposureArtifactTests(unittest.TestCase):
             settings=DbtExposureSettings(enabled=True),
         )
         self.assertEqual(exit_code, 0)
+        self.assertEqual(report["summary"]["total_records"], 1)
         self.assertEqual(report["summary"]["total_exposures"], 1)
+        self.assertEqual(report["summary"]["unmapped_dashboards"], 0)
+        self.assertEqual(report["summary"]["coverage_status"], "available")
         self.assertEqual(report["exposures"][0]["depends_on"], ["model.orders"])
         self.assertEqual(report["exposures"][0]["owner"], {"name": "Alice"})
         self.assertNotIn("email", report["exposures"][0]["owner"])
+
+    def test_dbt_exposure_enrichment_reports_unmapped_dashboard_coverage(self):
+        report, exit_code = run_dbt_exposure_enrichment(
+            client=FakeExposureClient(
+                {
+                    "records": [
+                        {"dashboard_identifier": "unmapped-dashboard", "exposure": None},
+                        {
+                            "dashboard_identifier": "mapped-dashboard",
+                            "exposure": {
+                                "label": "Mapped Dashboard",
+                                "type": "dashboard",
+                                "depends_on": ["ref('orders')"],
+                            },
+                        },
+                    ]
+                }
+            ),
+            model_id="model-1",
+            branch_id="branch-1",
+            settings=DbtExposureSettings(enabled=True),
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(report["summary"]["total_records"], 2)
+        self.assertEqual(report["summary"]["total_exposures"], 1)
+        self.assertEqual(report["summary"]["unmapped_dashboards"], 1)
+        self.assertEqual(report["summary"]["coverage_status"], "partial")
+        self.assertEqual(report["issues"][0]["severity"], "warning")
+        self.assertEqual(report["coverage_gaps"][0]["type"], "dbt_exposures")
+        self.assertNotIn("unmapped-dashboard", json.dumps(report))
 
     def test_dbt_exposure_enrichment_degrades_to_warning_by_default(self):
         report, exit_code = run_dbt_exposure_enrichment(
@@ -89,6 +122,7 @@ class ExposureArtifactTests(unittest.TestCase):
         self.assertEqual(manifest["public_dir"], "public")
         self.assertEqual(manifest["restricted_dir"], "restricted")
         self.assertTrue(manifest["restricted_artifacts_enabled"])
+        self.assertIn("restricted/<model_id>/dbt-exposures.json", manifest["restricted_artifacts"])
 
 
 if __name__ == "__main__":

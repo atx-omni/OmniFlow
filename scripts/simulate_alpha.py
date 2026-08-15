@@ -134,6 +134,29 @@ checks:
         marker={"base_url": "https://evil.example", "model_id": MODEL_ID, "branch_name": BRANCH_NAME},
     ),
     Scenario(
+        name="exposures_available",
+        description="dbt exposures should enrich the integrated report and reviewer summary",
+        expected_exit=1,
+        changed_files="omni/model/views/orders.view",
+        config="""checks:
+  dbt_exposures:
+    enabled: true
+    fail_on_unavailable: true
+""",
+    ),
+    Scenario(
+        name="exposures_partial",
+        description="unmapped dashboard exposure records should produce an advisory coverage gap",
+        expected_exit=1,
+        changed_files="omni/model/views/orders.view",
+        server_mode="exposures_partial",
+        config="""checks:
+  dbt_exposures:
+    enabled: true
+    fail_on_unavailable: true
+""",
+    ),
+    Scenario(
         name="exposures_unavailable_warning",
         description="dbt exposures API failure should warn but not change contract failure policy",
         expected_exit=1,
@@ -205,21 +228,24 @@ def route_request(state: FakeOmniState, path: str, query: dict[str, list[str]]) 
     if path == f"/api/v1/models/{MODEL_ID}/dbt-exposures":
         if state.mode == "exposures_403":
             return {"error": "forbidden"}, 403
+        records = [
+            {
+                "dashboard_identifier": "dash-1",
+                "deduplication_name": "executive_revenue",
+                "exposure": {
+                    "name": "executive_revenue",
+                    "label": "Executive Revenue",
+                    "type": "dashboard",
+                    "url": "https://omni.example/dashboards/dash-1",
+                    "owner": {"name": "Alice", "email": "alice@example.com"},
+                    "depends_on": ["ref('orders')"],
+                },
+            }
+        ]
+        if state.mode == "exposures_partial":
+            records.append({"dashboard_identifier": "dash-unmapped", "exposure": None})
         return {
-            "records": [
-                {
-                    "dashboard_identifier": "dash-1",
-                    "deduplication_name": "executive_revenue",
-                    "exposure": {
-                        "name": "executive_revenue",
-                        "label": "Executive Revenue",
-                        "type": "dashboard",
-                        "url": "https://omni.example/dashboards/dash-1",
-                        "owner": {"name": "Alice", "email": "alice@example.com"},
-                        "depends_on": ["model.orders"],
-                    },
-                }
-            ],
+            "records": records,
             "pageInfo": {"hasNextPage": False},
         }, 200
     return {"error": f"Unhandled fake Omni path: {path}"}, 404
@@ -444,6 +470,25 @@ def assert_result(scenario: Scenario, exit_code: int, artifacts: dict[str, Any])
         report = artifacts.get("public/report.json:json", {})
         if report.get("policy_decision") != "fail" or report.get("exit_code") != 2:
             errors.append("fork Omni PR did not fail closed without the Omni secret")
+    if scenario.name in {"exposures_available", "exposures_partial"}:
+        report = artifacts.get("public/report.json:json", {})
+        check_reports = report.get("model_reports", [{}])[0].get("check_reports", [])
+        exposure_report = next(
+            (item for item in check_reports if item.get("validator") == "dbt_exposures"),
+            {},
+        )
+        summary = exposure_report.get("summary", {})
+        expected_records = 2 if scenario.name == "exposures_partial" else 1
+        expected_status = "partial" if scenario.name == "exposures_partial" else "available"
+        if summary.get("total_records") != expected_records:
+            errors.append("dbt exposure report did not retain the dashboard record count")
+        if summary.get("total_exposures") != 1 or summary.get("coverage_status") != expected_status:
+            errors.append("dbt exposure report did not record the expected coverage status")
+        markdown = artifacts.get("public/report.md", "")
+        if "## dbt Exposure Coverage" not in markdown or "mapped exposure(s)" not in markdown:
+            errors.append("reviewer Markdown omitted successful dbt exposure coverage")
+        if scenario.name == "exposures_partial" and not exposure_report.get("coverage_gaps"):
+            errors.append("partial dbt exposure coverage did not produce a coverage gap")
     return not errors, errors
 
 

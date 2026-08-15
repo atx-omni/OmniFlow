@@ -193,6 +193,7 @@ Exit codes are `0` success, `1` validation failure, `2` configuration error, `3`
 
 - [Step-by-step installation](docs/INSTALLATION.md)
 - [Configuration reference](docs/CONFIGURATION.md)
+- [Testing and live validation](docs/TESTING.md)
 - [AI Repair development scaffold](docs/AI_REPAIR.md)
 - [Troubleshooting](docs/TROUBLESHOOTING.md)
 - [Support and safe diagnostic sharing](SUPPORT.md)
@@ -217,7 +218,7 @@ python -m build
 twine check dist/*
 ```
 
-The simulation covers same-repository and fork routing, contract failures, strict redaction, missing branches, malicious PR metadata, and optional API failures. The maintainers have also completed one end-to-end live validation on a non-production model. Neither result replaces the adopter-specific live gate for actual Omni PR metadata, tenant permissions, branch mapping, Content Validator coverage, GitHub annotations/comments, branch-protection enforcement, or webhook promotion.
+The simulation covers same-repository and fork routing, contract failures, strict redaction, missing branches, malicious PR metadata, successful and partial dbt exposure coverage, and optional API failures. The maintainers have also completed end-to-end live validation on a non-production model. Neither result replaces the adopter-specific live gate for actual Omni PR metadata, tenant permissions, branch mapping, Content Validator coverage, dbt exposure coverage, GitHub annotations/comments, branch-protection enforcement, or webhook promotion. Use the [testing matrix](docs/TESTING.md) to distinguish automated, live-tenant, and release evidence.
 
 ## Maintainer Release Setup
 
