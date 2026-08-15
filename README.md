@@ -37,7 +37,7 @@ Core OmniFlow validation does not execute warehouse queries, store query results
 1. A developer works in an Omni model branch and selects **Create pull request**.
 2. Omni creates the GitHub pull request.
 3. GitHub Actions starts OmniFlow from the trusted base-branch workflow.
-4. Non-Omni pull requests are routed to a successful `skipped` result.
+4. A credential-free preflight routes non-Omni pull requests to a successful `skipped` result before the validation process receives `OMNI_API_KEY`.
 5. OmniFlow selects the changed model from trusted base-branch metadata and resolves the Omni branch from the GitHub head branch.
 6. It pulls base and branch YAML, validates the model and content, computes the semantic diff, and searches Omni for downstream references.
 7. The pull request receives a redacted reviewer summary; detailed artifacts remain restricted to the runner unless explicitly uploaded.
@@ -65,6 +65,8 @@ The action installs from that pinned checkout during alpha testing:
 ```
 
 Do not install an unpinned branch. OmniFlow does not currently publish an official PyPI package; `pip install omniflow-ci` is not a supported installation path. The action installs from the reviewed checkout using an exact, hash-verified Python 3.11 Linux dependency lock.
+
+The command remains `omniflow`, while the future Python distribution name is `omniflow-ci`. The `omniflow` name on PyPI belongs to an unrelated OMOP data-harmonization project. See the [distribution naming decision](docs/DISTRIBUTION.md).
 
 ### 2. Add The API Secret
 
@@ -126,7 +128,7 @@ Do not install AI Repair for customer use. The repository contains a guarded dev
 
 ## Trust And Routing
 
-The example uses GitHub's `pull_request_target` event but never checks out or executes proposed PR code. OmniFlow retrieves changed filenames through GitHub's API and reads `.omni/flow.json`, `.omniflow.yml`, and the workflow itself from the trusted base branch. This prevents a same-repository pull request from changing `base_url`, disabling gates, enabling unsafe output, replacing the action, or redirecting `OMNI_API_KEY`.
+The example uses GitHub's `pull_request_target` event but never checks out or executes proposed PR code. A credential-free preflight retrieves changed filenames through GitHub's API and reads `.omni/flow.json`, `.omniflow.yml`, and the workflow itself from the trusted base branch. Only a selected Omni model context starts the validation process with `OMNI_API_KEY`; skipped PRs never inject it. This prevents a same-repository pull request from changing `base_url`, disabling gates, enabling unsafe output, replacing the action, or redirecting the token.
 
 Do not add steps that check out and execute pull-request code in this privileged workflow. Keep ordinary dbt tests and application builds in separate `pull_request` workflows without the Omni secret.
 
@@ -218,11 +220,11 @@ python -m build
 twine check dist/*
 ```
 
-The simulation covers same-repository and fork routing, contract failures, strict redaction, missing branches, malicious PR metadata, successful and partial dbt exposure coverage, and optional API failures. The maintainers have also completed end-to-end live validation on a non-production model. Neither result replaces the adopter-specific live gate for actual Omni PR metadata, tenant permissions, branch mapping, Content Validator coverage, dbt exposure coverage, GitHub annotations/comments, branch-protection enforcement, or webhook promotion. Use the [testing matrix](docs/TESTING.md) to distinguish automated, live-tenant, and release evidence.
+The simulation covers same-repository, fork, and multi-model routing; contract failures; strict redaction; missing branches; malicious PR metadata; successful and partial dbt exposure coverage; and optional API failures. The maintainers have also completed end-to-end live validation on a non-production model. Neither result replaces the adopter-specific live gate for actual Omni PR metadata, tenant permissions, branch mapping, Content Validator coverage, dbt exposure coverage, GitHub annotations/comments, branch-protection enforcement, or webhook promotion. Use the [testing matrix](docs/TESTING.md) to distinguish automated, live-tenant, and release evidence.
 
 ## Maintainer Release Setup
 
-Controlled-alpha releases are GitHub releases only. A `vX.Y.Z` tag must point to a commit contained in protected `main`; the release build uses hash-locked tooling, creates an SBOM and checksums, and signs the artifacts through Sigstore before publication through the protected `github-release` environment.
+Controlled-alpha releases are GitHub releases only. A `vX.Y.Z` tag must point to a commit contained in protected `main`; the release build uses hash-locked tooling, creates an SBOM and checksums, and signs the artifacts through Sigstore before publication through the protected `github-release` environment. Maintainers can dispatch the Release workflow on protected `main` to build and sign the same bundle as a preflight without creating a GitHub release.
 
 PyPI publication is intentionally disabled until maintainers secure the project name, configure a reviewed Trusted Publisher, and reintroduce that path in a separately reviewed change. A package using the OmniFlow name should not be treated as official unless this repository links to it.
 

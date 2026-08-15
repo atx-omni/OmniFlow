@@ -26,7 +26,7 @@ Non-Omni pull requests return a successful `skipped` decision. Fork pull request
 
 ## Credentials
 
-The GitHub workflow passes a dedicated Omni PAT as an action input. The composite action exposes it as `OMNI_API_KEY` only for the validation process, after installation completes. Install and skip steps do not receive the token as an environment variable.
+The GitHub workflow passes a dedicated Omni PAT as an action input. After installation, a credential-free route step reads only trusted metadata and GitHub changed-file context. The composite action exposes the PAT as `OMNI_API_KEY` only when that route selects at least one Omni model context. Install, routing, and skipped-report steps do not receive the token as an environment variable.
 
 The unreleased AI Repair scaffold uses a different `OMNIFLOW_REPAIR_API_KEY` during maintainer testing, exposed only to the repair process after protected-environment approval. It must never reuse the routine validation PAT. A dedicated Modeler-scoped user limited to a non-production model is the conservative development starting point; any narrower custom role remains unverified.
 

@@ -12,6 +12,7 @@ from omniflow.cli import (
     _write_context_failure_artifacts,
     _write_setup_failure_artifacts,
     _write_unconfigured_failure_artifacts,
+    cmd_route,
     cmd_run,
 )
 from omniflow.config import load_config
@@ -29,6 +30,67 @@ class FakeClient:
 
 
 class CliOrchestrationTests(unittest.TestCase):
+    def test_route_skips_and_writes_evidence_without_an_omni_api_key(self):
+        original = os.getcwd()
+        with tempfile.TemporaryDirectory() as tmp:
+            os.chdir(tmp)
+            try:
+                args = SimpleNamespace(
+                    config=None,
+                    auto=True,
+                    format="github",
+                    base_url=None,
+                    model_id=None,
+                    model_path=None,
+                    branch_id=None,
+                    branch_name=None,
+                    user_id=None,
+                    include_personal_folders=None,
+                )
+                with mock.patch("omniflow.cli.discover_contexts", return_value=[]):
+                    with mock.patch("omniflow.cli.require_api_key") as require_key:
+                        with mock.patch("builtins.print") as output:
+                            exit_code = cmd_route(args)
+                self.assertEqual(exit_code, 0)
+                require_key.assert_not_called()
+                output.assert_any_call("should_run=false")
+                report = json.loads(Path(".omniflow/public/report.json").read_text(encoding="utf-8"))
+                self.assertEqual(report["policy_decision"], "skipped")
+            finally:
+                os.chdir(original)
+
+    def test_route_allows_relevant_context_without_writing_skip_artifacts(self):
+        original = os.getcwd()
+        with tempfile.TemporaryDirectory() as tmp:
+            os.chdir(tmp)
+            try:
+                args = SimpleNamespace(
+                    config=None,
+                    auto=True,
+                    format="json",
+                    base_url=None,
+                    model_id=None,
+                    model_path=None,
+                    branch_id=None,
+                    branch_name=None,
+                    user_id=None,
+                    include_personal_folders=None,
+                )
+                context = ModelContext(
+                    base_url="https://omni.example",
+                    model_id="model-1",
+                    model_path="omni/model",
+                )
+                with mock.patch("omniflow.cli.discover_contexts", return_value=[context]):
+                    with mock.patch("builtins.print") as output:
+                        exit_code = cmd_route(args)
+                self.assertEqual(exit_code, 0)
+                payload = json.loads(output.call_args.args[0])
+                self.assertEqual(payload, {"model_count": 1, "reason": "", "should_run": True})
+                self.assertFalse(Path(".omniflow/public/report.json").exists())
+            finally:
+                os.chdir(original)
+
     def test_multi_context_run_aggregates_partial_failure_and_cleans_restricted_data(self):
         original = os.getcwd()
         with tempfile.TemporaryDirectory() as tmp:

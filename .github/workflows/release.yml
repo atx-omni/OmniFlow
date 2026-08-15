@@ -1,6 +1,7 @@
 name: Release
 
 on:
+  workflow_dispatch:
   push:
     tags:
       - "v*.*.*"
@@ -38,9 +39,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           PACKAGE_VERSION="$(python -c 'import omniflow; print(omniflow.__version__)')"
-          test "$GITHUB_REF_NAME" = "v$PACKAGE_VERSION"
-          MAIN_STATUS="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${GITHUB_SHA}...main" --jq .status)"
-          test "$MAIN_STATUS" = "ahead" -o "$MAIN_STATUS" = "identical"
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            test "$GITHUB_REF_NAME" = "v$PACKAGE_VERSION"
+            MAIN_STATUS="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${GITHUB_SHA}...main" --jq .status)"
+            test "$MAIN_STATUS" = "ahead" -o "$MAIN_STATUS" = "identical"
+          else
+            test "$GITHUB_REF" = "refs/heads/main"
+          fi
           python -m pip check
 
       - name: Build distributions
@@ -64,8 +69,37 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+  sign-preflight:
+    name: Signed release preflight
+    needs: build
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write  # Obtain a keyless Sigstore identity for the preflight bundle.
+    steps:
+      - name: Download verified release artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: omniflow-release-artifacts
+          path: dist
+
+      - name: Sign preflight artifacts
+        uses: sigstore/gh-action-sigstore-python@790bc6befb9d733738f18d8f895854b453640ec9
+        with:
+          inputs: ./dist/*
+
+      - name: Upload signed preflight bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: omniflow-signed-release-preflight-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+
   publish-github:
     needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment:
@@ -76,7 +110,7 @@ jobs:
       id-token: write  # Perform keyless Sigstore signing without a stored signing key.
     steps:
       - name: Download verified release artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: omniflow-release-artifacts
           path: dist

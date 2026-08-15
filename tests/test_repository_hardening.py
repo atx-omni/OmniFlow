@@ -49,6 +49,7 @@ class RepositoryHardeningTests(unittest.TestCase):
         scripts = [step.get("run", "") for step in action["runs"]["steps"]]
         self.assertFalse(any("${{ inputs." in script for script in scripts))
         self.assertTrue(any("--skip-reason" in script for script in scripts))
+        self.assertTrue(any("omniflow route --auto" in script for script in scripts))
         self.assertTrue(any("omniflow repair ai --auto" in script for script in scripts))
 
     def test_example_workflow_uses_minimal_checkout_and_uploads_only_public_evidence(self):
@@ -100,9 +101,14 @@ class RepositoryHardeningTests(unittest.TestCase):
 
     def test_release_is_audited_and_has_explicit_repository_context(self):
         text = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
+        self.assertIn("workflow_dispatch:", text)
         self.assertIn("--require-hashes --only-binary=:all:", text)
         self.assertIn("requirements/release-py311-linux-x86_64.txt", text)
         self.assertIn("compare/${GITHUB_SHA}...main", text)
+        self.assertIn("name: Signed release preflight", text)
+        self.assertIn("github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'", text)
+        self.assertIn("name: omniflow-signed-release-preflight-${{ github.sha }}", text)
+        self.assertIn("if: startsWith(github.ref, 'refs/tags/v')", text)
         self.assertIn("name: github-release", text)
         self.assertIn("GH_REPO: ${{ github.repository }}", text)
         self.assertNotIn("publish-pypi", text)
@@ -124,6 +130,7 @@ class RepositoryHardeningTests(unittest.TestCase):
         self.assertIn("repair-api-key", action["inputs"])
         self.assertEqual(action["inputs"]["mode"]["default"], "validate")
         install = next(step for step in action["runs"]["steps"] if step["name"] == "Install OmniFlow")
+        route = next(step for step in action["runs"]["steps"] if step["name"] == "Route OmniFlow run")
         run = next(step for step in action["runs"]["steps"] if step["name"] == "Run OmniFlow")
         repair = next(step for step in action["runs"]["steps"] if step["name"] == "Run OmniFlow AI repair")
         self.assertIn("--require-hashes", install["run"])
@@ -131,6 +138,8 @@ class RepositoryHardeningTests(unittest.TestCase):
         self.assertIn("--no-deps --no-build-isolation", install["run"])
         self.assertIn("PIP_NO_INDEX=1", install["run"])
         self.assertNotIn("OMNI_API_KEY", install.get("env", {}))
+        self.assertNotIn("OMNI_API_KEY", route.get("env", {}))
+        self.assertIn("steps.route.outputs.should_run == 'true'", run["if"])
         self.assertEqual(run["env"]["OMNI_API_KEY"], "${{ inputs['omni-api-key'] }}")
         self.assertNotIn("OMNI_API_KEY", repair["env"])
         self.assertEqual(

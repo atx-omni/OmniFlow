@@ -17,6 +17,7 @@ from urllib.parse import parse_qs, urlparse
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 MODEL_ID = "model-1"
+SECOND_MODEL_ID = "model-2"
 BRANCH_ID = "branch-1"
 BRANCH_NAME = "feature/omniflow-alpha"
 
@@ -75,6 +76,7 @@ class Scenario:
     server_mode: str = "normal"
     config: str | None = None
     include_api_key: bool = True
+    model_ids: tuple[str, ...] = (MODEL_ID,)
 
 
 SCENARIOS = [
@@ -100,6 +102,13 @@ SCENARIOS = [
         changed_files="omni/model/views/orders.view",
         server_mode="unused",
         include_api_key=False,
+    ),
+    Scenario(
+        name="multi_model_contract_failure",
+        description="changes under two model paths should execute and aggregate both model contexts",
+        expected_exit=1,
+        changed_files="omni/model/views/orders.view\nomni/model-2/views/orders.view",
+        model_ids=(MODEL_ID, SECOND_MODEL_ID),
     ),
     Scenario(
         name="contract_failure",
@@ -172,8 +181,9 @@ checks:
 
 
 class FakeOmniState:
-    def __init__(self, mode: str) -> None:
-        self.mode = mode
+    def __init__(self, scenario: Scenario) -> None:
+        self.mode = scenario.server_mode
+        self.model_ids = scenario.model_ids
         self.requests: list[dict[str, Any]] = []
 
 
@@ -202,53 +212,71 @@ def route_request(state: FakeOmniState, path: str, query: dict[str, list[str]]) 
     if path == "/api/v1/models":
         records = []
         if state.mode != "missing_branch":
-            records.append({"id": BRANCH_ID, "modelKind": "BRANCH", "baseModelId": MODEL_ID, "name": BRANCH_NAME})
+            records.extend(
+                {
+                    "id": branch_id_for(model_id),
+                    "modelKind": "BRANCH",
+                    "baseModelId": model_id,
+                    "name": BRANCH_NAME,
+                }
+                for model_id in state.model_ids
+            )
         return {"records": records, "pageInfo": {}}, 200
-    if path == f"/api/v1/models/{MODEL_ID}/git":
-        return {
-            "modelPath": "omni/model",
-            "baseBranch": "main",
-            "gitServiceProvider": "github",
-            "webUrl": "https://github.com/atx-omni/simulated",
-            "branchPerPullRequest": True,
-            "gitFollower": False,
-            "requirePullRequest": True,
-        }, 200
-    if path == f"/api/v1/models/{MODEL_ID}/validate":
-        return [], 200
-    if path == f"/api/v1/models/{MODEL_ID}/yaml":
-        files = HEAD_FILES if query.get("branchId") == [BRANCH_ID] else BASE_FILES
-        return {"files": files, "checksums": {name: f"checksum-{name}" for name in files}}, 200
-    if path == f"/api/v1/models/{MODEL_ID}/content-validator":
-        if query.get("find") == ["orders.revenue"] and query.get("find_type") == ["FIELD"]:
-            return content_payload("Executive Revenue", "alice@example.com"), 200
-        return {"content": []}, 200
+    for model_id in state.model_ids:
+        if path == f"/api/v1/models/{model_id}/git":
+            return {
+                "modelPath": model_path_for(model_id),
+                "baseBranch": "main",
+                "gitServiceProvider": "github",
+                "webUrl": "https://github.com/atx-omni/simulated",
+                "branchPerPullRequest": True,
+                "gitFollower": False,
+                "requirePullRequest": True,
+            }, 200
+        if path == f"/api/v1/models/{model_id}/validate":
+            return [], 200
+        if path == f"/api/v1/models/{model_id}/yaml":
+            files = HEAD_FILES if query.get("branchId") == [branch_id_for(model_id)] else BASE_FILES
+            return {"files": files, "checksums": {name: f"checksum-{name}" for name in files}}, 200
+        if path == f"/api/v1/models/{model_id}/content-validator":
+            if query.get("find") == ["orders.revenue"] and query.get("find_type") == ["FIELD"]:
+                return content_payload("Executive Revenue", "alice@example.com"), 200
+            return {"content": []}, 200
     if path == "/api/v1/content":
         return {"records": [{"identifier": "dash-1", "labels": [{"name": "Verified"}]}], "pageInfo": {}}, 200
-    if path == f"/api/v1/models/{MODEL_ID}/dbt-exposures":
-        if state.mode == "exposures_403":
-            return {"error": "forbidden"}, 403
-        records = [
-            {
-                "dashboard_identifier": "dash-1",
-                "deduplication_name": "executive_revenue",
-                "exposure": {
-                    "name": "executive_revenue",
-                    "label": "Executive Revenue",
-                    "type": "dashboard",
-                    "url": "https://omni.example/dashboards/dash-1",
-                    "owner": {"name": "Alice", "email": "alice@example.com"},
-                    "depends_on": ["ref('orders')"],
-                },
-            }
-        ]
-        if state.mode == "exposures_partial":
-            records.append({"dashboard_identifier": "dash-unmapped", "exposure": None})
-        return {
-            "records": records,
-            "pageInfo": {"hasNextPage": False},
-        }, 200
+    for model_id in state.model_ids:
+        if path == f"/api/v1/models/{model_id}/dbt-exposures":
+            if state.mode == "exposures_403":
+                return {"error": "forbidden"}, 403
+            records = [
+                {
+                    "dashboard_identifier": "dash-1",
+                    "deduplication_name": "executive_revenue",
+                    "exposure": {
+                        "name": "executive_revenue",
+                        "label": "Executive Revenue",
+                        "type": "dashboard",
+                        "url": "https://omni.example/dashboards/dash-1",
+                        "owner": {"name": "Alice", "email": "alice@example.com"},
+                        "depends_on": ["ref('orders')"],
+                    },
+                }
+            ]
+            if state.mode == "exposures_partial":
+                records.append({"dashboard_identifier": "dash-unmapped", "exposure": None})
+            return {
+                "records": records,
+                "pageInfo": {"hasNextPage": False},
+            }, 200
     return {"error": f"Unhandled fake Omni path: {path}"}, 404
+
+
+def model_path_for(model_id: str) -> str:
+    return "omni/model" if model_id == MODEL_ID else f"omni/{model_id}"
+
+
+def branch_id_for(model_id: str) -> str:
+    return BRANCH_ID if model_id == MODEL_ID else f"branch-{model_id.removeprefix('model-')}"
 
 
 def content_payload(name: str, email: str) -> dict[str, Any]:
@@ -299,7 +327,7 @@ def main(argv: list[str] | None = None) -> int:
 def run_scenario(scenario: Scenario, *, keep_workdir: bool) -> dict[str, Any]:
     tmp_ctx = tempfile.TemporaryDirectory(prefix=f"omniflow-{scenario.name}-")
     tmp = Path(tmp_ctx.name)
-    state = FakeOmniState(scenario.server_mode)
+    state = FakeOmniState(scenario)
     server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -345,17 +373,20 @@ def setup_repo(repo: Path, *, base_url: str, scenario: Scenario) -> None:
             "models": [
                 {
                     "base_url": base_url,
-                    "model_id": MODEL_ID,
-                    "model_path": "omni/model",
+                    "model_id": model_id,
+                    "model_path": model_path_for(model_id),
                     "base_branch": "main",
                     "git_provider": "github",
                     "web_url": "https://github.com/atx-omni/simulated",
                 }
+                for model_id in scenario.model_ids
             ],
         },
     )
-    (repo / "omni/model/views").mkdir(parents=True)
-    (repo / "omni/model/views/orders.view").write_text(BASE_FILES["views/orders.view"], encoding="utf-8")
+    for model_id in scenario.model_ids:
+        model_root = repo / model_path_for(model_id)
+        (model_root / "views").mkdir(parents=True)
+        (model_root / "views/orders.view").write_text(BASE_FILES["views/orders.view"], encoding="utf-8")
     config = (
         scenario.config
         or """reporting:
@@ -470,6 +501,10 @@ def assert_result(scenario: Scenario, exit_code: int, artifacts: dict[str, Any])
         report = artifacts.get("public/report.json:json", {})
         if report.get("policy_decision") != "fail" or report.get("exit_code") != 2:
             errors.append("fork Omni PR did not fail closed without the Omni secret")
+    if scenario.name == "multi_model_contract_failure":
+        report = artifacts.get("public/report.json:json", {})
+        if len(report.get("model_reports", [])) != 2 or len(report.get("models", [])) != 2:
+            errors.append("multi-model run did not aggregate both selected model contexts")
     if scenario.name in {"exposures_available", "exposures_partial"}:
         report = artifacts.get("public/report.json:json", {})
         check_reports = report.get("model_reports", [{}])[0].get("check_reports", [])

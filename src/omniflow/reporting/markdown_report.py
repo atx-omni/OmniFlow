@@ -46,7 +46,7 @@ def render_markdown_report(report: dict[str, Any]) -> str:
         "",
         "## dbt Exposure Coverage",
         "",
-        *_dbt_exposure_lines(dbt_exposure_summaries),
+        *_dbt_exposure_lines(dbt_exposure_summaries, decision=decision),
         "",
         "## Validation Summary",
         "",
@@ -90,6 +90,8 @@ def _decision_label(decision: str) -> str:
 
 
 def _model_lines(report: dict[str, Any]) -> list[str]:
+    if report.get("policy_decision") == "skipped":
+        return ["_Not evaluated because no Omni semantic-layer changes were detected._"]
     models = report.get("models")
     if isinstance(models, list) and models:
         lines = []
@@ -102,11 +104,13 @@ def _model_lines(report: dict[str, Any]) -> list[str]:
                 f"`{_safe_code(model.get('model_path', ''))}` branch `{_safe_code(branch)}`"
             )
         return lines or ["- Model context unavailable."]
-    return [
-        f"- Model ID: `{_safe_code(report.get('model_id', ''))}`",
-        f"- Model path: `{_safe_code(report.get('model_path', ''))}`",
-        f"- Branch: `{_safe_code(report.get('branch_name') or report.get('branch_id') or '')}`",
-    ]
+    if any(report.get(key) for key in ("model_id", "model_path", "branch_name", "branch_id")):
+        return [
+            f"- Model ID: `{_safe_code(report.get('model_id', ''))}`",
+            f"- Model path: `{_safe_code(report.get('model_path', ''))}`",
+            f"- Branch: `{_safe_code(report.get('branch_name') or report.get('branch_id') or '')}`",
+        ]
+    return ["_Model context unavailable._"]
 
 
 def _issue_lines(issues: list[dict[str, Any]], *, empty: str, limit: int) -> list[str]:
@@ -189,9 +193,11 @@ def _dbt_exposure_summaries(report: dict[str, Any]) -> list[dict[str, Any]]:
     return summaries
 
 
-def _dbt_exposure_lines(summaries: list[dict[str, Any]]) -> list[str]:
+def _dbt_exposure_lines(summaries: list[dict[str, Any]], *, decision: str) -> list[str]:
     if not summaries:
-        return ["_dbt exposure enrichment was not enabled for this run._"]
+        if decision == "skipped":
+            return ["_Not evaluated because no Omni semantic-layer changes were detected._"]
+        return ["_No dbt exposure result was produced for this run._"]
     lines = []
     for entry in summaries:
         summary = entry["summary"]
