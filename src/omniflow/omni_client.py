@@ -19,6 +19,8 @@ MAX_PAGINATION_PAGES = 500
 MAX_PAGINATION_RECORDS = 50_000
 MAX_AI_PROMPT_BYTES = 16 * 1024
 AI_JOB_STATES = {"CANCELLED", "COMPLETE", "DELIVERING", "EXECUTING", "FAILED", "QUEUED"}
+SCHEMA_REFRESH_STATES = {"RUNNING", "COMPLETED", "FAILED"}
+SCHEMA_REFRESH_MODEL_KINDS = {"SHARED", "SHARED_EXTENSION"}
 
 
 class OmniClient:
@@ -126,11 +128,66 @@ class OmniClient:
         records = self._paginate(f"/api/v1/models/{model_id}/dbt-exposures", params=params)
         return {"records": records}
 
+    def start_schema_refresh(
+        self,
+        model_id: str,
+        *,
+        branch_id: str | None = None,
+        hard_refresh: bool = True,
+    ) -> dict[str, str]:
+        model_id = validate_path_segment(model_id, name="model_id")
+        if not isinstance(hard_refresh, bool):
+            raise ConfigError("hard_refresh must be a boolean")
+        params: dict[str, str] = {"hard_refresh": str(hard_refresh).lower()}
+        if branch_id:
+            params["branch_id"] = validate_path_segment(branch_id, name="branch_id")
+        payload = self._request(
+            "POST",
+            f"/api/v1/models/{model_id}/refresh",
+            params=params,
+            retry_transient=False,
+        )
+        if not isinstance(payload, dict):
+            raise OmniAPIError("Schema refresh returned an unexpected response shape")
+        job_id = payload.get("jobId")
+        response_model_id = payload.get("modelId")
+        status = _schema_refresh_status(payload.get("status"))
+        if not isinstance(job_id, str) or not job_id.strip():
+            raise OmniAPIError("Schema refresh did not return a job ID")
+        if response_model_id != model_id:
+            raise OmniAPIError("Schema refresh returned a mismatched model ID")
+        return {
+            "job_id": validate_path_segment(job_id.strip(), name="job_id"),
+            "model_id": model_id,
+            "status": status,
+        }
+
+    def get_schema_refresh_job_status(self, job_id: str) -> dict[str, str]:
+        job_id = validate_path_segment(job_id, name="job_id")
+        payload = self._request("GET", f"/api/v1/jobs/{job_id}/status")
+        if not isinstance(payload, dict):
+            raise OmniAPIError("Schema refresh job status returned an unexpected response shape")
+        response_job_id = payload.get("job_id")
+        job_type = payload.get("job_type")
+        status = _schema_refresh_status(payload.get("status"))
+        if response_job_id != job_id:
+            raise OmniAPIError("Schema refresh job status returned a mismatched job ID")
+        if job_type != "refresh_schema":
+            raise OmniAPIError("Schema refresh job status returned an unexpected job type")
+        result = {"job_id": job_id, "job_type": job_type, "status": status}
+        model_id = payload.get("model_id")
+        if isinstance(model_id, str) and model_id.strip():
+            result["model_id"] = validate_path_segment(model_id.strip(), name="model_id")
+        # Timestamps and any future data-bearing fields are intentionally discarded.
+        return result
+
     def list_models(
         self,
         model_kind: str | None = None,
         base_model_id: str | None = None,
         name: str | None = None,
+        model_id: str | None = None,
+        connection_id: str | None = None,
     ) -> list[dict[str, Any]]:
         params: dict[str, Any] = {}
         if model_kind:
@@ -139,7 +196,40 @@ class OmniClient:
             params["baseModelId"] = base_model_id
         if name:
             params["name"] = name
+        if model_id:
+            params["modelId"] = validate_path_segment(model_id, name="model_id")
+        if connection_id:
+            params["connectionId"] = validate_path_segment(connection_id, name="connection_id")
         return self._paginate("/api/v1/models", params=params)
+
+    def get_model_metadata(self, model_id: str) -> dict[str, str]:
+        model_id = validate_path_segment(model_id, name="model_id")
+        matching = [record for record in self.list_models(model_id=model_id) if record.get("id") == model_id]
+        if len(matching) != 1:
+            raise OmniAPIError("Model metadata lookup did not return exactly one matching model")
+        connection_id = matching[0].get("connectionId")
+        if not isinstance(connection_id, str) or not connection_id.strip():
+            raise OmniAPIError("Model metadata lookup did not return a connection ID")
+        return {
+            "model_id": model_id,
+            "connection_id": validate_path_segment(connection_id.strip(), name="connection_id"),
+        }
+
+    def list_refresh_affected_model_ids(self, connection_id: str) -> list[str]:
+        connection_id = validate_path_segment(connection_id, name="connection_id")
+        model_ids: set[str] = set()
+        for record in self.list_models(connection_id=connection_id):
+            if record.get("modelKind") not in SCHEMA_REFRESH_MODEL_KINDS:
+                continue
+            if record.get("connectionId") != connection_id:
+                raise OmniAPIError("Connection model lookup returned a mismatched connection ID")
+            model_id = record.get("id")
+            if not isinstance(model_id, str) or not model_id.strip():
+                raise OmniAPIError("Connection model lookup returned an invalid model ID")
+            model_ids.add(validate_path_segment(model_id.strip(), name="model_id"))
+        if not model_ids:
+            raise OmniAPIError("Connection model lookup did not return any shared models")
+        return sorted(model_ids)
 
     def resolve_branch_id(self, model_id: str, branch_name: str | None) -> str | None:
         if not branch_name:
@@ -414,6 +504,15 @@ def _content_validator_find_type(value: str) -> str:
     if normalized not in aliases:
         raise ConfigError("Content Validator find_type must be VIEW, FIELD, or TOPIC")
     return aliases[normalized]
+
+
+def _schema_refresh_status(value: Any) -> str:
+    if not isinstance(value, str):
+        raise OmniAPIError("Schema refresh returned an invalid status")
+    normalized = value.strip().upper()
+    if normalized not in SCHEMA_REFRESH_STATES:
+        raise OmniAPIError("Schema refresh returned an unsupported status")
+    return normalized
 
 
 def _commit_message(value: str) -> str:

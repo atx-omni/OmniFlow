@@ -51,6 +51,7 @@ class RepositoryHardeningTests(unittest.TestCase):
         self.assertTrue(any("--skip-reason" in script for script in scripts))
         self.assertTrue(any("omniflow route --auto" in script for script in scripts))
         self.assertTrue(any("omniflow repair ai --auto" in script for script in scripts))
+        self.assertTrue(any("omniflow dbt sync --auto" in script for script in scripts))
 
     def test_example_workflow_uses_minimal_checkout_and_uploads_only_public_evidence(self):
         text = (ROOT / ".github/workflow-examples/omniflow.yml").read_text(encoding="utf-8")
@@ -128,11 +129,13 @@ class RepositoryHardeningTests(unittest.TestCase):
         self.assertNotIn("version", action["inputs"])
         self.assertIn("omni-api-key", action["inputs"])
         self.assertIn("repair-api-key", action["inputs"])
+        self.assertIn("sync-api-key", action["inputs"])
         self.assertEqual(action["inputs"]["mode"]["default"], "validate")
         install = next(step for step in action["runs"]["steps"] if step["name"] == "Install OmniFlow")
         route = next(step for step in action["runs"]["steps"] if step["name"] == "Route OmniFlow run")
         run = next(step for step in action["runs"]["steps"] if step["name"] == "Run OmniFlow")
         repair = next(step for step in action["runs"]["steps"] if step["name"] == "Run OmniFlow AI repair")
+        sync = next(step for step in action["runs"]["steps"] if step["name"] == "Synchronize dbt metadata into Omni")
         self.assertIn("--require-hashes", install["run"])
         self.assertIn("--only-binary=:all:", install["run"])
         self.assertIn("--no-deps --no-build-isolation", install["run"])
@@ -147,6 +150,13 @@ class RepositoryHardeningTests(unittest.TestCase):
             "${{ inputs['repair-api-key'] }}",
         )
         self.assertNotIn("OMNIFLOW_REPAIR_API_KEY", install.get("env", {}))
+        self.assertNotIn("OMNI_API_KEY", sync["env"])
+        self.assertNotIn("OMNIFLOW_REPAIR_API_KEY", sync["env"])
+        self.assertEqual(
+            sync["env"]["OMNIFLOW_SYNC_API_KEY"],
+            "${{ inputs['sync-api-key'] }}",
+        )
+        self.assertNotIn("OMNIFLOW_SYNC_API_KEY", install.get("env", {}))
         self.assertNotIn("omniflow-ci==", (ROOT / "action.yml").read_text(encoding="utf-8"))
 
     def test_ai_repair_workflow_is_manual_protected_and_same_repository_only(self):
@@ -162,6 +172,21 @@ class RepositoryHardeningTests(unittest.TestCase):
         self.assertIn("mode: repair", text)
         self.assertIn("repair-api-key: ${{ secrets.OMNIFLOW_REPAIR_API_KEY }}", text)
         self.assertNotIn("OMNI_API_KEY", text)
+        self.assertNotIn(".omniflow/restricted/", text)
+
+    def test_dbt_sync_workflow_is_post_deployment_protected_and_loop_bounded(self):
+        text = (ROOT / ".github/workflow-examples/omniflow-dbt-sync.yml").read_text(encoding="utf-8")
+        self.assertIn("branches: [main]", text)
+        self.assertIn("workflow_dispatch:", text)
+        self.assertIn("environment: omniflow-production", text)
+        self.assertIn("Deploy dbt to production", text)
+        self.assertLess(text.index("Deploy dbt to production"), text.index("Synchronize dbt metadata into Omni"))
+        self.assertIn("mode: dbt-sync", text)
+        self.assertIn("sync-api-key: ${{ secrets.OMNIFLOW_SYNC_API_KEY }}", text)
+        self.assertIn("models/**", text)
+        self.assertNotIn("omni/**", text)
+        self.assertIn("persist-credentials: false", text)
+        self.assertIn(".omniflow/public/dbt-sync.json", text)
         self.assertNotIn(".omniflow/restricted/", text)
 
     def test_action_and_release_locks_pin_every_requirement_with_sha256(self):

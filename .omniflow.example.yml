@@ -51,6 +51,17 @@ security:
   redaction_level: standard
   retain_restricted_artifacts: false
 
+# Optional post-deployment sync for repositories that deploy dbt models.
+# Invoke only after the production dbt job succeeds. It is disabled by default
+# and has no effect on repositories that do not use dbt.
+# deployment:
+#   dbt_sync:
+#     enabled: true
+#     refresh_mode: hard
+#     poll_interval_seconds: 5
+#     timeout_seconds: 900
+#     post_sync_validation: true
+
 # Unreleased development scaffold: human-authorized Omni Modeling Agent repair.
 # Do not enable for customer use until Omni publishes a supported Modeling Agent API.
 # Omni's documented AI Jobs API may execute queries and has no no-query switch.

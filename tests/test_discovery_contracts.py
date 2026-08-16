@@ -11,6 +11,7 @@ from omniflow.config import ContractSettings, load_config
 from omniflow.contracts import evaluate_contracts
 from omniflow.discovery import (
     discover_contexts,
+    discover_deployment_contexts,
     get_changed_files,
     load_flow_metadata,
     load_pr_marker,
@@ -172,6 +173,99 @@ class DiscoveryTests(unittest.TestCase):
             ):
                 contexts = discover_contexts(auto=True)
         self.assertEqual([context.model_id for context in contexts], ["a", "b"])
+
+    def test_deployment_discovery_selects_every_model_on_the_current_base_branch(self):
+        with temporary_workdir() as tmp:
+            write_json(
+                tmp / ".omni/flow.json",
+                {
+                    "version": 1,
+                    "models": [
+                        {
+                            "base_url": "https://omni.example",
+                            "model_id": "a",
+                            "model_path": "omni/a",
+                            "base_branch": "main",
+                        },
+                        {
+                            "base_url": "https://omni.example",
+                            "model_id": "b",
+                            "model_path": "omni/b",
+                            "base_branch": "main",
+                        },
+                        {
+                            "base_url": "https://omni.example",
+                            "model_id": "release",
+                            "model_path": "omni/release",
+                            "base_branch": "release",
+                        },
+                    ],
+                },
+            )
+            with mock.patch.dict(os.environ, {"GITHUB_REF_NAME": "main"}, clear=True):
+                contexts = discover_deployment_contexts(auto=True)
+        self.assertEqual([context.model_id for context in contexts], ["a", "b"])
+        self.assertTrue(all(context.branch_name is None for context in contexts))
+
+    def test_deployment_discovery_requires_complete_trusted_base_branch_metadata(self):
+        with temporary_workdir() as tmp:
+            write_json(
+                tmp / ".omni/flow.json",
+                {
+                    "version": 1,
+                    "models": [
+                        {
+                            "base_url": "https://omni.example",
+                            "model_id": "model-1",
+                            "model_path": "omni/model",
+                        }
+                    ],
+                },
+            )
+            with mock.patch.dict(os.environ, {"GITHUB_REF_NAME": "main"}, clear=True):
+                with self.assertRaises(ConfigError):
+                    discover_deployment_contexts(auto=True)
+
+    def test_explicit_deployment_discovery_requires_a_base_branch(self):
+        with mock.patch.dict(os.environ, {"GITHUB_REF_NAME": "main"}, clear=True):
+            with self.assertRaises(ConfigError):
+                discover_deployment_contexts(
+                    auto=False,
+                    base_url="https://omni.example",
+                    model_id="model-1",
+                )
+            contexts = discover_deployment_contexts(
+                auto=False,
+                base_url="https://omni.example",
+                model_id="model-1",
+                base_branch="main",
+            )
+        self.assertEqual(contexts[0].base_branch, "main")
+
+    def test_deployment_discovery_rejects_prs_and_non_base_branches_as_security_violations(self):
+        with temporary_workdir() as tmp:
+            write_json(
+                tmp / ".omni/flow.json",
+                {
+                    "version": 1,
+                    "models": [
+                        {
+                            "base_url": "https://omni.example",
+                            "model_id": "model-1",
+                            "model_path": "omni/model",
+                            "base_branch": "main",
+                        }
+                    ],
+                },
+            )
+            for env in (
+                {"GITHUB_EVENT_NAME": "pull_request", "GITHUB_HEAD_REF": "feature/a"},
+                {"GITHUB_EVENT_NAME": "push", "GITHUB_REF_NAME": "feature/a"},
+            ):
+                with self.subTest(env=env):
+                    with mock.patch.dict(os.environ, env, clear=True):
+                        with self.assertRaises(SecurityPolicyError):
+                            discover_deployment_contexts(auto=True)
 
     def test_pr_marker_resolves_ambiguous_content_only_pr(self):
         with temporary_workdir() as tmp:

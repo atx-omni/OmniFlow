@@ -30,7 +30,7 @@ SEMANTIC_LINT_RULES = {
     "forbid_personal_folder_validation_scope",
 }
 RULE_SEVERITIES = {"off", "info", "warn", "error"}
-CONFIG_KEYS = {"omni", "checks", "reporting", "security", "contracts", "repairs"}
+CONFIG_KEYS = {"omni", "checks", "reporting", "security", "contracts", "repairs", "deployment"}
 OMNI_KEYS = {
     "base_url",
     "model_id",
@@ -69,6 +69,14 @@ AI_REPAIR_KEYS = {
     "max_changed_files",
     "max_changed_lines",
     "poll_timeout_seconds",
+}
+DEPLOYMENT_KEYS = {"dbt_sync"}
+DBT_SYNC_KEYS = {
+    "enabled",
+    "refresh_mode",
+    "poll_interval_seconds",
+    "timeout_seconds",
+    "post_sync_validation",
 }
 
 
@@ -219,6 +227,15 @@ class AIRepairSettings:
 
 
 @dataclass
+class DbtSyncSettings:
+    enabled: bool = False
+    refresh_mode: str = "hard"
+    poll_interval_seconds: int = 5
+    timeout_seconds: int = 900
+    post_sync_validation: bool = True
+
+
+@dataclass
 class OmniFlowConfig:
     raw: dict[str, Any]
     source: Path | None
@@ -231,6 +248,7 @@ class OmniFlowConfig:
     reporting: ReportingSettings
     security: SecuritySettings
     ai_repair: AIRepairSettings
+    dbt_sync: DbtSyncSettings
     hash: str
 
 
@@ -246,7 +264,9 @@ def _to_config(raw: dict[str, Any], source: Path | None) -> OmniFlowConfig:
     security_raw = _mapping(raw.get("security"), "security")
     contracts_raw = _mapping(raw.get("contracts"), "contracts")
     repairs_raw = _mapping(raw.get("repairs"), "repairs")
+    deployment_raw = _mapping(raw.get("deployment"), "deployment")
     ai_repair_raw = _mapping(repairs_raw.get("ai"), "repairs.ai")
+    dbt_sync_raw = _mapping(deployment_raw.get("dbt_sync"), "deployment.dbt_sync")
     content_raw = _mapping(checks_raw.get("content_validation"), "checks.content_validation")
     model_raw = _mapping(checks_raw.get("model_validation"), "checks.model_validation")
     lint_raw = _mapping(checks_raw.get("semantic_lint"), "checks.semantic_lint")
@@ -400,6 +420,29 @@ def _to_config(raw: dict[str, Any], source: Path | None) -> OmniFlowConfig:
             default=300,
         ),
     )
+    dbt_sync = DbtSyncSettings(
+        enabled=parse_bool("deployment.dbt_sync.enabled", dbt_sync_raw.get("enabled"), False),
+        refresh_mode=_refresh_mode(dbt_sync_raw.get("refresh_mode", "hard")),
+        poll_interval_seconds=_bounded_int(
+            "deployment.dbt_sync.poll_interval_seconds",
+            dbt_sync_raw.get("poll_interval_seconds", 5),
+            minimum=2,
+            maximum=30,
+            default=5,
+        ),
+        timeout_seconds=_bounded_int(
+            "deployment.dbt_sync.timeout_seconds",
+            dbt_sync_raw.get("timeout_seconds", 900),
+            minimum=30,
+            maximum=3_600,
+            default=900,
+        ),
+        post_sync_validation=parse_bool(
+            "deployment.dbt_sync.post_sync_validation",
+            dbt_sync_raw.get("post_sync_validation"),
+            True,
+        ),
+    )
     return OmniFlowConfig(
         raw=raw,
         source=source,
@@ -412,6 +455,7 @@ def _to_config(raw: dict[str, Any], source: Path | None) -> OmniFlowConfig:
         reporting=reporting,
         security=security,
         ai_repair=ai_repair,
+        dbt_sync=dbt_sync,
         hash=config_hash(raw),
     )
 
@@ -437,6 +481,15 @@ def _redaction_level(value: Any) -> str:
     return normalized
 
 
+def _refresh_mode(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ConfigError("deployment.dbt_sync.refresh_mode must be 'hard' or 'soft'")
+    normalized = value.strip().lower()
+    if normalized not in {"hard", "soft"}:
+        raise ConfigError("deployment.dbt_sync.refresh_mode must be 'hard' or 'soft'")
+    return normalized
+
+
 def _mapping(value: Any, name: str) -> dict[str, Any]:
     if value is None:
         return {}
@@ -453,13 +506,20 @@ def _validate_config_schema(raw: dict[str, Any]) -> None:
     security = _mapping(raw.get("security"), "security")
     contracts = _mapping(raw.get("contracts"), "contracts")
     repairs = _mapping(raw.get("repairs"), "repairs")
+    deployment = _mapping(raw.get("deployment"), "deployment")
     _reject_unknown_keys(omni, OMNI_KEYS, "omni")
     _reject_unknown_keys(checks, CHECK_KEYS, "checks")
     _reject_unknown_keys(reporting, REPORTING_KEYS, "reporting")
     _reject_unknown_keys(security, SECURITY_KEYS, "security")
     _reject_unknown_keys(contracts, CONTRACT_KEYS, "contracts")
     _reject_unknown_keys(repairs, REPAIR_KEYS, "repairs")
+    _reject_unknown_keys(deployment, DEPLOYMENT_KEYS, "deployment")
     _reject_unknown_keys(_mapping(repairs.get("ai"), "repairs.ai"), AI_REPAIR_KEYS, "repairs.ai")
+    _reject_unknown_keys(
+        _mapping(deployment.get("dbt_sync"), "deployment.dbt_sync"),
+        DBT_SYNC_KEYS,
+        "deployment.dbt_sync",
+    )
     _reject_unknown_keys(
         _mapping(checks.get("content_validation"), "checks.content_validation"),
         CONTENT_KEYS,
@@ -548,5 +608,14 @@ def require_repair_api_key() -> str:
     if not value:
         raise ConfigError(
             "Missing OMNIFLOW_REPAIR_API_KEY. AI repair requires a separate write-capable Omni token."
+        )
+    return value
+
+
+def require_sync_api_key() -> str:
+    value = os.getenv("OMNIFLOW_SYNC_API_KEY")
+    if not value:
+        raise ConfigError(
+            "Missing OMNIFLOW_SYNC_API_KEY. dbt synchronization requires a dedicated deployment token."
         )
     return value

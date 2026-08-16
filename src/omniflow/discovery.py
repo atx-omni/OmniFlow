@@ -97,6 +97,74 @@ def discover_contexts(
     return contexts
 
 
+def discover_deployment_contexts(
+    *,
+    auto: bool,
+    base_url: str | None = None,
+    model_id: str | None = None,
+    model_path: str | None = None,
+    branch_name: str | None = None,
+    branch_id: str | None = None,
+    base_branch: str | None = None,
+    flow_path: str | Path = FLOW_PATH,
+) -> list[ModelContext]:
+    if is_pull_request_event():
+        raise SecurityPolicyError("dbt synchronization is prohibited for pull request events")
+    deployment_branch = discover_branch_name()
+    if auto:
+        flow = load_flow_metadata(flow_path)
+        if flow is None:
+            raise ConfigError("Missing trusted .omni/flow.json metadata for dbt synchronization")
+        contexts = [_model_from_payload(item, branch_name=branch_name) for item in flow["models"]]
+        missing_base_branch = [context.model_id for context in contexts if not context.base_branch]
+        if missing_base_branch:
+            raise ConfigError(
+                "dbt synchronization requires base_branch for every model in trusted .omni/flow.json"
+            )
+        if not deployment_branch:
+            raise ConfigError("Could not determine the deployment Git branch for dbt synchronization")
+        if model_id:
+            model_id = validate_path_segment(model_id, name="model_id")
+            contexts = [context for context in contexts if context.model_id == model_id]
+            if not contexts:
+                raise ConfigError("Requested dbt synchronization model is not present in trusted .omni/flow.json")
+        if model_path:
+            normalized_model_path = model_path.strip().strip("/")
+            contexts = [context for context in contexts if context.model_path == normalized_model_path]
+            if not contexts:
+                raise ConfigError("Requested dbt synchronization model path is not present in trusted metadata")
+        configured_base_branches = {context.base_branch for context in contexts}
+        contexts = [context for context in contexts if context.base_branch == deployment_branch]
+        if not contexts:
+            expected = ", ".join(sorted(str(branch) for branch in configured_base_branches))
+            raise SecurityPolicyError(
+                f"dbt synchronization is restricted to trusted base branch(es) {expected}, "
+                f"not '{deployment_branch}'"
+            )
+        if base_url:
+            trusted_base_url = validate_base_url(base_url)
+            for context in contexts:
+                context.base_url = trusted_base_url
+        if branch_id:
+            for context in contexts:
+                context.branch_id = validate_path_segment(branch_id, name="branch_id")
+        return contexts
+
+    if not base_url or not model_id or not base_branch:
+        raise ConfigError(
+            "Explicit dbt synchronization requires --base-url, --model-id, and --base-branch. "
+            "Use --auto for the protected deployment workflow."
+        )
+    context = _model_from_payload(
+        {"base_url": base_url, "model_id": model_id, "model_path": model_path or ""},
+        branch_name=branch_name,
+        require_model_path=False,
+    )
+    context.base_branch = validate_branch_name(base_branch)
+    context.branch_id = validate_path_segment(branch_id, name="branch_id") if branch_id else None
+    return [context]
+
+
 def discover_branch_name() -> str | None:
     return current_branch()
 

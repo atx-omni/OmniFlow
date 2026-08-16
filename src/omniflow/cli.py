@@ -11,12 +11,19 @@ from typing import Any
 
 from . import __version__
 from .artifacts import public_dir, restricted_dir, write_artifact_manifest, write_public_json, write_public_reports
-from .config import DEFAULT_REPORT_FORMATS, load_config, require_api_key, require_repair_api_key
+from .config import (
+    DEFAULT_REPORT_FORMATS,
+    load_config,
+    require_api_key,
+    require_repair_api_key,
+    require_sync_api_key,
+)
 from .contracts import evaluate_contracts
+from .dbt_sync import run_dbt_sync, validate_dbt_sync_environment
 from .diff.diff_engine import diff_graphs
 from .diff.semantic_graph import build_graph
 from .diff.yaml_loader import load_yaml_files
-from .discovery import ModelContext, discover_contexts
+from .discovery import ModelContext, discover_contexts, discover_deployment_contexts
 from .downstream import generate_downstream_dependencies
 from .exceptions import ConfigError, ExitCodes, OmniAuthError, OmniFlowError, SecurityPolicyError
 from .exposures import run_dbt_exposure_enrichment
@@ -123,6 +130,16 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_omni_args(exposures_pull)
     exposures_pull.add_argument("--out", default=None)
     exposures_pull.set_defaults(func=cmd_exposures_pull)
+
+    dbt = subcommands.add_parser("dbt", help="dbt deployment commands")
+    dbt_sub = dbt.add_subparsers(required=True)
+    dbt_sync = dbt_sub.add_parser("sync", help="Refresh Omni after a successful production dbt deployment")
+    _add_config_arg(dbt_sync)
+    _add_common_omni_args(dbt_sync)
+    dbt_sync.add_argument("--auto", action="store_true", help="Select deployment models from trusted metadata")
+    dbt_sync.add_argument("--base-branch", help="Trusted deployment branch for explicit local debugging")
+    dbt_sync.add_argument("--refresh-mode", choices=("hard", "soft"), default=None)
+    dbt_sync.set_defaults(func=cmd_dbt_sync)
 
     diff_parser = subcommands.add_parser("diff", help="Compare semantic YAML")
     diff_parser.add_argument("--base", required=True, help="Directory containing base YAML")
@@ -430,6 +447,7 @@ def _run_context(
     context: ModelContext,
     output_dir: Path,
     api_key: str | None = None,
+    comparison_base_yaml_dir: Path | None = None,
 ) -> tuple[dict[str, Any], int]:
     client, branch_id = _client_and_branch_for_context(context, config.omni.timeout, api_key=api_key)
     all_issues: list[dict[str, Any]] = []
@@ -470,14 +488,15 @@ def _run_context(
     diff_report = None
     head_graph = None
     if config.semantic_lint.enabled or config.contracts.enabled:
-        base_yaml_dir = output_dir / "yaml-base"
+        base_yaml_dir = comparison_base_yaml_dir or output_dir / "yaml-base"
         head_yaml_dir = output_dir / "yaml-head"
-        pull_yaml(
-            client=client,
-            model_id=context.model_id,
-            branch_id=None,
-            output_dir=base_yaml_dir,
-        )
+        if comparison_base_yaml_dir is None:
+            pull_yaml(
+                client=client,
+                model_id=context.model_id,
+                branch_id=None,
+                output_dir=base_yaml_dir,
+            )
         pull_yaml(
             client=client,
             model_id=context.model_id,
@@ -649,6 +668,283 @@ def cmd_exposures_pull(args: argparse.Namespace) -> int:
     output_path = Path(args.out or Path(config.reporting.output_dir) / "dbt-exposures.json")
     write_json_report(output_path, report)
     print(f"Pulled {report['summary']['total_exposures']} dbt exposure record(s) to {output_path}")
+    return exit_code
+
+
+def cmd_dbt_sync(args: argparse.Namespace) -> int:
+    try:
+        config = _override_config(load_config(args.config), args)
+    except OmniFlowError as exc:
+        _write_unconfigured_failure_artifacts(output_dir=Path(".omniflow"), exc=exc)
+        raise
+    output_dir = Path(config.reporting.output_dir)
+    _validate_run_output_layout(output_dir)
+    if not config.security.retain_restricted_artifacts:
+        _purge_restricted_path(restricted_dir(output_dir))
+
+    try:
+        if not config.dbt_sync.enabled:
+            raise ConfigError(
+                "dbt synchronization is disabled. Set deployment.dbt_sync.enabled: true in trusted policy."
+            )
+        contexts = discover_deployment_contexts(
+            auto=args.auto,
+            base_url=config.omni.base_url,
+            model_id=config.omni.model_id,
+            model_path=getattr(args, "model_path", None),
+            branch_name=config.omni.branch_name,
+            branch_id=config.omni.branch_id,
+            base_branch=getattr(args, "base_branch", None),
+        )
+        deployment_branch = validate_dbt_sync_environment(contexts)
+        sync_api_key = require_sync_api_key()
+    except OmniFlowError as exc:
+        _write_setup_failure_artifacts(config=config, output_dir=output_dir, exc=exc)
+        raise
+
+    refresh_mode = args.refresh_mode or config.dbt_sync.refresh_mode
+    prepared_contexts: list[dict[str, Any]] = []
+    try:
+        connection_branches: dict[tuple[str, str], str | None] = {}
+        for context in contexts:
+            client, branch_id = _client_and_branch_for_context(
+                context,
+                config.omni.timeout,
+                api_key=sync_api_key,
+            )
+            metadata = client.get_model_metadata(context.model_id)
+            connection_key = (context.base_url, metadata["connection_id"])
+            if connection_key in connection_branches and connection_branches[connection_key] != branch_id:
+                raise ConfigError(
+                    "Models on the same Omni connection resolved to different refresh branches; "
+                    "no schema refresh was started"
+                )
+            connection_branches[connection_key] = branch_id
+            prepared_contexts.append(
+                {
+                    "context": context,
+                    "client": client,
+                    "branch_id": branch_id,
+                    "connection_key": connection_key,
+                    "connection_id": metadata["connection_id"],
+                }
+            )
+        for connection_key in connection_branches:
+            connection_contexts = [
+                item for item in prepared_contexts if item["connection_key"] == connection_key
+            ]
+            configured_model_ids = {item["context"].model_id for item in connection_contexts}
+            affected_model_ids = set(
+                connection_contexts[0]["client"].list_refresh_affected_model_ids(
+                    connection_contexts[0]["connection_id"]
+                )
+            )
+            if configured_model_ids != affected_model_ids:
+                raise ConfigError(
+                    "dbt synchronization requires every shared model affected by an Omni connection refresh "
+                    "to be registered in trusted .omni/flow.json; no schema refresh was started"
+                )
+        if config.semantic_lint.enabled or config.contracts.enabled:
+            for prepared in prepared_contexts:
+                context = prepared["context"]
+                snapshot_dir = restricted_dir(output_dir) / _safe_context_dir(context) / "pre-sync-yaml"
+                _validate_context_output_layout(snapshot_dir)
+                pull_yaml(
+                    client=prepared["client"],
+                    model_id=context.model_id,
+                    branch_id=prepared["branch_id"],
+                    output_dir=snapshot_dir,
+                )
+                prepared["comparison_base_yaml_dir"] = snapshot_dir
+    except OmniFlowError as exc:
+        if not config.security.retain_restricted_artifacts:
+            _purge_restricted_path(restricted_dir(output_dir))
+        _write_setup_failure_artifacts(config=config, output_dir=output_dir, exc=exc)
+        raise
+
+    model_reports: list[dict[str, Any]] = []
+    sync_reports: list[dict[str, Any]] = []
+    all_issues: list[dict[str, Any]] = []
+    exit_code = ExitCodes.SUCCESS
+    refresh_outcomes: dict[tuple[str, str], tuple[dict[str, Any], int]] = {}
+    try:
+        for prepared in prepared_contexts:
+            context = prepared["context"]
+            client = prepared["client"]
+            branch_id = prepared["branch_id"]
+            connection_key = prepared["connection_key"]
+            connection_id = prepared["connection_id"]
+            context_output_dir = restricted_dir(output_dir) / _safe_context_dir(context)
+            validation_output_dir = context_output_dir / "post-sync-validation"
+            _validate_context_output_layout(context_output_dir)
+            _validate_context_output_layout(validation_output_dir)
+            if connection_key not in refresh_outcomes:
+                affected_model_ids = [
+                    item["context"].model_id
+                    for item in prepared_contexts
+                    if item["connection_key"] == connection_key
+                ]
+                try:
+                    sync_report, sync_exit = run_dbt_sync(
+                        client=client,
+                        model_id=context.model_id,
+                        branch_id=branch_id,
+                        refresh_mode=refresh_mode,
+                        poll_interval_seconds=config.dbt_sync.poll_interval_seconds,
+                        timeout_seconds=config.dbt_sync.timeout_seconds,
+                    )
+                except OmniFlowError as exc:
+                    sync_report = _dbt_sync_failure_report(
+                        context=context,
+                        refresh_mode=refresh_mode,
+                        exc=exc,
+                    )
+                    sync_exit = exc.exit_code
+                sync_report["connection_id"] = connection_id
+                sync_report["affected_model_ids"] = affected_model_ids
+                refresh_outcomes[connection_key] = (sync_report, sync_exit)
+                sync_reports.append(sync_report)
+                all_issues.extend(sync_report.get("issues", []))
+            else:
+                sync_report, sync_exit = refresh_outcomes[connection_key]
+
+            validation_report = None
+            validation_exit = ExitCodes.SUCCESS
+            if sync_exit == ExitCodes.SUCCESS and config.dbt_sync.post_sync_validation:
+                try:
+                    validation_report, validation_exit = _run_context(
+                        config=config,
+                        context=context,
+                        output_dir=validation_output_dir,
+                        api_key=sync_api_key,
+                        comparison_base_yaml_dir=prepared.get("comparison_base_yaml_dir"),
+                    )
+                except OmniFlowError as exc:
+                    validation_report, validation_exit = _write_context_failure_artifacts(
+                        config=config,
+                        context=context,
+                        output_dir=validation_output_dir,
+                        exc=exc,
+                    )
+
+            context_issues = list(sync_report.get("issues", []))
+            if validation_report:
+                context_issues.extend(validation_report.get("issues", []))
+            context_exit = max(sync_exit, validation_exit)
+            context_report = {
+                "model_id": context.model_id,
+                "model_path": context.model_path,
+                "base_branch": context.base_branch,
+                "connection_id": connection_id,
+                "refresh": sync_report,
+                "post_sync_validation": validation_report,
+                "post_sync_validation_status": (
+                    "not_run"
+                    if not config.dbt_sync.post_sync_validation or sync_exit != ExitCodes.SUCCESS
+                    else "failed"
+                    if validation_exit
+                    else "passed"
+                ),
+                "issues": context_issues,
+                "exit_code": context_exit,
+                "exit_code_reason": _exit_code_reason(context_exit),
+            }
+            model_reports.append(context_report)
+            if validation_report:
+                all_issues.extend(validation_report.get("issues", []))
+            exit_code = max(exit_code, context_exit)
+    finally:
+        if not config.security.retain_restricted_artifacts:
+            _purge_restricted_path(restricted_dir(output_dir))
+
+    summary = _summarize(all_issues)
+    summary.update(
+        {
+            "models_requested": len(contexts),
+            "refreshes_completed": sum(1 for report in sync_reports if report.get("status") == "completed"),
+            "refreshes_failed": sum(1 for report in sync_reports if report.get("status") != "completed"),
+        }
+    )
+    report = {
+        "tool": "omniflow",
+        "tool_version": __version__,
+        "operation": "dbt_sync",
+        "generated_at": utc_now_iso(),
+        "git_sha": current_sha(),
+        "git_branch": deployment_branch,
+        "pr_number": pr_number(),
+        "event_type": event_name(),
+        "runner": _runner_metadata(),
+        "models": [_context_dict(context) for context in contexts],
+        "config_hash": config.hash,
+        "refresh_mode": refresh_mode,
+        "post_sync_validation_enabled": config.dbt_sync.post_sync_validation,
+        "raw_query_results_stored": False,
+        "summary": summary,
+        "issues": all_issues,
+        "model_reports": model_reports,
+        "policy_decision": "fail" if exit_code else "pass",
+        "exit_code": exit_code,
+        "exit_code_reason": _exit_code_reason(exit_code),
+    }
+    public_report = write_public_reports(
+        report,
+        output_dir=output_dir,
+        formats=config.reporting.formats,
+        redaction_level=config.security.redaction_level,
+    )
+    sync_artifact = {
+        "tool": "omniflow",
+        "tool_version": __version__,
+        "operation": "dbt_sync",
+        "generated_at": utc_now_iso(),
+        "models": sync_reports,
+        "raw_query_results_stored": False,
+        "policy_decision": report["policy_decision"],
+        "exit_code": exit_code,
+    }
+    write_public_json(output_dir / "dbt-sync.json", sync_artifact, redaction_level=config.security.redaction_level)
+    write_public_json(
+        public_dir(output_dir) / "dbt-sync.json",
+        sync_artifact,
+        redaction_level=config.security.redaction_level,
+    )
+    evidence = {
+        "tool": "omniflow",
+        "tool_version": __version__,
+        "operation": "dbt_sync",
+        "config_hash": config.hash,
+        "git_sha": current_sha(),
+        "git_branch": deployment_branch,
+        "pr_number": pr_number(),
+        "event_type": event_name(),
+        "runner": _runner_metadata(),
+        "models": [_context_dict(context) for context in contexts],
+        "refresh_mode": refresh_mode,
+        "refresh_statuses": [report.get("status") for report in sync_reports],
+        "validation_status": "failed" if exit_code else "passed",
+        "policy_decision": "fail" if exit_code else "pass",
+        "raw_query_results_stored": False,
+        "exit_code": exit_code,
+        "exit_code_reason": _exit_code_reason(exit_code),
+        "timestamp": utc_now_iso(),
+    }
+    write_public_json(output_dir / "evidence.json", evidence, redaction_level=config.security.redaction_level)
+    write_public_json(
+        public_dir(output_dir) / "evidence.json",
+        evidence,
+        redaction_level=config.security.redaction_level,
+    )
+    write_artifact_manifest(
+        output_dir=output_dir,
+        restricted_artifacts_enabled=config.security.retain_restricted_artifacts,
+        redaction_level=config.security.redaction_level,
+    )
+    _emit_github_annotations(public_report.get("issues", []), limit=config.security.max_report_samples)
+    print(
+        "OmniFlow dbt sync complete: "
+        f"models={len(contexts)} refreshed={summary['refreshes_completed']} exit_code={exit_code}"
+    )
     return exit_code
 
 
@@ -994,6 +1290,7 @@ def _validate_run_output_layout(output_dir: Path) -> None:
         "report.sarif",
         "junit.xml",
         "evidence.json",
+        "dbt-sync.json",
         "repair.json",
         "repair.md",
     )
@@ -1015,6 +1312,7 @@ def _validate_context_output_layout(output_dir: Path) -> None:
         "dependencies.json",
         "contract-impact.json",
         "dbt-exposures.json",
+        "dbt-sync.json",
     ):
         validate_repo_output_path(output_dir / name)
     for name in ("yaml-base", "yaml-head"):
@@ -1104,6 +1402,29 @@ def _repair_failure_report(*, config, exc: OmniFlowError) -> dict[str, Any]:
         "exit_code": exc.exit_code,
         "exit_code_reason": _exit_code_reason(exc.exit_code),
         "issues": [{"validator": "ai_repair", "severity": "error", "message": redact(str(exc))}],
+    }
+
+
+def _dbt_sync_failure_report(
+    *,
+    context: ModelContext,
+    refresh_mode: str,
+    exc: OmniFlowError,
+) -> dict[str, Any]:
+    return {
+        "tool": "omniflow",
+        "tool_version": __version__,
+        "operation": "dbt_sync",
+        "generated_at": utc_now_iso(),
+        "model_id": context.model_id,
+        "branch_id": context.branch_id,
+        "refresh_mode": refresh_mode,
+        "status": "failed",
+        "raw_query_results_stored": False,
+        "issues": [{"validator": "dbt_sync", "severity": "error", "message": redact(str(exc))}],
+        "summary": {"total_issues": 1, "errors": 1, "warnings": 0},
+        "exit_code": exc.exit_code,
+        "exit_code_reason": _exit_code_reason(exc.exit_code),
     }
 
 

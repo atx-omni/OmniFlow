@@ -19,6 +19,7 @@ OmniFlow uses four evidence layers. A green result in one layer must not be pres
 | Semantic diff and lint | Unit change and rule tests | A harmless semantic change produces the expected risk summary |
 | Downstream contracts | Unit and simulator reference tests | Targeted content searches complete without coverage gaps |
 | dbt exposures | Unit normalization, partial coverage, failure policy, and simulator tests | Base and branch calls return expected dashboard and dependency counts |
+| Post-deployment dbt sync | Unit API contract, polling, event, branch, timeout, action, and evidence tests | Controlled refresh completes after a real dbt deployment and Git side effects are understood |
 | JSON, Markdown, SARIF, and JUnit | Unit render tests and packaged action tests | Public artifact downloads open and contain only redacted evidence |
 | GitHub annotations and PR summary | Unit escaping tests | A controlled PR displays warnings or errors and updates one bot comment |
 | AI Repair development scaffold | Unit rollback and safety tests | Maintainer-only non-production failure, repair, rerun, and rollback exercises |
@@ -57,11 +58,29 @@ Omni documents that exposure generation covers published dashboards in shared sp
 
 dbt exposure enrichment supplements OmniFlow's targeted Content Validator contract analysis. It does not replace it and it does not run `dbt build`.
 
+## Live Post-Deployment dbt Sync Gate
+
+Do not treat mocked refresh tests as proof that a customer connection will synchronize. Before enabling this stage in production:
+
+1. Use a non-production connection and model with the same dbt and Git settings as production.
+2. Confirm `base_branch` is present for every model in `.omni/flow.json`.
+3. Create the dedicated `OMNIFLOW_SYNC_API_KEY` protected-environment secret with the required Modeler or Connection Admin permission.
+4. Deploy a harmless dbt metadata change, such as a description, through the actual deployment command.
+5. Confirm a failed dbt command prevents the OmniFlow sync step from starting.
+6. Confirm the refresh returns a job ID, polling reaches `COMPLETED`, and post-sync validation passes.
+7. Verify the dbt change appears in the expected shared model or branch, depending on Branch based schema refresh.
+8. Inspect the Git repository for an Omni-generated commit or system-sync pull request and confirm it does not retrigger the dbt deployment workflow.
+9. Download `dbt-sync.json`, `report.json`, and `evidence.json`; verify model, branch, job, commit, and policy metadata, then confirm no token, raw payload, authored YAML, or query result is present.
+10. Exercise one controlled API failure or insufficient-permission token and confirm exit code `3` or `4` fails deployment completion without implying that the preceding dbt deployment was rolled back.
+
+Record this as adopter-specific live evidence. OmniFlow automation can prove that the documented API exchange and configured checks completed; it cannot independently prove that dbt transformed the intended production data or that a human approved a system-sync pull request.
+
 ## Intentionally Bounded Tests
 
 - Do not run `--unsafe-raw-output` against customer content as a routine test. Its behavior is covered with synthetic payloads.
 - Do not send secrets to fork pull requests. Fork routing is proven with withheld-secret tests and should fail closed for Omni changes.
 - Do not test AI rollback or destructive model changes against production models.
+- Do not test hard schema removals against production. Prove dbt sync with an additive non-production change first.
 - Dispatch the Release workflow on protected `main` to test the build, SPDX SBOM, checksums, and keyless signatures without publishing a release.
 - Do not publish a release merely to test release automation. Use a version tag and the protected release gate only for intentional versions.
 
