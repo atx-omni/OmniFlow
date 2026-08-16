@@ -50,7 +50,7 @@ def enabled_config(path: Path):
         "    post_sync_validation: true\n",
         encoding="utf-8",
     )
-    config = load_config(path)
+    config = load_config(path.resolve())
     config.semantic_lint.enabled = False
     config.contracts.enabled = False
     return config
