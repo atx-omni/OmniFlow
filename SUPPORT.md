@@ -16,13 +16,13 @@ Include:
 - OmniFlow version or full action commit SHA.
 - Python version and GitHub event type.
 - Exit code and redacted error text.
-- Which check failed: discovery, model validation, content validation, lint, diff, contracts, reporting, or workflow routing.
+- Which check failed: discovery, model validation, content validation, lint, diff, contracts, dbt refresh or polling, reporting, or workflow routing.
 - A minimal metadata-only example using placeholder IDs and names.
 - The redacted public report when it is safe to share.
 
 Do not include:
 
-- `OMNI_API_KEY` or any credential.
+- `OMNI_API_KEY`, `OMNIFLOW_SYNC_API_KEY`, or any credential.
 - Private tenant URLs, model IDs, branch IDs, repository URLs, or user IDs.
 - Customer model YAML or full Omni API responses.
 - Raw query results, PII, email addresses, document URLs, or restricted artifacts.

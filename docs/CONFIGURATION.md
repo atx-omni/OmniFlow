@@ -7,6 +7,7 @@ OmniFlow separates trusted model identity, optional policy, and secrets so each 
 | Model identity and routing | `.omni/flow.json` | Yes for `omniflow run --auto` |
 | Validation and reporting policy | `.omniflow.yml` | No |
 | Omni API key | `OMNI_API_KEY` environment variable or GitHub Actions secret | Yes for Omni validation |
+| dbt sync API key | `OMNIFLOW_SYNC_API_KEY` protected GitHub environment secret | Only for optional post-deployment sync |
 | AI repair API key | `OMNIFLOW_REPAIR_API_KEY` protected GitHub environment secret | Only for optional AI Repair |
 | Pull-request branch | GitHub event context | Discovered automatically |
 
@@ -30,7 +31,7 @@ OmniFlow separates trusted model identity, optional policy, and secrets so each 
 }
 ```
 
-Required model fields are `base_url`, `model_id`, and `model_path`. `base_branch`, `git_provider`, and `web_url` are recommended because `omniflow doctor --auto` can compare them with Omni's Git configuration when the API key permits that read.
+Required model fields are `base_url`, `model_id`, and `model_path`. `base_branch`, `git_provider`, and `web_url` are recommended because `omniflow doctor --auto` can compare them with Omni's Git configuration when the API key permits that read. `base_branch` is required when post-deployment dbt sync is enabled.
 
 Rules:
 
@@ -99,6 +100,32 @@ An unreferenced breaking change remains visible as risk but does not fail the de
 - `fail_on_unavailable`: defaults to `false`.
 
 The Omni dbt exposures endpoint has its own permission requirement. Reports distinguish dashboard records analyzed, mapped exposures, unmapped dashboards, and `available`, `partial`, or `unavailable` coverage. The endpoint covers published shared dashboards; private dashboards and workbooks are outside its documented scope. This check supplements downstream contract analysis; it does not replace Content Validator reference searches or run dbt commands.
+
+## Post-Deployment dbt Sync
+
+This deployment stage is independent from `checks.dbt_exposures`. It is disabled by default and is not part of `omniflow run --auto`.
+
+```yaml
+deployment:
+  dbt_sync:
+    enabled: true
+    refresh_mode: hard
+    poll_interval_seconds: 5
+    timeout_seconds: 900
+    post_sync_validation: true
+```
+
+| Setting | Default | Allowed range or behavior |
+| --- | --- | --- |
+| `enabled` | `false` | Must be enabled in trusted base-branch policy. |
+| `refresh_mode` | `hard` | `hard` removes dropped objects; `soft` is additive only. |
+| `poll_interval_seconds` | `5` | `2` through `30`; Omni recommends 2-5 seconds. |
+| `timeout_seconds` | `900` | `30` through `3600`. |
+| `post_sync_validation` | `true` | Reruns all enabled checks after refresh completes. |
+
+The sync token is read only from `OMNIFLOW_SYNC_API_KEY`. It must be a dedicated PAT with Modeler permission for a connection containing one shared model or Connection Admin permission for a connection containing multiple shared models. When `post_sync_validation` is enabled, that same dedicated deployment user also needs the read permissions required by the enabled checks. Pull-request validation and AI repair action modes never receive this token.
+
+`omniflow dbt sync --auto` selects all trusted model records whose `base_branch` exactly matches the current deployment branch. In GitHub Actions it accepts only `push` and `workflow_dispatch`, rejects tags and pull requests, and writes no raw response or query-result data. See [Post-Deployment dbt Synchronization](DBT_SYNC.md).
 
 ## Semantic Lint
 
@@ -182,5 +209,7 @@ omniflow run --auto --config .omniflow.yml
 ```
 
 The API key is always read from `OMNI_API_KEY`. Never add it to either configuration file.
+
+For an explicit local dbt sync test, `--base-url`, `--model-id`, and `--base-branch` are all required. The supported protected workflow uses `omniflow dbt sync --auto` and trusted `.omni/flow.json` metadata.
 
 `omniflow repair ai --auto` is intentionally not a local debug shortcut. It additionally requires a trusted same-repository `pull_request_target` label event, protected workflow, GitHub token, and `OMNIFLOW_REPAIR_API_KEY`.

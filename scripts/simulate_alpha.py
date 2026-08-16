@@ -66,6 +66,13 @@ base_view: orders
 }
 
 
+SYNC_HEAD_FILES = {
+    **BASE_FILES,
+    "views/orders.view": BASE_FILES["views/orders.view"]
+    + "  dbt_sync_marker:\n    type: string\n    description: Added by simulated dbt deployment\n",
+}
+
+
 @dataclass(frozen=True)
 class Scenario:
     name: str
@@ -77,6 +84,7 @@ class Scenario:
     config: str | None = None
     include_api_key: bool = True
     model_ids: tuple[str, ...] = (MODEL_ID,)
+    operation: str = "validate"
 
 
 SCENARIOS = [
@@ -177,14 +185,44 @@ checks:
     fail_on_unavailable: false
 """,
     ),
+    Scenario(
+        name="dbt_sync_success",
+        description="production dbt deployment should refresh a shared connection once and revalidate every model",
+        expected_exit=0,
+        changed_files="models/marts/fct_orders.sql",
+        model_ids=(MODEL_ID, SECOND_MODEL_ID),
+        operation="dbt_sync",
+        config="""deployment:
+  dbt_sync:
+    enabled: true
+    poll_interval_seconds: 2
+    timeout_seconds: 30
+""",
+    ),
+    Scenario(
+        name="dbt_sync_job_failure",
+        description="failed Omni schema refresh should block the deployment with API exit code 4",
+        expected_exit=4,
+        changed_files="models/marts/fct_orders.sql",
+        operation="dbt_sync",
+        server_mode="sync_failed",
+        config="""deployment:
+  dbt_sync:
+    enabled: true
+    poll_interval_seconds: 2
+    timeout_seconds: 30
+""",
+    ),
 ]
 
 
 class FakeOmniState:
     def __init__(self, scenario: Scenario) -> None:
         self.mode = scenario.server_mode
+        self.operation = scenario.operation
         self.model_ids = scenario.model_ids
         self.requests: list[dict[str, Any]] = []
+        self.refreshed = False
 
 
 def make_handler(state: FakeOmniState):
@@ -195,9 +233,22 @@ def make_handler(state: FakeOmniState):
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
             query = parse_qs(parsed.query)
-            state.requests.append({"path": parsed.path, "query": query})
+            state.requests.append({"method": "GET", "path": parsed.path, "query": query})
             try:
-                payload, status = route_request(state, parsed.path, query)
+                payload, status = route_request(state, "GET", parsed.path, query)
+            except Exception as exc:  # noqa: BLE001 - simulation server should surface unexpected behavior.
+                payload, status = {"error": str(exc)}, 500
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(payload).encode("utf-8"))
+
+        def do_POST(self) -> None:
+            parsed = urlparse(self.path)
+            query = parse_qs(parsed.query)
+            state.requests.append({"method": "POST", "path": parsed.path, "query": query})
+            try:
+                payload, status = route_request(state, "POST", parsed.path, query)
             except Exception as exc:  # noqa: BLE001 - simulation server should surface unexpected behavior.
                 payload, status = {"error": str(exc)}, 500
             self.send_response(status)
@@ -208,10 +259,29 @@ def make_handler(state: FakeOmniState):
     return Handler
 
 
-def route_request(state: FakeOmniState, path: str, query: dict[str, list[str]]) -> tuple[Any, int]:
-    if path == "/api/v1/models":
+def route_request(
+    state: FakeOmniState,
+    method: str,
+    path: str,
+    query: dict[str, list[str]],
+) -> tuple[Any, int]:
+    if method == "GET" and path == "/api/v1/models":
         records = []
-        if state.mode != "missing_branch":
+        requested_model_ids = query.get("modelId", [])
+        requested_connection_ids = query.get("connectionId", [])
+        if requested_model_ids or requested_connection_ids:
+            records.extend(
+                {
+                    "id": model_id,
+                    "baseModelId": model_id,
+                    "connectionId": "connection-1",
+                    "modelKind": "SHARED",
+                    "name": f"Simulated {model_id}",
+                }
+                for model_id in state.model_ids
+                if not requested_model_ids or model_id in requested_model_ids
+            )
+        elif state.mode != "missing_branch":
             records.extend(
                 {
                     "id": branch_id_for(model_id),
@@ -222,8 +292,14 @@ def route_request(state: FakeOmniState, path: str, query: dict[str, list[str]]) 
                 for model_id in state.model_ids
             )
         return {"records": records, "pageInfo": {}}, 200
+    if method == "GET" and path == "/api/v1/jobs/job-1/status":
+        status = "FAILED" if state.mode == "sync_failed" else "COMPLETED"
+        return {"job_type": "refresh_schema", "job_id": "job-1", "status": status}, 200
     for model_id in state.model_ids:
-        if path == f"/api/v1/models/{model_id}/git":
+        if method == "POST" and path == f"/api/v1/models/{model_id}/refresh":
+            state.refreshed = True
+            return {"jobId": "job-1", "modelId": model_id, "status": "running"}, 200
+        if method == "GET" and path == f"/api/v1/models/{model_id}/git":
             return {
                 "modelPath": model_path_for(model_id),
                 "baseBranch": "main",
@@ -233,19 +309,22 @@ def route_request(state: FakeOmniState, path: str, query: dict[str, list[str]]) 
                 "gitFollower": False,
                 "requirePullRequest": True,
             }, 200
-        if path == f"/api/v1/models/{model_id}/validate":
+        if method == "GET" and path == f"/api/v1/models/{model_id}/validate":
             return [], 200
-        if path == f"/api/v1/models/{model_id}/yaml":
-            files = HEAD_FILES if query.get("branchId") == [branch_id_for(model_id)] else BASE_FILES
+        if method == "GET" and path == f"/api/v1/models/{model_id}/yaml":
+            if state.operation == "dbt_sync" and state.refreshed:
+                files = SYNC_HEAD_FILES
+            else:
+                files = HEAD_FILES if query.get("branchId") == [branch_id_for(model_id)] else BASE_FILES
             return {"files": files, "checksums": {name: f"checksum-{name}" for name in files}}, 200
-        if path == f"/api/v1/models/{model_id}/content-validator":
+        if method == "GET" and path == f"/api/v1/models/{model_id}/content-validator":
             if query.get("find") == ["orders.revenue"] and query.get("find_type") == ["FIELD"]:
                 return content_payload("Executive Revenue", "alice@example.com"), 200
             return {"content": []}, 200
-    if path == "/api/v1/content":
+    if method == "GET" and path == "/api/v1/content":
         return {"records": [{"identifier": "dash-1", "labels": [{"name": "Verified"}]}], "pageInfo": {}}, 200
     for model_id in state.model_ids:
-        if path == f"/api/v1/models/{model_id}/dbt-exposures":
+        if method == "GET" and path == f"/api/v1/models/{model_id}/dbt-exposures":
             if state.mode == "exposures_403":
                 return {"error": "forbidden"}, 403
             records = [
@@ -338,7 +417,7 @@ def run_scenario(scenario: Scenario, *, keep_workdir: bool) -> dict[str, Any]:
         setup_repo(repo, base_url=base_url, scenario=scenario)
         completed = run_omniflow(repo, scenario)
         artifacts = inspect_artifacts(repo)
-        passed, errors = assert_result(scenario, completed.returncode, artifacts)
+        passed, errors = assert_result(scenario, completed.returncode, artifacts, state.requests)
         return {
             "name": scenario.name,
             "description": scenario.description,
@@ -398,9 +477,15 @@ security:
     (repo / ".omniflow.yml").write_text(config, encoding="utf-8")
     run(["git", "add", "."], cwd=repo)
     run(["git", "commit", "-q", "-m", "base"], cwd=repo)
-    run(["git", "checkout", "-q", "-b", BRANCH_NAME], cwd=repo)
+    if scenario.operation == "validate":
+        run(["git", "checkout", "-q", "-b", BRANCH_NAME], cwd=repo)
     apply_changed_files(repo, scenario.changed_files)
-    event = {"pull_request": {"body": marker_body(scenario), "number": 1}}
+    if scenario.operation == "dbt_sync":
+        run(["git", "add", "."], cwd=repo)
+        run(["git", "commit", "-q", "-m", "deploy dbt"], cwd=repo)
+        event = {"ref": "refs/heads/main", "commits": []}
+    else:
+        event = {"pull_request": {"body": marker_body(scenario), "number": 1}}
     write_json(repo / "event.json", event)
 
 
@@ -429,21 +514,54 @@ def marker_body(scenario: Scenario) -> str:
 
 def run_omniflow(repo: Path, scenario: Scenario) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
-    env.pop("OMNI_API_KEY", None)
-    env.update(
-        {
-            "PYTHONPATH": str(SRC),
-            "GITHUB_HEAD_REF": BRANCH_NAME,
-            "GITHUB_BASE_REF": "main",
-            "GITHUB_EVENT_NAME": "pull_request",
-            "GITHUB_EVENT_PATH": str(repo / "event.json"),
-            "OMNIFLOW_CHANGED_FILES": scenario.changed_files,
-        }
-    )
-    if scenario.include_api_key:
+    for name in (
+        "OMNI_API_KEY",
+        "OMNIFLOW_SYNC_API_KEY",
+        "GITHUB_ACTIONS",
+        "GITHUB_HEAD_REF",
+        "GITHUB_BASE_REF",
+        "GITHUB_EVENT_NAME",
+        "GITHUB_REF_NAME",
+        "GITHUB_REF_TYPE",
+        "OMNIFLOW_CHANGED_FILES",
+    ):
+        env.pop(name, None)
+    env["PYTHONPATH"] = str(SRC)
+    env["GITHUB_EVENT_PATH"] = str(repo / "event.json")
+    if scenario.operation == "dbt_sync":
+        env.update(
+            {
+                "GITHUB_ACTIONS": "true",
+                "GITHUB_EVENT_NAME": "push",
+                "GITHUB_REF_NAME": "main",
+                "GITHUB_REF_TYPE": "branch",
+                "OMNIFLOW_SYNC_API_KEY": "simulation-sync-secret",  # pragma: allowlist secret
+            }
+        )
+        command = [
+            sys.executable,
+            "-m",
+            "omniflow.cli",
+            "dbt",
+            "sync",
+            "--auto",
+            "--config",
+            ".omniflow.yml",
+        ]
+    else:
+        env.update(
+            {
+                "GITHUB_HEAD_REF": BRANCH_NAME,
+                "GITHUB_BASE_REF": "main",
+                "GITHUB_EVENT_NAME": "pull_request",
+                "OMNIFLOW_CHANGED_FILES": scenario.changed_files,
+            }
+        )
+        command = [sys.executable, "-m", "omniflow.cli", "run", "--auto", "--config", ".omniflow.yml"]
+    if scenario.include_api_key and scenario.operation == "validate":
         env["OMNI_API_KEY"] = "simulation-secret"  # pragma: allowlist secret
     return subprocess.run(
-        [sys.executable, "-m", "omniflow.cli", "run", "--auto", "--config", ".omniflow.yml"],
+        command,
         cwd=repo,
         env=env,
         text=True,
@@ -458,7 +576,13 @@ def inspect_artifacts(repo: Path) -> dict[str, Any]:
     if not root.exists():
         return artifacts
     artifacts["files"] = sorted(str(path.relative_to(root)) for path in root.rglob("*") if path.is_file())
-    for relative in ("report.json", "public/report.json", "public/report.md", "artifact-manifest.json"):
+    for relative in (
+        "report.json",
+        "public/report.json",
+        "public/report.md",
+        "public/dbt-sync.json",
+        "artifact-manifest.json",
+    ):
         path = root / relative
         if path.exists():
             artifacts[relative] = path.read_text(encoding="utf-8")
@@ -470,7 +594,12 @@ def inspect_artifacts(repo: Path) -> dict[str, Any]:
     return artifacts
 
 
-def assert_result(scenario: Scenario, exit_code: int, artifacts: dict[str, Any]) -> tuple[bool, list[str]]:
+def assert_result(
+    scenario: Scenario,
+    exit_code: int,
+    artifacts: dict[str, Any],
+    requests: list[dict[str, Any]],
+) -> tuple[bool, list[str]]:
     errors = []
     if exit_code != scenario.expected_exit:
         errors.append(f"expected exit {scenario.expected_exit}, got {exit_code}")
@@ -479,10 +608,12 @@ def assert_result(scenario: Scenario, exit_code: int, artifacts: dict[str, Any])
     if "public/report.json" not in artifacts.get("files", []):
         errors.append("missing public/report.json")
     public_text = artifacts.get("public/report.json", "")
+    public_blob = public_text + artifacts.get("public/report.md", "") + artifacts.get("public/dbt-sync.json", "")
     if (
-        "simulation-secret" in public_text
-        or "alice@example.com" in public_text
-        or "https://omni.example/dashboards" in public_text
+        "simulation-secret" in public_blob
+        or "simulation-sync-secret" in public_blob
+        or "alice@example.com" in public_blob
+        or "https://omni.example/dashboards" in public_blob
     ):
         errors.append("public report leaked secret/email/dashboard URL")
     if scenario.name == "strict_redaction" and "Executive Revenue" in public_text:
@@ -524,6 +655,51 @@ def assert_result(scenario: Scenario, exit_code: int, artifacts: dict[str, Any])
             errors.append("reviewer Markdown omitted successful dbt exposure coverage")
         if scenario.name == "exposures_partial" and not exposure_report.get("coverage_gaps"):
             errors.append("partial dbt exposure coverage did not produce a coverage gap")
+    if scenario.operation == "dbt_sync":
+        if "public/dbt-sync.json" not in artifacts.get("files", []):
+            errors.append("dbt sync run did not emit public/dbt-sync.json")
+        report = artifacts.get("public/report.json:json", {})
+        sync = artifacts.get("public/dbt-sync.json:json", {})
+        refresh_posts = [
+            request
+            for request in requests
+            if request.get("method") == "POST" and str(request.get("path", "")).endswith("/refresh")
+        ]
+        if len(refresh_posts) != 1:
+            errors.append(f"dbt sync expected one connection refresh, got {len(refresh_posts)}")
+        refresh_index = requests.index(refresh_posts[0]) if refresh_posts else len(requests)
+        if refresh_posts:
+            pre_refresh_yaml_reads = [
+                request
+                for request in requests[:refresh_index]
+                if request.get("method") == "GET" and str(request.get("path", "")).endswith("/yaml")
+            ]
+            if len(pre_refresh_yaml_reads) != len(scenario.model_ids):
+                errors.append("dbt sync did not snapshot every affected model before the refresh POST")
+        if scenario.name == "dbt_sync_success":
+            if report.get("summary", {}).get("models_requested") != 2:
+                errors.append("dbt sync did not retain both configured model validations")
+            if report.get("summary", {}).get("refreshes_completed") != 1:
+                errors.append("dbt sync did not deduplicate the shared connection refresh")
+            if any(
+                item.get("post_sync_validation_status") != "passed"
+                for item in report.get("model_reports", [])
+            ):
+                errors.append("dbt sync did not complete post-refresh validation for every model")
+            affected = (sync.get("models") or [{}])[0].get("affected_model_ids", [])
+            if affected != [MODEL_ID, SECOND_MODEL_ID]:
+                errors.append("dbt sync evidence omitted affected models")
+            post_refresh_yaml_reads = [
+                request
+                for request in requests[refresh_index + 1 :]
+                if request.get("method") == "GET" and str(request.get("path", "")).endswith("/yaml")
+            ]
+            if len(post_refresh_yaml_reads) < len(scenario.model_ids):
+                errors.append("dbt sync did not compare post-refresh YAML for every affected model")
+        if scenario.name == "dbt_sync_job_failure":
+            statuses = [item.get("status") for item in sync.get("models", [])]
+            if statuses != ["failed"]:
+                errors.append("failed schema refresh did not retain normalized failure status")
     return not errors, errors
 
 

@@ -73,6 +73,84 @@ class OmniClientTests(unittest.TestCase):
         self.assertEqual(client.resolve_branch_id("model-1", "feature/a"), "branch-1")
         self.assertTrue(session.calls[0][2]["stream"])
 
+    def test_model_metadata_returns_only_the_documented_connection_identity(self):
+        session = FakeSession(
+            [
+                FakeResponse(
+                    {
+                        "records": [
+                            {
+                                "id": "model-1",
+                                "connectionId": "connection-1",
+                                "name": "private model name",
+                            }
+                        ],
+                        "pageInfo": {},
+                    }
+                )
+            ]
+        )
+        client = OmniClient(base_url="https://omni.example", api_key=FAKE_API_KEY, session=session)
+        self.assertEqual(
+            client.get_model_metadata("model-1"),
+            {"model_id": "model-1", "connection_id": "connection-1"},
+        )
+        self.assertEqual(session.calls[0][2]["params"]["modelId"], "model-1")
+
+    def test_connection_refresh_coverage_returns_only_shared_model_ids(self):
+        session = FakeSession(
+            [
+                FakeResponse(
+                    {
+                        "records": [
+                            {
+                                "id": "model-1",
+                                "connectionId": "connection-1",
+                                "modelKind": "SHARED",
+                            },
+                            {
+                                "id": "model-2",
+                                "connectionId": "connection-1",
+                                "modelKind": "SHARED_EXTENSION",
+                            },
+                            {
+                                "id": "branch-1",
+                                "connectionId": "connection-1",
+                                "modelKind": "BRANCH",
+                            },
+                        ],
+                        "pageInfo": {},
+                    }
+                )
+            ]
+        )
+        client = OmniClient(base_url="https://omni.example", api_key=FAKE_API_KEY, session=session)
+        self.assertEqual(
+            client.list_refresh_affected_model_ids("connection-1"),
+            ["model-1", "model-2"],
+        )
+        self.assertEqual(session.calls[0][2]["params"]["connectionId"], "connection-1")
+
+    def test_connection_refresh_coverage_rejects_mismatches_and_empty_results(self):
+        payloads = (
+            {
+                "records": [
+                    {"id": "model-1", "connectionId": "other", "modelKind": "SHARED"},
+                ],
+                "pageInfo": {},
+            },
+            {"records": [], "pageInfo": {}},
+        )
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                client = OmniClient(
+                    base_url="https://omni.example",
+                    api_key=FAKE_API_KEY,
+                    session=FakeSession([FakeResponse(payload)]),
+                )
+                with self.assertRaises(OmniAPIError):
+                    client.list_refresh_affected_model_ids("connection-1")
+
     def test_retries_429(self):
         session = FakeSession([FakeResponse({}, status_code=429), FakeResponse([], status_code=200)])
         client = OmniClient(base_url="https://omni.example", api_key=FAKE_API_KEY, session=session)
@@ -171,6 +249,62 @@ class OmniClientTests(unittest.TestCase):
         _, url, kwargs = session.calls[0]
         self.assertEqual(url, "https://omni.example/api/v1/models/model-1/dbt-exposures")
         self.assertEqual(kwargs["params"]["branch_id"], "branch-1")
+
+    def test_schema_refresh_uses_documented_async_job_contract(self):
+        session = FakeSession(
+            [
+                FakeResponse({"jobId": "job-1", "modelId": "model-1", "status": "running"}),
+                FakeResponse(
+                    {
+                        "job_type": "refresh_schema",
+                        "job_id": "job-1",
+                        "status": "COMPLETED",
+                        "private_future_field": "discard me",
+                    }
+                ),
+            ]
+        )
+        client = OmniClient(base_url="https://omni.example", api_key=FAKE_API_KEY, session=session)
+        self.assertEqual(
+            client.start_schema_refresh("model-1", branch_id="branch-1", hard_refresh=False),
+            {"job_id": "job-1", "model_id": "model-1", "status": "RUNNING"},
+        )
+        self.assertEqual(
+            client.get_schema_refresh_job_status("job-1"),
+            {"job_id": "job-1", "job_type": "refresh_schema", "status": "COMPLETED"},
+        )
+        method, url, kwargs = session.calls[0]
+        self.assertEqual(method, "POST")
+        self.assertEqual(url, "https://omni.example/api/v1/models/model-1/refresh")
+        self.assertEqual(kwargs["params"], {"hard_refresh": "false", "branch_id": "branch-1"})
+        self.assertEqual(session.calls[1][1], "https://omni.example/api/v1/jobs/job-1/status")
+
+    def test_schema_refresh_start_is_not_retried_because_it_is_not_idempotent(self):
+        session = FakeSession([FakeResponse({}, status_code=500)])
+        client = OmniClient(base_url="https://omni.example", api_key=FAKE_API_KEY, session=session)
+        with self.assertRaises(OmniAPIError):
+            client.start_schema_refresh("model-1")
+        self.assertEqual(len(session.calls), 1)
+
+    def test_schema_refresh_rejects_mismatched_ids_and_unknown_statuses(self):
+        payloads = (
+            ("start", {"jobId": "job-1", "modelId": "other", "status": "running"}),
+            ("status", {"job_type": "refresh_schema", "job_id": "other", "status": "COMPLETED"}),
+            ("status", {"job_type": "other", "job_id": "job-1", "status": "COMPLETED"}),
+            ("status", {"job_type": "refresh_schema", "job_id": "job-1", "status": "UNKNOWN"}),
+        )
+        for operation, payload in payloads:
+            with self.subTest(operation=operation, payload=payload):
+                client = OmniClient(
+                    base_url="https://omni.example",
+                    api_key=FAKE_API_KEY,
+                    session=FakeSession([FakeResponse(payload)]),
+                )
+                with self.assertRaises(OmniAPIError):
+                    if operation == "start":
+                        client.start_schema_refresh("model-1")
+                    else:
+                        client.get_schema_refresh_job_status("job-1")
 
     def test_content_metadata_uses_documented_organization_scope(self):
         session = FakeSession([FakeResponse({"records": [], "pageInfo": {}})])

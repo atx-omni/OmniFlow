@@ -101,6 +101,37 @@ Confirm that the workflow:
 - Has outbound access to Python package dependencies.
 - Has not changed the action's hash-locked dependency file or replaced the trusted installation step.
 
+## Post-Deployment dbt Sync Results
+
+### Missing `OMNIFLOW_SYNC_API_KEY`
+
+Confirm the secret exists inside the protected `omniflow-production` GitHub environment and the action passes it through `sync-api-key`. Do not put it in `.omniflow.yml` or `.omni/flow.json`. Use a dedicated PAT rather than the validation or AI repair identity.
+
+### Sync Is Disabled
+
+`omniflow dbt sync --auto` requires `deployment.dbt_sync.enabled: true` in trusted policy. This fail-closed behavior prevents a workflow addition from silently introducing a write-capable deployment stage before policy review.
+
+### Wrong Event Or Branch
+
+The sync command accepts only base-branch `push` and reviewed `workflow_dispatch` runs in GitHub Actions. Pull requests, tags, schedules, and branch names that differ from `.omni/flow.json` `base_branch` exit with security code `5`. Run ordinary `omniflow run --auto` for pull-request validation.
+
+### Refresh Returns HTTP 400
+
+Check Omni's **Branch based schema refresh** setting:
+
+- When disabled, remove `OMNI_BRANCH_ID` and `OMNI_BRANCH_NAME` from the deployment environment.
+- When enabled, provide an existing branch ID or a branch name the token can resolve.
+
+Omni's API rejects a branch ID when the setting is disabled and requires one when it is enabled. OmniFlow does not infer or create a deployment branch because that could refresh or promote the wrong model state.
+
+### Refresh Job Failed Or Timed Out
+
+Open the model or connection in Omni and inspect the schema refresh status. Confirm dbt finished successfully, the token has Modeler or Connection Admin permission required for that connection, and the configured timeout is sufficient for the model size. OmniFlow records only the job ID and normalized status; do not paste raw API responses into an issue.
+
+### Refresh Triggered Another Deployment
+
+Limit the dbt deployment workflow's `push.paths` to dbt source files and exclude generated Omni model paths. Review Omni Git settings for **Require for system syncs** and Branch based schema refresh. Stop the workflow until the path filter is corrected; repeated refreshes can create repeated generated commits or pull requests.
+
 ## AI Repair Results
 
 AI Repair is an unreleased maintainer scaffold and must not be enabled for customer use. See [the AI Repair guide](AI_REPAIR.md) for the release blocker. Never troubleshoot repair by pasting model YAML, the AI prompt, a result summary, or a token into a GitHub issue.

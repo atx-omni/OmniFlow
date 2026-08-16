@@ -1,8 +1,8 @@
 name: OmniFlow
-description: Security-first validation for Omni semantic-layer changes.
+description: Security-first validation and post-deployment synchronization for Omni semantic-layer changes.
 inputs:
   mode:
-    description: Operation to run. Supported values are validate and repair.
+    description: Operation to run. Supported values are validate, repair, and dbt-sync.
     required: false
     default: validate
   config:
@@ -14,6 +14,9 @@ inputs:
     required: false
   repair-api-key:
     description: Separate write-capable Omni PAT. Exposed only to the opt-in repair step.
+    required: false
+  sync-api-key:
+    description: Dedicated Modeler or Connection Admin PAT. Exposed only to the protected dbt sync step.
     required: false
   skip-reason:
     description: Record a successful skipped run without exposing the Omni API key.
@@ -58,8 +61,14 @@ runs:
               exit 2
             fi
             ;;
+          dbt-sync)
+            if [ -n "$OMNIFLOW_INPUT_SKIP_REASON" ]; then
+              echo "skip-reason is supported only in validate mode" >&2
+              exit 2
+            fi
+            ;;
           *)
-            echo "mode must be validate or repair" >&2
+            echo "mode must be validate, repair, or dbt-sync" >&2
             exit 2
             ;;
         esac
@@ -108,3 +117,13 @@ runs:
       run: |
         set -euo pipefail
         omniflow repair ai --auto --config "$OMNIFLOW_INPUT_CONFIG"
+
+    - name: Synchronize dbt metadata into Omni
+      if: inputs.mode == 'dbt-sync'
+      shell: bash
+      env:
+        OMNIFLOW_SYNC_API_KEY: ${{ inputs['sync-api-key'] }}
+        OMNIFLOW_INPUT_CONFIG: ${{ inputs.config }}
+      run: |
+        set -euo pipefail
+        omniflow dbt sync --auto --config "$OMNIFLOW_INPUT_CONFIG"

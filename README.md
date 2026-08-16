@@ -1,8 +1,8 @@
 # OmniFlow
 
-OmniFlow is an open-source, local-first CI gate for Omni semantic-layer development. It runs in a customer's GitHub repository when an Omni branch opens a pull request, validates the model and its downstream content, and produces review and audit evidence before merge.
+OmniFlow is an open-source, local-first CI/CD companion for Omni semantic-layer development. It runs in a customer's GitHub repository when an Omni branch opens a pull request, validates the model and its downstream content, and can synchronize Omni after an approved production dbt deployment.
 
-> **Status:** Controlled alpha. The complete Omni-created PR, validation, evidence, merge, and Omni synchronization path has passed on a maintainer-controlled non-production model. Each adopter must still complete the live installation gate against its own model, permissions, GitHub plan, and branch protections before making OmniFlow a required check.
+> **Status:** Controlled alpha. The complete Omni-created PR, validation, evidence, merge, and Omni synchronization path has passed on a maintainer-controlled non-production model. The post-deployment dbt schema-refresh stage has automated contract coverage but still requires its first live non-production connection test. Each adopter must complete the live installation gate against its own model, permissions, dbt deployment, Git settings, GitHub plan, and branch protections before making OmniFlow a required check.
 
 ## Quick Start
 
@@ -15,6 +15,7 @@ The complete walkthrough is in [Install OmniFlow In A GitHub Repository](docs/IN
 5. Optionally copy [`.omniflow.example.yml`](.omniflow.example.yml) to `.omniflow.yml`, then merge the setup files through the protected process.
 6. Create a dedicated least-privilege Omni personal access token and store it as the GitHub Actions secret `OMNI_API_KEY`. Do not use an Organization API Key.
 7. Create a harmless model change in an Omni branch, select **Create pull request**, and confirm OmniFlow validates the resulting GitHub pull request.
+8. For repositories that deploy dbt, optionally add the protected [post-deployment dbt sync](docs/DBT_SYNC.md) after the production dbt command succeeds.
 
 After the first live run succeeds, make the OmniFlow check required in GitHub branch protection. Continue with the [installation checklist](docs/INSTALLATION.md#step-9-verify-the-installation) before treating OmniFlow as a merge gate.
 
@@ -28,6 +29,7 @@ The workflow always preserves `report.sarif` in the evidence artifact. Repositor
 - Semantic lint rules for descriptions, primary keys, labels, topic owners, cardinality, and governance
 - Breaking semantic changes and the dashboards, reports, and queries that reference them
 - Optional, branch-aware dbt exposure metadata
+- Optional post-deployment dbt metadata refresh with asynchronous job polling and full revalidation
 - JSON, Markdown, SARIF, JUnit, and evidence artifacts
 
 Core OmniFlow validation does not execute warehouse queries, store query results, write model YAML, or merge pull requests. An [AI Repair development scaffold](docs/AI_REPAIR.md) is present but is disabled, unreleased, and not supported for customer installation because Omni does not currently document a public Modeling Agent mutation API.
@@ -43,6 +45,7 @@ Core OmniFlow validation does not execute warehouse queries, store query results
 7. The pull request receives a redacted reviewer summary; detailed artifacts remain restricted to the runner unless explicitly uploaded.
 8. GitHub branch protection blocks merge when required OmniFlow checks fail.
 9. After review and approval, the pull request is merged. Omni's configured pull-request webhook promotes the Omni branch and publishes associated draft content.
+10. When the repository also deploys dbt, the protected production job can run `omniflow dbt sync --auto` after dbt succeeds, then rerun every enabled OmniFlow check against the refreshed model.
 
 The unreleased AI Repair scaffold is not part of this customer workflow. It must remain disabled until Omni publishes a supported Modeling Agent API contract.
 
@@ -126,6 +129,12 @@ GitHub may require a Team or Enterprise organization plan to enforce rulesets or
 
 Do not install AI Repair for customer use. The repository contains a guarded development scaffold, but the documented AI Jobs API is query-oriented and does not expose the Modeling Agent's branch-editing behavior. See [AI Repair Development Scaffold](docs/AI_REPAIR.md) for the blocker and safety design.
 
+### 7. Optional Post-Deployment dbt Sync
+
+Repositories that deploy dbt can enable a separate protected action mode after the production dbt command. It calls Omni's documented schema refresh API, polls the job to a terminal state, and reruns all enabled checks. It is disabled by default and never runs for repositories without the `deployment.dbt_sync.enabled` policy.
+
+The command rejects pull-request events and non-base branches. Use a dedicated `OMNIFLOW_SYNC_API_KEY` protected environment secret and restrict workflow paths to dbt source files so Omni-generated Git commits cannot create a deployment loop. See [Post-Deployment dbt Synchronization](docs/DBT_SYNC.md).
+
 ## Trust And Routing
 
 The example uses GitHub's `pull_request_target` event but never checks out or executes proposed PR code. A credential-free preflight retrieves changed filenames through GitHub's API and reads `.omni/flow.json`, `.omniflow.yml`, and the workflow itself from the trusted base branch. Only a selected Omni model context starts the validation process with `OMNI_API_KEY`; skipped PRs never inject it. This prevents a same-repository pull request from changing `base_url`, disabling gates, enabling unsafe output, replacing the action, or redirecting the token.
@@ -163,6 +172,7 @@ Each run writes root and redacted public summaries:
   report.sarif
   junit.xml
   evidence.json
+  dbt-sync.json          # present for dbt synchronization runs
   artifact-manifest.json
   public/
   restricted/<model_id>/
@@ -179,6 +189,7 @@ The unreleased AI Repair scaffold emits `repair.json` and `repair.md` during mai
 ```bash
 omniflow doctor --auto
 omniflow run --auto
+omniflow dbt sync --auto
 omniflow repair ai --auto
 omniflow content validate --base-url https://example.omniapp.co --model-id <id>
 omniflow model validate --base-url https://example.omniapp.co --model-id <id>
@@ -196,6 +207,7 @@ Exit codes are `0` success, `1` validation failure, `2` configuration error, `3`
 - [Step-by-step installation](docs/INSTALLATION.md)
 - [Configuration reference](docs/CONFIGURATION.md)
 - [Testing and live validation](docs/TESTING.md)
+- [Post-deployment dbt synchronization](docs/DBT_SYNC.md)
 - [AI Repair development scaffold](docs/AI_REPAIR.md)
 - [Troubleshooting](docs/TROUBLESHOOTING.md)
 - [Support and safe diagnostic sharing](SUPPORT.md)
@@ -220,7 +232,7 @@ python -m build
 twine check dist/*
 ```
 
-The simulation covers same-repository, fork, and multi-model routing; contract failures; strict redaction; missing branches; malicious PR metadata; successful and partial dbt exposure coverage; and optional API failures. The maintainers have also completed end-to-end live validation on a non-production model. Neither result replaces the adopter-specific live gate for actual Omni PR metadata, tenant permissions, branch mapping, Content Validator coverage, dbt exposure coverage, GitHub annotations/comments, branch-protection enforcement, or webhook promotion. Use the [testing matrix](docs/TESTING.md) to distinguish automated, live-tenant, and release evidence.
+The simulation covers same-repository, fork, and multi-model routing; contract failures; strict redaction; missing branches; malicious PR metadata; successful and partial dbt exposure coverage; one-refresh-per-connection dbt synchronization; post-sync revalidation; and refresh-job failure. The maintainers have also completed end-to-end live pull-request validation on a non-production model. Neither result replaces the adopter-specific live gate for actual Omni PR metadata, tenant permissions, branch mapping, Content Validator coverage, dbt exposure coverage, schema refresh and Git side effects, GitHub annotations/comments, branch-protection enforcement, or webhook promotion. Use the [testing matrix](docs/TESTING.md) to distinguish automated, live-tenant, and release evidence.
 
 ## Maintainer Release Setup
 
@@ -234,6 +246,8 @@ PyPI publication is intentionally disabled until maintainers secure the project 
 - [Omni model validation API](https://docs.omni.co/api/models/validate-model)
 - [Omni Content Validator API](https://docs.omni.co/api/content-validator/validate-content)
 - [Omni dbt exposures API](https://docs.omni.co/api/dbt/get-dbt-exposures)
+- [Omni schema refresh API](https://docs.omni.co/api/models/refresh-schema)
+- [Omni schema refresh job status API](https://docs.omni.co/api/jobs/get-job-status)
 - [Omni AI Jobs API](https://docs.omni.co/api/ai/create-ai-job)
 - [Omni AI data security](https://docs.omni.co/ai/security)
 - [Omni Git branch commit API](https://docs.omni.co/api/model-git-configuration/create-or-update-a-pull-request-for-a-model-branch)

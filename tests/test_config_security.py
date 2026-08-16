@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from omniflow.config import load_config, require_repair_api_key
+from omniflow.config import load_config, require_repair_api_key, require_sync_api_key
 from omniflow.exceptions import ConfigError, SecurityPolicyError
 from omniflow.security import public_safe, redact
 
@@ -59,6 +59,8 @@ contracts:
         self.assertFalse(config.security.retain_restricted_artifacts)
         self.assertFalse(config.ai_repair.enabled)
         self.assertFalse(config.ai_repair.allow_query_execution)
+        self.assertFalse(config.dbt_sync.enabled)
+        self.assertTrue(config.dbt_sync.post_sync_validation)
 
     def test_ai_repair_requires_explicit_opt_in_and_bounded_limits(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -107,6 +109,51 @@ repairs:
         ):
             self.assertEqual(require_repair_api_key(), "repair-token")
 
+    def test_dbt_sync_is_opt_in_bounded_and_uses_a_dedicated_environment_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".omniflow.yml"
+            path.write_text(
+                """
+deployment:
+  dbt_sync:
+    enabled: true
+    refresh_mode: soft
+    poll_interval_seconds: 3
+    timeout_seconds: 600
+    post_sync_validation: false
+""",
+                encoding="utf-8",
+            )
+            config = load_config(path)
+        self.assertTrue(config.dbt_sync.enabled)
+        self.assertEqual(config.dbt_sync.refresh_mode, "soft")
+        self.assertEqual(config.dbt_sync.poll_interval_seconds, 3)
+        self.assertEqual(config.dbt_sync.timeout_seconds, 600)
+        self.assertFalse(config.dbt_sync.post_sync_validation)
+
+        for body in (
+            "deployment:\n  dbt_sync:\n    refresh_mode: partial\n",
+            "deployment:\n  dbt_sync:\n    poll_interval_seconds: 1\n",
+            "deployment:\n  dbt_sync:\n    timeout_seconds: 3601\n",
+            "deployment:\n  dbt_sync:\n    unreviewed_option: true\n",
+        ):
+            with self.subTest(body=body):
+                with tempfile.TemporaryDirectory() as tmp:
+                    path = Path(tmp) / ".omniflow.yml"
+                    path.write_text(body, encoding="utf-8")
+                    with self.assertRaises(ConfigError):
+                        load_config(path)
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(ConfigError):
+                require_sync_api_key()
+        with mock.patch.dict(
+            os.environ,
+            {"OMNIFLOW_SYNC_API_KEY": "sync-token"},  # pragma: allowlist secret
+            clear=True,
+        ):
+            self.assertEqual(require_sync_api_key(), "sync-token")
+
     def test_rejects_unknown_top_level_and_nested_policy_keys(self):
         for body in (
             "unknown_section: {}\n",
@@ -135,11 +182,16 @@ repairs:
                 load_config(path)
 
     def test_rejects_secret_like_config_keys(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / ".omniflow.yml"
-            path.write_text("omni:\n  api_key: nope\n", encoding="utf-8")
-            with self.assertRaises(SecurityPolicyError):
-                load_config(path)
+        for body in (
+            "omni:\n  api_key: nope\n",
+            "deployment:\n  dbt_sync:\n    token: nope\n",
+        ):
+            with self.subTest(body=body):
+                with tempfile.TemporaryDirectory() as tmp:
+                    path = Path(tmp) / ".omniflow.yml"
+                    path.write_text(body, encoding="utf-8")
+                    with self.assertRaises(SecurityPolicyError):
+                        load_config(path)
 
     def test_rejects_secret_environment_expansion_from_config(self):
         with tempfile.TemporaryDirectory() as tmp:

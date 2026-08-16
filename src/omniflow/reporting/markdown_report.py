@@ -15,12 +15,14 @@ def render_markdown_report(report: dict[str, Any]) -> str:
     impacts = [issue for issue in issues if issue.get("validator") == "contracts" or issue.get("impact_level")]
     coverage_gaps = _coverage_gaps(report)
     dbt_exposure_summaries = _dbt_exposure_summaries(report)
+    operation = str(report.get("operation") or "validation")
+    dbt_sync_summaries = _dbt_sync_summaries(report)
     lines = [
         "# OmniFlow",
         "",
         "## Decision",
         "",
-        f"**{_decision_label(decision)}**",
+        f"**{_decision_label(decision, operation=operation)}**",
         "",
         f"- Policy decision: `{_safe_code(decision)}`",
         f"- Exit code reason: `{_safe_code(exit_reason)}`",
@@ -31,6 +33,10 @@ def render_markdown_report(report: dict[str, Any]) -> str:
         "## Model Context",
         "",
         *_model_lines(report),
+        "",
+        "## dbt Synchronization",
+        "",
+        *_dbt_sync_lines(dbt_sync_summaries, operation=operation),
         "",
         "## Blocking Issues",
         "",
@@ -60,7 +66,7 @@ def render_markdown_report(report: dict[str, Any]) -> str:
         "",
         "## Reviewer Actions",
         "",
-        *_reviewer_actions(decision, blocking, impacts, coverage_gaps),
+        *_reviewer_actions(decision, blocking, impacts, coverage_gaps, operation=operation),
         "",
         "## Audit Metadata",
         "",
@@ -79,12 +85,16 @@ def write_markdown_report(path: str | Path, report: dict[str, Any]) -> None:
     secure_write_text(target, render_markdown_report(report))
 
 
-def _decision_label(decision: str) -> str:
+def _decision_label(decision: str, *, operation: str) -> str:
     if decision == "pass":
+        if operation == "dbt_sync":
+            return "Pass: Omni refresh and post-sync checks passed."
         return "Pass: OmniFlow checks passed."
     if decision == "skipped":
         return "Skipped: no Omni semantic-layer changes were detected."
     if decision == "fail":
+        if operation == "dbt_sync":
+            return "Fail: do not mark the dbt deployment complete."
         return "Fail: review blocking issues before merge."
     return "Review required: OmniFlow could not determine a final decision."
 
@@ -98,7 +108,7 @@ def _model_lines(report: dict[str, Any]) -> list[str]:
         for model in models:
             if not isinstance(model, dict):
                 continue
-            branch = model.get("branch_name") or model.get("branch_id") or ""
+            branch = model.get("branch_name") or model.get("branch_id") or model.get("base_branch") or ""
             lines.append(
                 f"- `{_safe_code(model.get('model_id', ''))}` path "
                 f"`{_safe_code(model.get('model_path', ''))}` branch `{_safe_code(branch)}`"
@@ -211,12 +221,70 @@ def _dbt_exposure_lines(summaries: list[dict[str, Any]], *, decision: str) -> li
     return lines
 
 
+def _dbt_sync_summaries(report: dict[str, Any]) -> list[dict[str, Any]]:
+    if report.get("operation") != "dbt_sync":
+        return []
+    summaries = []
+    indexes: dict[tuple[Any, Any], int] = {}
+    validation_order = {"not_run": 0, "passed": 1, "failed": 2}
+    for model_report in report.get("model_reports", []) if isinstance(report.get("model_reports"), list) else []:
+        if not isinstance(model_report, dict):
+            continue
+        refresh = model_report.get("refresh")
+        if not isinstance(refresh, dict):
+            continue
+        key = (refresh.get("connection_id"), refresh.get("job_id"))
+        validation_status = str(model_report.get("post_sync_validation_status", "unknown"))
+        if key in indexes:
+            existing = summaries[indexes[key]]
+            if validation_order.get(validation_status, 2) > validation_order.get(
+                str(existing["validation_status"]), 2
+            ):
+                existing["validation_status"] = validation_status
+            continue
+        indexes[key] = len(summaries)
+        summaries.append(
+            {
+                "refresh": refresh,
+                "validation_status": validation_status,
+            }
+        )
+    return summaries
+
+
+def _dbt_sync_lines(summaries: list[dict[str, Any]], *, operation: str) -> list[str]:
+    if operation != "dbt_sync":
+        return ["_Not a dbt synchronization run._"]
+    if not summaries:
+        return ["_No schema refresh job was started._"]
+    lines = []
+    for entry in summaries:
+        refresh = entry["refresh"]
+        affected = refresh.get("affected_model_ids")
+        affected_count = len(affected) if isinstance(affected, list) else 1
+        lines.append(
+            f"- Connection `{_safe_code(refresh.get('connection_id', ''))}` job "
+            f"`{_safe_code(refresh.get('job_id', 'not-started'))}`: "
+            f"refresh `{_safe_code(refresh.get('status', 'unknown'))}` in "
+            f"`{_safe_code(refresh.get('refresh_mode', 'unknown'))}` mode; "
+            f"affected models `{affected_count}`; post-sync validation "
+            f"`{_safe_code(entry.get('validation_status', 'unknown'))}`."
+        )
+    return lines
+
+
 def _reviewer_actions(
     decision: str,
     blocking: list[dict[str, Any]],
     impacts: list[dict[str, Any]],
     coverage_gaps: list[dict[str, Any]],
+    *,
+    operation: str,
 ) -> list[str]:
+    if operation == "dbt_sync":
+        if decision == "pass":
+            return ["- Confirm refreshed metadata and any Omni-generated Git change before closing deployment."]
+        return ["- Keep deployment open and resolve the refresh or post-sync validation failure."]
     if decision == "pass":
         actions = ["- Review semantic diff and downstream impact artifacts before approving."]
         if coverage_gaps:

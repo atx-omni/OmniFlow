@@ -13,6 +13,7 @@ Maintainers will review complete reports on a best-effort basis. No service-leve
 ## Security Boundaries
 
 - The action exposes the dedicated Omni PAT to the validation process only, under the `OMNI_API_KEY` environment name. Dependency installation does not receive it.
+- Optional dbt synchronization uses a separate `OMNIFLOW_SYNC_API_KEY`, rejects pull requests and non-base branches, and never exposes that token to pull-request validation or AI repair modes. The protected sync process uses it for the refresh and enabled post-sync read checks.
 - Pull-request policy and model host metadata are read from the trusted base branch.
 - The example privileged workflow does not check out or execute pull-request code; changed filenames are read through GitHub's API.
 - Public artifacts are redacted; detailed model and dependency artifacts are deleted by default and remain local when retention is explicitly enabled.

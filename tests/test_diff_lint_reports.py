@@ -473,6 +473,47 @@ class DiffLintReportTests(unittest.TestCase):
         self.assertNotIn("Model ID: ``", markdown)
         self.assertNotIn("dbt exposure enrichment was not enabled", markdown)
 
+    def test_markdown_report_uses_deployment_language_for_dbt_sync(self):
+        refresh = {
+            "connection_id": "connection-1",
+            "job_id": "job-1",
+            "status": "completed",
+            "refresh_mode": "hard",
+            "affected_model_ids": ["model-1", "model-2"],
+        }
+        markdown = render_markdown_report(
+            {
+                "operation": "dbt_sync",
+                "tool_version": "0.4.0",
+                "policy_decision": "fail",
+                "exit_code_reason": "validation failed",
+                "summary": {},
+                "issues": [],
+                "models": [
+                    {"model_id": "model-1", "model_path": "omni/model-1", "base_branch": "main"},
+                    {"model_id": "model-2", "model_path": "omni/model-2", "base_branch": "main"},
+                ],
+                "model_reports": [
+                    {
+                        "model_id": "model-1",
+                        "refresh": refresh,
+                        "post_sync_validation_status": "passed",
+                    },
+                    {
+                        "model_id": "model-2",
+                        "refresh": refresh,
+                        "post_sync_validation_status": "failed",
+                    },
+                ],
+            }
+        )
+        self.assertIn("Fail: do not mark the dbt deployment complete.", markdown)
+        self.assertIn("## dbt Synchronization", markdown)
+        self.assertIn("Connection `connection-1` job `job-1`", markdown)
+        self.assertIn("affected models `2`; post-sync validation `failed`", markdown)
+        self.assertIn("Keep deployment open", markdown)
+        self.assertNotIn("before merge", markdown)
+
 
 if __name__ == "__main__":
     unittest.main()

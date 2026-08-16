@@ -59,6 +59,7 @@ def write_artifact_manifest(
             "report.sarif",
             "junit.xml",
             "evidence.json",
+            "dbt-sync.json",
             "repair.json",
             "repair.md",
         )
@@ -74,6 +75,7 @@ def write_artifact_manifest(
         "restricted_artifacts": [
             f"{RESTRICTED_DIR}/<model_id>/yaml-base/",
             f"{RESTRICTED_DIR}/<model_id>/yaml-head/",
+            f"{RESTRICTED_DIR}/<model_id>/pre-sync-yaml/",
             f"{RESTRICTED_DIR}/<model_id>/dependencies.json",
             f"{RESTRICTED_DIR}/<model_id>/semantic-diff.json",
             f"{RESTRICTED_DIR}/<model_id>/contract-impact.json",
