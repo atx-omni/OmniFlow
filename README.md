@@ -366,6 +366,7 @@ Exit codes are `0` success, `1` validation failure, `2` configuration error, `3`
 
 ## Documentation
 
+- [Architecture and operating guide](docs/ARCHITECTURE.md)
 - [Step-by-step installation](docs/INSTALLATION.md)
 - [Configuration reference](docs/CONFIGURATION.md)
 - [Testing and live validation](docs/TESTING.md)
