@@ -61,6 +61,20 @@ security:
 #     poll_interval_seconds: 5
 #     timeout_seconds: 900
 #     post_sync_validation: true
+#
+#   # Optional single-branch safety policy for monorepos that hold dbt and Omni
+#   # model YAML on the same protected branch. Blocks a merge that would promote
+#   # breaking Omni changes before the matching dbt deployment reaches the
+#   # warehouse. Disabled by default. See docs/BREAKING_CHANGE_HOLD.md.
+#   breaking_change_hold:
+#     enabled: true
+#     action: fail          # fail blocks the merge; warn only reports
+#     dbt_paths:            # keep consistent with the deployment push.paths filter
+#       - models
+#       - seeds
+#       - snapshots
+#       - macros
+#     pending_label: omniflow/awaiting-deploy
 
 # Unreleased development scaffold: human-authorized Omni Modeling Agent repair.
 # Do not enable for customer use until Omni publishes a supported Modeling Agent API.

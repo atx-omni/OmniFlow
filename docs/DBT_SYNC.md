@@ -102,6 +102,10 @@ Exit behavior:
 - `5`: the event or Git branch violates deployment policy.
 - `6`: an internal OmniFlow error occurred.
 
+## Single-Branch Monorepos
+
+Repositories that keep dbt and Omni model YAML on the same protected branch can pair this stage with the [breaking change hold](BREAKING_CHANGE_HOLD.md). The hold blocks a pull request that would promote breaking Omni changes before this deployment reaches the warehouse, and [omniflow-dbt-sync-with-release.yml](../.github/workflow-examples/omniflow-dbt-sync-with-release.yml) extends the job below to record the synchronized commit and release the held pull request after a successful refresh.
+
 ## Official Omni References
 
 - [Refresh schema API](https://docs.omni.co/api/models/refresh-schema)

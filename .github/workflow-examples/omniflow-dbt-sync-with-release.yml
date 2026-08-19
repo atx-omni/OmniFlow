@@ -1,0 +1,135 @@
+name: Deploy dbt, synchronize Omni, and release held model changes
+
+# Single-branch monorepo variant of omniflow-dbt-sync.yml.
+#
+# Use this workflow when dbt and Omni model YAML live on the same protected
+# branch and the repository enables deployment.breaking_change_hold. It records
+# the synchronized commit so pull request validation can tell whether a dbt
+# deployment is still pending, then releases any Omni pull request that the hold
+# policy parked while the warehouse was behind.
+#
+# Keep the ordinary omniflow.yml validation workflow in place. This workflow
+# only runs after a merge to the protected branch.
+
+on:
+  push:
+    branches: [main]
+    # Keep this list limited to files that can change the production dbt build.
+    # It must stay consistent with deployment.breaking_change_hold.dbt_paths.
+    paths:
+      - dbt_project.yml
+      - packages.yml
+      - dependencies.yml
+      - selectors.yml
+      - analyses/**
+      - models/**
+      - macros/**
+      - seeds/**
+      - semantic_models/**
+      - snapshots/**
+      - tests/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: omniflow-dbt-production-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  deploy-and-sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: omniflow-production
+    permissions:
+      contents: read
+      # Required only for the release step below, which edits and merges the
+      # held Omni pull request.
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      # Replace this command with the repository's reviewed production dbt deployment.
+      # OmniFlow must remain after this step so a failed dbt deployment prevents refresh.
+      - name: Deploy dbt to production
+        run: ./scripts/deploy-dbt-production.sh
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: "3.11"
+
+      - name: Synchronize dbt metadata into Omni
+        uses: atx-omni/OmniFlow@<pinned-commit-sha> # zizmor: ignore[unpinned-uses] customer must replace
+        with:
+          mode: dbt-sync
+          config: .omniflow.yml
+          sync-api-key: ${{ secrets.OMNIFLOW_SYNC_API_KEY }}
+
+      # Records the commit whose dbt state is now present in Omni. Pull request
+      # validation reads this value to decide whether a dbt deployment is still
+      # pending for breaking Omni model changes.
+      #
+      # This requires a token with permission to set Actions variables. The
+      # default GITHUB_TOKEN cannot write repository variables, so use a
+      # dedicated fine-grained token stored as OMNIFLOW_SYNC_STATE_TOKEN with
+      # read and write access to repository variables only.
+      - name: Record synchronized commit
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.OMNIFLOW_SYNC_STATE_TOKEN }}
+          SYNCED_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "OMNIFLOW_SYNC_STATE_TOKEN is not configured; skipping sync state update" >&2
+            echo "Breaking-change hold will fall back to same-pull-request detection only" >&2
+            exit 0
+          fi
+          gh variable set OMNIFLOW_LAST_SYNC_SHA --body "$SYNCED_SHA"
+
+      # Releases Omni model pull requests that the hold policy parked while the
+      # warehouse was behind. Auto-merge still respects branch protection, so
+      # required checks and reviews must pass before GitHub completes the merge.
+      - name: Release held Omni model changes
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PENDING_LABEL: omniflow/awaiting-deploy
+        run: |
+          set -euo pipefail
+          HELD="$(gh pr list --label "$PENDING_LABEL" --state open --base "$GITHUB_REF_NAME" \
+            --json number --jq '.[].number')"
+          if [ -z "$HELD" ]; then
+            echo "No held Omni pull requests to release"
+            exit 0
+          fi
+          for PR_NUMBER in $HELD; do
+            echo "Releasing held Omni pull request #${PR_NUMBER} after a successful dbt sync"
+            gh pr edit "$PR_NUMBER" --remove-label "$PENDING_LABEL"
+            gh pr comment "$PR_NUMBER" --body \
+              "The pending dbt deployment finished and \`omniflow dbt sync\` succeeded. This pull request is released and set to auto-merge once required checks and reviews pass."
+            # Auto-merge waits for branch protection instead of bypassing it.
+            gh pr merge "$PR_NUMBER" --auto --squash
+          done
+
+      - name: Upload synchronization evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: omniflow-dbt-sync-evidence
+          path: |
+            .omniflow/public/report.json
+            .omniflow/public/report.md
+            .omniflow/public/report.sarif
+            .omniflow/public/junit.xml
+            .omniflow/public/evidence.json
+            .omniflow/public/dbt-sync.json
+            .omniflow/artifact-manifest.json
+          if-no-files-found: ignore
+          include-hidden-files: true

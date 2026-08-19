@@ -11,6 +11,7 @@ from typing import Any
 
 from . import __version__
 from .artifacts import public_dir, restricted_dir, write_artifact_manifest, write_public_json, write_public_reports
+from .breaking_hold import evaluate_breaking_hold, hold_triggered
 from .config import (
     DEFAULT_REPORT_FORMATS,
     load_config,
@@ -23,7 +24,7 @@ from .dbt_sync import run_dbt_sync, validate_dbt_sync_environment
 from .diff.diff_engine import diff_graphs
 from .diff.semantic_graph import build_graph
 from .diff.yaml_loader import load_yaml_files
-from .discovery import ModelContext, discover_contexts, discover_deployment_contexts
+from .discovery import ModelContext, discover_contexts, discover_deployment_contexts, get_changed_files
 from .downstream import generate_downstream_dependencies
 from .exceptions import ConfigError, ExitCodes, OmniAuthError, OmniFlowError, SecurityPolicyError
 from .exposures import run_dbt_exposure_enrichment
@@ -217,6 +218,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     all_reports = []
     all_issues: list[dict[str, Any]] = []
     exit_code = 0
+    changed_files = get_changed_files() if config.breaking_change_hold.enabled else []
     for context in contexts:
         context_output_dir = restricted_dir(output_dir) / _safe_context_dir(context)
         _validate_context_output_layout(context_output_dir)
@@ -226,6 +228,8 @@ def cmd_run(args: argparse.Namespace) -> int:
                     config=config,
                     context=context,
                     output_dir=context_output_dir,
+                    changed_files=changed_files,
+                    enforce_breaking_hold=True,
                 )
             except OmniFlowError as exc:
                 context_report, context_exit = _write_context_failure_artifacts(
@@ -274,6 +278,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         restricted_artifacts_enabled=config.security.retain_restricted_artifacts,
         redaction_level=config.security.redaction_level,
     )
+    _emit_hold_output(all_issues, settings=config.breaking_change_hold)
     print(f"OmniFlow complete: models={len(contexts)} issues={summary['total_issues']} exit_code={exit_code}")
     return exit_code
 
@@ -448,6 +453,8 @@ def _run_context(
     output_dir: Path,
     api_key: str | None = None,
     comparison_base_yaml_dir: Path | None = None,
+    changed_files: list[str] | None = None,
+    enforce_breaking_hold: bool = False,
 ) -> tuple[dict[str, Any], int]:
     client, branch_id = _client_and_branch_for_context(context, config.omni.timeout, api_key=api_key)
     all_issues: list[dict[str, Any]] = []
@@ -487,7 +494,10 @@ def _run_context(
 
     diff_report = None
     head_graph = None
-    if config.semantic_lint.enabled or config.contracts.enabled:
+    # The breaking-change hold reads the semantic diff, so it must be able to
+    # request one even when semantic lint and contracts are both disabled.
+    needs_breaking_hold = enforce_breaking_hold and config.breaking_change_hold.enabled
+    if config.semantic_lint.enabled or config.contracts.enabled or needs_breaking_hold:
         base_yaml_dir = comparison_base_yaml_dir or output_dir / "yaml-base"
         head_yaml_dir = output_dir / "yaml-head"
         if comparison_base_yaml_dir is None:
@@ -564,6 +574,35 @@ def _run_context(
         reports.append(exposure_report)
         all_issues.extend(exposure_report.get("issues", []))
         exit_code = max(exit_code, exposure_exit)
+
+    if enforce_breaking_hold and config.breaking_change_hold.enabled:
+        hold_issues = evaluate_breaking_hold(
+            diff_result=diff_report,
+            changed_files=changed_files or [],
+            last_sync_sha=os.getenv("OMNIFLOW_LAST_SYNC_SHA"),
+            settings=config.breaking_change_hold,
+        )
+        if hold_issues:
+            hold_report = {
+                "tool": "omniflow",
+                "validator": "breaking_change_hold",
+                "generated_at": utc_now_iso(),
+                "model_id": context.model_id,
+                "branch_id": branch_id,
+                "action": config.breaking_change_hold.action,
+                "pending_label": config.breaking_change_hold.pending_label,
+                "issues": hold_issues,
+                "summary": {
+                    "total_issues": len(hold_issues),
+                    "errors": sum(1 for issue in hold_issues if issue.get("severity") == "error"),
+                    "warnings": sum(1 for issue in hold_issues if issue.get("severity") == "warning"),
+                },
+            }
+            write_json_report(output_dir / "breaking-change-hold.json", hold_report)
+            reports.append(hold_report)
+            all_issues.extend(hold_issues)
+            if config.breaking_change_hold.action == "fail":
+                exit_code = max(exit_code, ExitCodes.VALIDATION_FAILED)
 
     summary = _summarize(all_issues)
     report = _base_report(config, context, branch_id, exit_code, all_issues, summary)
@@ -1283,6 +1322,22 @@ def _emit_github_annotations(issues: list[dict[str, Any]], *, limit: int) -> Non
         print(line)
 
 
+def _emit_hold_output(issues: list[dict[str, Any]], *, settings) -> None:
+    """Publish the hold decision so a protected workflow can label the pull request."""
+    if not settings.enabled:
+        return
+    output_path = os.getenv("GITHUB_OUTPUT")
+    if not output_path:
+        return
+    triggered = hold_triggered(issues)
+    try:
+        with open(output_path, "a", encoding="utf-8") as handle:
+            handle.write(f"hold_triggered={'true' if triggered else 'false'}\n")
+            handle.write(f"hold_pending_label={settings.pending_label}\n")
+    except OSError as exc:
+        print(redact(f"Could not write the OmniFlow hold decision output: {exc}"), file=sys.stderr)
+
+
 def _validate_run_output_layout(output_dir: Path) -> None:
     report_names = (
         "report.json",
@@ -1313,6 +1368,7 @@ def _validate_context_output_layout(output_dir: Path) -> None:
         "contract-impact.json",
         "dbt-exposures.json",
         "dbt-sync.json",
+        "breaking-change-hold.json",
     ):
         validate_repo_output_path(output_dir / name)
     for name in ("yaml-base", "yaml-head"):

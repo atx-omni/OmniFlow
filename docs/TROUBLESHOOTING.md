@@ -160,6 +160,28 @@ OmniFlow could not confirm cancellation or the Git commit result. It deliberatel
 
 Stop merge and deployment activity. A concurrent edit or API failure prevented exact rollback verification. Compare the current Omni branch with the PR and reconcile it manually. Rotate the repair PAT if credential misuse is suspected.
 
+## Breaking Change Hold
+
+### The hold blocked a pull request that is actually safe
+
+Detection is path-based. A pull request that touches a configured `dbt_paths` entry while making breaking Omni changes is held even when the two are unrelated. Narrow `deployment.breaking_change_hold.dbt_paths` to the directories that really carry warehouse schema, or split the unrelated change into its own pull request. Use `action: warn` while tuning the paths.
+
+### The hold never fires even though the policy is enabled
+
+Check, in order:
+
+1. The semantic diff has a `breaking` change. Additive changes never trigger the hold.
+2. A changed file actually matches a `dbt_paths` entry. Matching requires a directory boundary, so `models` does not match `models_archive`.
+3. For pending-deployment detection, `OMNIFLOW_LAST_SYNC_SHA` is set and the checkout uses `fetch-depth: 0`. OmniFlow prints a warning when the recorded commit is unreachable and evaluates same-pull-request detection only.
+
+### `breaking-change hold could not reach the recorded sync commit`
+
+The runner has a shallow checkout, so pending-deployment detection was skipped. Set `fetch-depth: 0` on the `actions/checkout` step in the validation workflow. Same-pull-request detection still ran.
+
+### A held pull request was never released
+
+The release step runs only after `omniflow dbt sync` succeeds. Confirm the deployment job completed, that `OMNIFLOW_SYNC_STATE_TOKEN` is configured so the synchronized commit was recorded, and that the label on the pull request matches `deployment.breaking_change_hold.pending_label`. Auto-merge also waits for required checks and reviews, so a released pull request can still be pending on branch protection.
+
 ## Exit Codes
 
 | Code | Meaning |
