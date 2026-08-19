@@ -213,6 +213,54 @@ checks:
     timeout_seconds: 30
 """,
     ),
+    Scenario(
+        name="breaking_change_hold_same_pr",
+        description="breaking Omni change beside a dbt source change should be held for split deployment",
+        expected_exit=1,
+        changed_files="omni/model/views/orders.view\nmodels/marts/fct_orders.sql",
+        config="""deployment:
+  breaking_change_hold:
+    enabled: true
+    action: fail
+    dbt_paths:
+      - models
+""",
+    ),
+    Scenario(
+        name="breaking_change_hold_omni_only",
+        description="breaking Omni change without dbt evidence should not be held",
+        expected_exit=1,
+        changed_files="omni/model/views/orders.view",
+        config="""deployment:
+  breaking_change_hold:
+    enabled: true
+    action: fail
+    dbt_paths:
+      - models
+""",
+    ),
+    Scenario(
+        name="breaking_change_hold_warn",
+        description="warn action should report the hold without adding a blocking failure",
+        expected_exit=0,
+        changed_files="omni/model/views/orders.view\nmodels/marts/fct_orders.sql",
+        config="""contracts:
+  enabled: false
+checks:
+  content_validation:
+    enabled: false
+  model_validation:
+    enabled: false
+  semantic_lint:
+    enabled: false
+deployment:
+  breaking_change_hold:
+    enabled: true
+    action: warn
+    dbt_paths:
+      - models
+""",
+    ),
 ]
 
 
@@ -700,6 +748,27 @@ def assert_result(
             statuses = [item.get("status") for item in sync.get("models", [])]
             if statuses != ["failed"]:
                 errors.append("failed schema refresh did not retain normalized failure status")
+    if scenario.name.startswith("breaking_change_hold"):
+        report = artifacts.get("public/report.json:json", {})
+        hold_issues = [
+            issue
+            for issue in report.get("issues", [])
+            if issue.get("validator") == "breaking_change_hold"
+        ]
+        if scenario.name == "breaking_change_hold_omni_only":
+            if hold_issues:
+                errors.append("hold fired without any dbt change evidence")
+        elif not hold_issues:
+            errors.append("breaking change beside a dbt source change did not trigger the hold")
+        else:
+            issue = hold_issues[0]
+            if issue.get("rule") != "breaking_change_with_dbt_in_same_pull_request":
+                errors.append("hold did not record the same-pull-request rule")
+            if issue.get("dbt_paths") != ["models"]:
+                errors.append("hold did not record the matched dbt path")
+            expected_severity = "warning" if scenario.name.endswith("_warn") else "error"
+            if issue.get("severity") != expected_severity:
+                errors.append(f"hold severity should be {expected_severity} for {scenario.name}")
     return not errors, errors
 
 

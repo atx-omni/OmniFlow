@@ -24,6 +24,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
+          # Pending-deployment detection in the optional breaking-change hold policy
+          # needs the recorded sync commit to be reachable. Repositories that enable
+          # deployment.breaking_change_hold should change this to 0. OmniFlow warns and
+          # falls back to same-pull-request detection when the commit is unreachable.
           fetch-depth: 1
           persist-credentials: false
 
@@ -33,11 +37,15 @@ jobs:
           python-version: "3.11"
 
       - name: Run OmniFlow
+        id: omniflow
         if: github.event_name != 'pull_request_target' || github.event.pull_request.head.repo.full_name == github.repository
         uses: atx-omni/OmniFlow@<pinned-commit-sha> # zizmor: ignore[unpinned-uses] customer must replace
         with:
           config: .omniflow.yml
           omni-api-key: ${{ secrets.OMNI_API_KEY }}
+          # Recorded by the protected dbt sync workflow. Enables the hold policy to
+          # detect breaking Omni changes made while a dbt deployment is still pending.
+          last-sync-sha: ${{ vars.OMNIFLOW_LAST_SYNC_SHA }}
 
       - name: Route fork pull request without Omni secret
         if: github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name != github.repository
@@ -85,4 +93,30 @@ jobs:
             gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${EXISTING}" -f body="$BODY" >/dev/null
           else
             gh pr comment "$PR_NUMBER" --body "$BODY"
+          fi
+
+      # Applies or clears the breaking-change hold label so the protected dbt sync
+      # workflow can release this pull request after the deployment lands. This step
+      # is inert unless deployment.breaking_change_hold is enabled in trusted policy.
+      - name: Apply breaking-change hold label
+        if: always() && github.event_name == 'pull_request_target' && steps.omniflow.outputs.hold-pending-label != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HOLD_TRIGGERED: ${{ steps.omniflow.outputs.hold-triggered }}
+          PENDING_LABEL: ${{ steps.omniflow.outputs.hold-pending-label }}
+        run: |
+          set -euo pipefail
+          HAS_LABEL="$(gh pr view "$PR_NUMBER" --json labels \
+            --jq "[.labels[].name] | index(\"${PENDING_LABEL}\") // empty")"
+          if [ "$HOLD_TRIGGERED" = "true" ]; then
+            if [ -z "$HAS_LABEL" ]; then
+              gh label create "$PENDING_LABEL" \
+                --description "Held by OmniFlow until the pending dbt deployment completes" \
+                --color D93F0B 2>/dev/null || true
+              gh pr edit "$PR_NUMBER" --add-label "$PENDING_LABEL"
+            fi
+          elif [ -n "$HAS_LABEL" ]; then
+            # The hold cleared on a later push, so stop parking the pull request.
+            gh pr edit "$PR_NUMBER" --remove-label "$PENDING_LABEL"
           fi

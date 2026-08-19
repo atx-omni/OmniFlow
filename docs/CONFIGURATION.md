@@ -127,6 +127,37 @@ The sync token is read only from `OMNIFLOW_SYNC_API_KEY`. It must be a dedicated
 
 `omniflow dbt sync --auto` selects all trusted model records whose `base_branch` exactly matches the current deployment branch. In GitHub Actions it accepts only `push` and `workflow_dispatch`, rejects tags and pull requests, and writes no raw response or query-result data. See [Post-Deployment dbt Synchronization](DBT_SYNC.md).
 
+## Breaking Change Hold
+
+This optional pull-request policy lets a monorepo keep dbt and Omni model YAML on one protected branch. It blocks a merge that would promote breaking Omni changes before the matching dbt deployment reaches the warehouse. It is disabled by default and never fires in repositories with no configured dbt paths.
+
+```yaml
+deployment:
+  breaking_change_hold:
+    enabled: true
+    action: fail
+    dbt_paths:
+      - models
+      - seeds
+      - snapshots
+      - macros
+    pending_label: omniflow/awaiting-deploy
+```
+
+| Setting | Default | Allowed range or behavior |
+| --- | --- | --- |
+| `enabled` | `false` | Must be enabled in trusted base-branch policy. |
+| `action` | `fail` | `fail` blocks the merge through the required check; `warn` reports only. |
+| `dbt_paths` | `models`, `seeds`, `snapshots`, `macros` | Relative repository paths, maximum 50. Absolute and `..` paths are rejected. |
+| `pending_label` | `omniflow/awaiting-deploy` | One line, no commas, 50 characters or fewer. |
+
+The policy only evaluates changes the semantic diff marks `breaking`: deleted fields, renamed fields, field type changes, deleted relationships, and relationship cardinality changes. It fires in two situations:
+
+- The pull request contains breaking Omni changes and also modifies a configured dbt path.
+- The pull request contains breaking Omni changes while dbt sources changed on the base branch after the commit recorded in `OMNIFLOW_LAST_SYNC_SHA`.
+
+Pending detection requires both the recorded commit and a full-history checkout. When either is missing, OmniFlow prints a warning and evaluates same-pull-request detection only rather than blocking on incomplete evidence. Keep `dbt_paths` consistent with the `push.paths` filter on the deployment workflow. See [Breaking Change Hold](BREAKING_CHANGE_HOLD.md).
+
 ## Semantic Lint
 
 `checks.semantic_lint.enabled` defaults to `true`. Every rule accepts `off`, `info`, `warn`, or `error`. Only `error` is a blocking lint severity.

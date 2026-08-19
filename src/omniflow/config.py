@@ -70,7 +70,7 @@ AI_REPAIR_KEYS = {
     "max_changed_lines",
     "poll_timeout_seconds",
 }
-DEPLOYMENT_KEYS = {"dbt_sync"}
+DEPLOYMENT_KEYS = {"dbt_sync", "breaking_change_hold"}
 DBT_SYNC_KEYS = {
     "enabled",
     "refresh_mode",
@@ -78,6 +78,16 @@ DBT_SYNC_KEYS = {
     "timeout_seconds",
     "post_sync_validation",
 }
+BREAKING_HOLD_KEYS = {
+    "enabled",
+    "action",
+    "dbt_paths",
+    "pending_label",
+}
+BREAKING_HOLD_ACTIONS = {"fail", "warn"}
+DEFAULT_DBT_PATHS = ["models/", "seeds/", "snapshots/", "macros/"]
+DEFAULT_PENDING_LABEL = "omniflow/awaiting-deploy"
+MAX_DBT_PATHS = 50
 
 
 def _expand_env_string(value: str) -> str:
@@ -236,6 +246,14 @@ class DbtSyncSettings:
 
 
 @dataclass
+class BreakingChangeHoldSettings:
+    enabled: bool = False
+    action: str = "fail"
+    dbt_paths: list[str] = field(default_factory=lambda: list(DEFAULT_DBT_PATHS))
+    pending_label: str = DEFAULT_PENDING_LABEL
+
+
+@dataclass
 class OmniFlowConfig:
     raw: dict[str, Any]
     source: Path | None
@@ -249,6 +267,7 @@ class OmniFlowConfig:
     security: SecuritySettings
     ai_repair: AIRepairSettings
     dbt_sync: DbtSyncSettings
+    breaking_change_hold: BreakingChangeHoldSettings
     hash: str
 
 
@@ -267,6 +286,9 @@ def _to_config(raw: dict[str, Any], source: Path | None) -> OmniFlowConfig:
     deployment_raw = _mapping(raw.get("deployment"), "deployment")
     ai_repair_raw = _mapping(repairs_raw.get("ai"), "repairs.ai")
     dbt_sync_raw = _mapping(deployment_raw.get("dbt_sync"), "deployment.dbt_sync")
+    breaking_hold_raw = _mapping(
+        deployment_raw.get("breaking_change_hold"), "deployment.breaking_change_hold"
+    )
     content_raw = _mapping(checks_raw.get("content_validation"), "checks.content_validation")
     model_raw = _mapping(checks_raw.get("model_validation"), "checks.model_validation")
     lint_raw = _mapping(checks_raw.get("semantic_lint"), "checks.semantic_lint")
@@ -443,6 +465,16 @@ def _to_config(raw: dict[str, Any], source: Path | None) -> OmniFlowConfig:
             True,
         ),
     )
+    breaking_change_hold = BreakingChangeHoldSettings(
+        enabled=parse_bool(
+            "deployment.breaking_change_hold.enabled",
+            breaking_hold_raw.get("enabled"),
+            False,
+        ),
+        action=_hold_action(breaking_hold_raw.get("action", "fail")),
+        dbt_paths=_dbt_paths(breaking_hold_raw.get("dbt_paths")),
+        pending_label=_pending_label(breaking_hold_raw.get("pending_label")),
+    )
     return OmniFlowConfig(
         raw=raw,
         source=source,
@@ -456,6 +488,7 @@ def _to_config(raw: dict[str, Any], source: Path | None) -> OmniFlowConfig:
         security=security,
         ai_repair=ai_repair,
         dbt_sync=dbt_sync,
+        breaking_change_hold=breaking_change_hold,
         hash=config_hash(raw),
     )
 
@@ -490,6 +523,67 @@ def _refresh_mode(value: Any) -> str:
     return normalized
 
 
+def _hold_action(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ConfigError("deployment.breaking_change_hold.action must be 'fail' or 'warn'")
+    normalized = value.strip().lower()
+    if normalized not in BREAKING_HOLD_ACTIONS:
+        raise ConfigError("deployment.breaking_change_hold.action must be 'fail' or 'warn'")
+    return normalized
+
+
+def _dbt_paths(value: Any) -> list[str]:
+    if value is None:
+        return list(DEFAULT_DBT_PATHS)
+    if not isinstance(value, list):
+        raise ConfigError("deployment.breaking_change_hold.dbt_paths must be a list of repository paths")
+    normalized: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise ConfigError(
+                "deployment.breaking_change_hold.dbt_paths entries must be non-empty strings"
+            )
+        raw_candidate = item.strip()
+        # Reject absolute and traversal input before normalization so a leading
+        # separator cannot be stripped into a seemingly relative path.
+        if (
+            Path(raw_candidate).is_absolute()
+            or ".." in Path(raw_candidate).parts
+            or len(raw_candidate) > 1_024
+            or any(character in raw_candidate for character in ("\x00", "\r", "\n", "\\"))
+        ):
+            raise ConfigError(
+                "deployment.breaking_change_hold.dbt_paths entries must be relative repository paths"
+            )
+        candidate = raw_candidate.strip("/")
+        if not candidate or candidate == ".":
+            raise ConfigError(
+                "deployment.breaking_change_hold.dbt_paths entries must be relative repository paths"
+            )
+        if candidate not in normalized:
+            normalized.append(candidate)
+    if not normalized:
+        raise ConfigError("deployment.breaking_change_hold.dbt_paths must include at least one path")
+    if len(normalized) > MAX_DBT_PATHS:
+        raise SecurityPolicyError(
+            f"deployment.breaking_change_hold.dbt_paths cannot exceed {MAX_DBT_PATHS} entries"
+        )
+    return normalized
+
+
+def _pending_label(value: Any) -> str:
+    if value is None:
+        return DEFAULT_PENDING_LABEL
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError("deployment.breaking_change_hold.pending_label must be a non-empty string")
+    normalized = value.strip()
+    if len(normalized) > 50 or any(character in normalized for character in ("\x00", "\r", "\n", ",")):
+        raise ConfigError(
+            "deployment.breaking_change_hold.pending_label must be one line, no commas, and 50 characters or fewer"
+        )
+    return normalized
+
+
 def _mapping(value: Any, name: str) -> dict[str, Any]:
     if value is None:
         return {}
@@ -519,6 +613,11 @@ def _validate_config_schema(raw: dict[str, Any]) -> None:
         _mapping(deployment.get("dbt_sync"), "deployment.dbt_sync"),
         DBT_SYNC_KEYS,
         "deployment.dbt_sync",
+    )
+    _reject_unknown_keys(
+        _mapping(deployment.get("breaking_change_hold"), "deployment.breaking_change_hold"),
+        BREAKING_HOLD_KEYS,
+        "deployment.breaking_change_hold",
     )
     _reject_unknown_keys(
         _mapping(checks.get("content_validation"), "checks.content_validation"),

@@ -22,6 +22,22 @@ inputs:
     description: Record a successful skipped run without exposing the Omni API key.
     required: false
     default: ""
+  last-sync-sha:
+    description: >-
+      Commit SHA recorded by the last successful dbt sync. Pass
+      ${{ vars.OMNIFLOW_LAST_SYNC_SHA }} to enable pending-deployment detection in the
+      breaking-change hold policy. Requires a full-history checkout to be effective.
+    required: false
+    default: ""
+outputs:
+  hold-triggered:
+    description: >-
+      "true" when the breaking-change hold policy parked this pull request because a dbt
+      deployment must land first. Empty unless the policy is enabled in trusted policy config.
+    value: ${{ steps.validate.outputs.hold_triggered }}
+  hold-pending-label:
+    description: Label a protected workflow should apply while the pull request is held.
+    value: ${{ steps.validate.outputs.hold_pending_label }}
 runs:
   using: composite
   steps:
@@ -97,12 +113,14 @@ runs:
           --format github >> "$GITHUB_OUTPUT"
 
     - name: Run OmniFlow
+      id: validate
       if: inputs.mode == 'validate' && inputs['skip-reason'] == '' && steps.route.outputs.should_run == 'true'
       shell: bash
       env:
         OMNI_API_KEY: ${{ inputs['omni-api-key'] }}
         OMNIFLOW_INPUT_CONFIG: ${{ inputs.config }}
         OMNIFLOW_GITHUB_TOKEN: ${{ github.token }}
+        OMNIFLOW_LAST_SYNC_SHA: ${{ inputs['last-sync-sha'] }}
       run: |
         set -euo pipefail
         omniflow run --auto --config "$OMNIFLOW_INPUT_CONFIG"

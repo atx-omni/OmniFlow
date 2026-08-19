@@ -26,6 +26,17 @@ MODEL_KEYS = {"base_url", "model_id", "model_path", "base_branch", "git_provider
 MAX_FLOW_MODELS = 500
 MAX_MARKER_BYTES = 4 * 1024
 MAX_CHANGED_FILES = 10_000
+CHANGED_FILES_CACHE_ENV = (
+    "OMNIFLOW_CHANGED_FILES",
+    "GITHUB_EVENT_NAME",
+    "GITHUB_EVENT_PATH",
+    "GITHUB_BASE_REF",
+    "GITHUB_REPOSITORY",
+    "GITHUB_API_URL",
+    "GITHUB_EVENT_NUMBER",
+    "GITHUB_REF",
+)
+_CHANGED_FILES_CACHE: dict[tuple[Any, ...], list[str]] = {}
 
 
 @dataclass
@@ -242,6 +253,31 @@ def load_pr_marker() -> dict[str, Any]:
 
 
 def get_changed_files(base_branch: str | None = None) -> list[str]:
+    """Return the changed repository paths for this run.
+
+    The result is memoized against the environment that determines it, because
+    routing, validation, and the breaking-change hold policy all need the same
+    inventory, and the pull_request_target path pays for paginated GitHub API
+    calls to build it. Keying on the environment keeps the cache correct when
+    the surrounding event context changes.
+    """
+    key = _changed_files_cache_key(base_branch)
+    if key in _CHANGED_FILES_CACHE:
+        return list(_CHANGED_FILES_CACHE[key])
+    files = _resolve_changed_files(base_branch)
+    _CHANGED_FILES_CACHE[key] = list(files)
+    return list(files)
+
+
+def reset_changed_files_cache() -> None:
+    _CHANGED_FILES_CACHE.clear()
+
+
+def _changed_files_cache_key(base_branch: str | None) -> tuple[Any, ...]:
+    return (base_branch, *(os.getenv(name) for name in CHANGED_FILES_CACHE_ENV))
+
+
+def _resolve_changed_files(base_branch: str | None = None) -> list[str]:
     explicit = os.getenv("OMNIFLOW_CHANGED_FILES")
     if explicit:
         return [item.strip() for item in explicit.splitlines() if item.strip()]
