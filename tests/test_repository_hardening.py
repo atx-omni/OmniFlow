@@ -5,9 +5,92 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from packaging.requirements import Requirement
+from packaging.version import Version
 
 ROOT = Path(__file__).resolve().parents[1]
 PINNED_USE_RE = re.compile(r"^[^@\s]+@[0-9a-f]{40}$")
+SHA256_HASHES_RE = re.compile(r"--hash=sha256:[a-fA-F0-9]{64}(?:\s+--hash=sha256:[a-fA-F0-9]{64})*")
+
+
+def hash_locked_requirements(text: str, *, allowed_includes: tuple[str, ...] = ()) -> list[Requirement]:
+    """Validate the repository's lock format, associating hashes with each logical requirement."""
+    logical_lines = []
+    pending = ""
+    for physical_line in text.splitlines():
+        # A backslash in a full-line comment must not hide the next requirement.
+        line = pending + ("" if physical_line.lstrip().startswith("#") else physical_line)
+        if not physical_line.lstrip().startswith("#") and physical_line.endswith("\\"):
+            pending = line[:-1] + " "
+            continue
+        logical_lines.append(line)
+        pending = ""
+    if pending:
+        raise ValueError("Lock file ends with an unfinished continuation")
+    requirements = []
+    for logical_line in logical_lines:
+        line = re.split(r"\s+#", logical_line, maxsplit=1)[0].strip()
+        if not line or line.startswith("#") or line in allowed_includes:
+            continue
+        requirement_text, separator, hashes = line.partition("--hash=")
+        requirement = Requirement(requirement_text.strip())
+        pins = list(requirement.specifier)
+        if requirement.url or requirement.marker or len(pins) != 1 or pins[0].operator != "==":
+            raise ValueError(f"Requirement must have one exact version pin: {line}")
+        if "*" in pins[0].version:
+            raise ValueError(f"Wildcard version is not an exact pin: {line}")
+        if not SHA256_HASHES_RE.fullmatch(separator + hashes):
+            raise ValueError(f"Requirement must have valid SHA-256 hashes: {line}")
+        requirements.append(requirement)
+    if not requirements:
+        raise ValueError("Lock file has no pinned requirements")
+    return requirements
+
+
+class HashLockValidationTests(unittest.TestCase):
+    def test_accepts_multiple_hashes_per_requirement_and_inline_hashes(self):
+        text = (
+            "# Release build inputs\n-r action-py311-linux-x86_64.txt\n\n"
+            "build==1.6.0 \\\n"
+            f"    --hash=sha256:{'a' * 64} \\\n"
+            f"    --hash=sha256:{'b' * 64}\n"
+            f"pyproject-hooks==1.2.0 --hash=sha256:{'c' * 64} # pinned build hook\n"
+        )
+        requirements = hash_locked_requirements(text, allowed_includes=("-r action-py311-linux-x86_64.txt",))
+        self.assertEqual([str(requirement) for requirement in requirements], ["build==1.6.0", "pyproject-hooks==1.2.0"])
+
+    def test_rejects_missing_hash_even_when_aggregate_counts_match(self):
+        text = (
+            "build==1.6.0 \\\n"
+            f"    --hash=sha256:{'a' * 64} \\\n"
+            f"    --hash=sha256:{'b' * 64}\n"
+            "pyproject-hooks==1.2.0\n"
+        )
+        with self.assertRaisesRegex(ValueError, "valid SHA-256 hashes: pyproject-hooks"):
+            hash_locked_requirements(text)
+
+    def test_rejects_invalid_locks(self):
+        valid_hash = f"--hash=sha256:{'a' * 64}"
+        invalid_locks = (
+            "# Empty lock\n",
+            f"build>=1.6.0 {valid_hash}\n",
+            f"build==1.* {valid_hash}\n",
+            f"build==1.6.0; python_version<'3.12' {valid_hash}\n",
+            f"build @ https://example.com/build.whl {valid_hash}\n",
+            f"build==1.6.0 # {valid_hash}\n",
+            f"build==1.6.0\n    {valid_hash}\n",
+            f"{valid_hash}\nbuild==1.6.0 {valid_hash}\n",
+            "build==1.6.0 --hash=sha256:abc\n",
+            f"build==1.6.0 --hash=sha256:{'g' * 64}\n",
+            f"build==1.6.0 --hash=sha1:{'a' * 40}\n",
+            f"build==1.6.0 {valid_hash} --hash=sha256:abc\n",
+            f"build==1.6.0 {valid_hash} \\",
+            f"-r unchecked.txt\nbuild==1.6.0 {valid_hash}\n",
+            f"# Comment with a backslash \\\nmissing==1.0\nbuild==1.6.0 {valid_hash}\n",
+        )
+        for text in invalid_locks:
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                hash_locked_requirements(text)
 
 
 def nested_uses(value: Any) -> list[str]:
@@ -117,12 +200,50 @@ class RepositoryHardeningTests(unittest.TestCase):
 
     def test_build_and_ci_use_patched_setuptools(self):
         pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-        self.assertIn("setuptools>=83,<84", pyproject["build-system"]["requires"])
-
-        for path in [ROOT / ".github/workflows/dependency-scan.yml", ROOT / ".github/workflows/test.yml"]:
-            self.assertIn("setuptools==83.0.0", path.read_text(encoding="utf-8"), msg=str(path))
+        requirements = [Requirement(value) for value in pyproject["build-system"]["requires"]]
+        setuptools = next(requirement for requirement in requirements if requirement.name == "setuptools")
+        self.assertIsNone(setuptools.url)
+        self.assertIsNone(setuptools.marker)
+        self.assertTrue(
+            any(spec.operator == ">=" and Version(spec.version) >= Version("83") for spec in setuptools.specifier)
+        )
+        self.assertTrue(any(spec.operator == "<" for spec in setuptools.specifier))
         lock = (ROOT / "requirements/action-py311-linux-x86_64.txt").read_text(encoding="utf-8")
-        self.assertIn("setuptools==83.0.0", lock)
+        for source, text in [
+            ("action lock", lock),
+            *[
+                (str(path), path.read_text(encoding="utf-8"))
+                for path in (ROOT / ".github/workflows/dependency-scan.yml", ROOT / ".github/workflows/test.yml")
+            ],
+        ]:
+            pins = re.findall(r"\bsetuptools==([0-9][A-Za-z0-9.!+_-]*)", text)
+            self.assertTrue(pins, msg=source)
+            for pin in pins:
+                self.assertGreaterEqual(Version(pin), Version("83"), msg=source)
+                self.assertIn(Version(pin), setuptools.specifier, msg=source)
+
+    def test_ci_bootstrap_uses_patched_pip(self):
+        for relative in ("dependency-scan.yml", "test.yml"):
+            text = (ROOT / ".github/workflows" / relative).read_text(encoding="utf-8")
+            pins = re.findall(r"\bpip==([0-9][A-Za-z0-9.!+_-]*)", text)
+            self.assertTrue(pins, msg=relative)
+            for pin in pins:
+                self.assertGreaterEqual(Version(pin), Version("26.2"), msg=relative)
+
+    def test_runtime_urllib3_floor_and_lock_are_patched(self):
+        pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+        requirements = [Requirement(value) for value in pyproject["project"]["dependencies"]]
+        urllib3 = next(requirement for requirement in requirements if requirement.name == "urllib3")
+        self.assertIsNone(urllib3.url)
+        self.assertIsNone(urllib3.marker)
+        self.assertTrue(
+            any(spec.operator == ">=" and Version(spec.version) >= Version("2.8.0") for spec in urllib3.specifier)
+        )
+        lock = (ROOT / "requirements/action-py311-linux-x86_64.txt").read_text(encoding="utf-8")
+        locked = next(requirement for requirement in hash_locked_requirements(lock) if requirement.name == "urllib3")
+        version = Version(next(iter(locked.specifier)).version)
+        self.assertGreaterEqual(version, Version("2.8.0"))
+        self.assertIn(version, urllib3.specifier)
 
     def test_action_install_is_hash_locked_and_token_is_runtime_only(self):
         action = yaml.safe_load((ROOT / "action.yml").read_text(encoding="utf-8"))
@@ -190,15 +311,13 @@ class RepositoryHardeningTests(unittest.TestCase):
         self.assertNotIn(".omniflow/restricted/", text)
 
     def test_action_and_release_locks_pin_every_requirement_with_sha256(self):
-        for relative in (
-            "requirements/action-py311-linux-x86_64.txt",
-            "requirements/release-py311-linux-x86_64.txt",
+        for relative, includes in (
+            ("requirements/action-py311-linux-x86_64.txt", ()),
+            ("requirements/release-py311-linux-x86_64.txt", ("-r action-py311-linux-x86_64.txt",)),
         ):
             text = (ROOT / relative).read_text(encoding="utf-8")
-            requirements = [line for line in text.splitlines() if "==" in line and not line.lstrip().startswith("#")]
-            hashes = [line for line in text.splitlines() if "--hash=sha256:" in line]
-            self.assertTrue(requirements, msg=relative)
-            self.assertEqual(len(requirements), len(hashes), msg=relative)
+            with self.subTest(lock=relative):
+                hash_locked_requirements(text, allowed_includes=includes)
 
     def test_security_critical_files_have_codeowners(self):
         text = (ROOT / ".github/CODEOWNERS").read_text(encoding="utf-8")
