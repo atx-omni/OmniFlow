@@ -443,6 +443,7 @@ Exit codes are `0` success, `1` validation failure, `2` configuration error, `3`
 
 ## Documentation
 
+- [Historical v0.4.0 architecture guide](docs/ARCHITECTURE.md) — archival context only; use the current guides below for setup and security.
 - [Step-by-step installation](docs/INSTALLATION.md)
 - [Configuration reference](docs/CONFIGURATION.md)
 - [Testing and live validation](docs/TESTING.md)
@@ -463,7 +464,7 @@ Exit codes are `0` success, `1` validation failure, `2` configuration error, `3`
 ```bash
 python3.11 -m venv .venv
 . .venv/bin/activate
-python -m pip install --upgrade "pip==26.2" "setuptools==83.0.0"
+python -m pip install --upgrade "pip==26.2" "setuptools==84.0.0"
 python -m pip install -e ".[dev]"
 pytest --cov=omniflow
 ruff check .
