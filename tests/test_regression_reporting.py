@@ -130,7 +130,8 @@ def test_markdown_sample_prioritizes_comparison_blocker_over_large_baseline():
     findings = text.split("## Findings", 1)[1]
     assert "1. `model` / `model_evidence_unavailable`" in findings
     assert "ambiguous_model_identity" in findings
-    assert "Additional safe findings" in findings
+    assert "**25 occurrences**" in findings
+    assert findings.count("Existing model issue") == 1
 
 
 def test_model_schema_fields_accept_only_fixed_vocabulary_and_numeric_counts():

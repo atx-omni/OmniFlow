@@ -19,6 +19,32 @@
 
 No returned references is not proof of no consumers when coverage is unavailable. Content history counts (new/existing/resolved) describe content validation only; they are not the total blocking count across model, lint, contract and other checks. Missing optional results do not establish that those checks ran successfully.
 
+### Reading an actionable report
+
+Start with **Blocking findings**, not the total recorded errors or warnings. For example, a run with three errors
+can have only one blocker when two errors are matched baseline findings under new-only policy. Nonblocking findings
+are grouped separately by their safe category and occurrence count, rather than repeating one generic message.
+
+Semantic lint reports retain built-in rule IDs such as `require_field_descriptions`, `require_primary_keys`, and
+`require_owner_metadata`, each with a fixed corrective step. Lint findings describe the checked model and are not
+automatically classified as new-versus-existing PR defects. A new dashboard-filter finding identifies that check,
+its branch scope, and the next investigation step; it does not invent the underlying field or filter defect from
+an anonymous report. Open Content Validator in the same authorized Omni model and branch for those exact details.
+
+Public JSON, SARIF and JUnit retain individual findings. Markdown and GitHub annotations group only identical safe
+projections, preserve policy and context distinctions, and report omitted categories when presentation limits apply.
+No PII/PHI/PCI-bearing messages, field values, SQL, names, or resource IDs are enabled in public reports by these reporting improvements.
+
+### Finding the affected code in a private repository
+
+Eligible private same-repository GitHub.com validation runs now default to a separate **repository diagnostics** artifact. It can identify the exact authored field/view/topic, source file and source-key line, alongside the fixed explanation and corrective guidance. The JSON contains all findings; Markdown prioritizes blockers and explicitly counts any omitted findings. A location labeled `base` refers to the old snapshot (for example, a deleted field), not the current PR file. No line number is invented when only a file is known.
+
+The ordinary PR comment stays minimal. Download `omniflow-repository-diagnostics` from the run to inspect its `report.md` and `report.json`. If absent, check the safe console fallback reason and local `repository/status.json`: unknown repository eligibility, unavailable trusted policy, mismatched authored snapshots, or unavailable report generation will withhold detailed output without changing validation policy. Existing workflows need the separately guarded upload step from the updated workflow example. Do not upload the whole `.omniflow` directory.
+
+Content-only dashboard/filter identities that are not authored in the repository still require inspection in Omni. Unrecognized API messages are not copied into the report, and a source location alone does not establish the precise root cause.
+
+To opt out, merge `reporting.diagnostics.mode: minimal` into the root `.omniflow.yml` on the trusted target branch. `repository` is the omitted default; both modes retain minimal public reports, logs, annotations and PR comments. See [Diagnostic Privacy](DIAGNOSTIC_PRIVACY.md).
+
 ## Upgrading from 0.4.0: relationship-coverage errors
 
 An old semantic-diff defect omitted joined-view metadata on valid added or modified relationships. The resulting false blocker reads:

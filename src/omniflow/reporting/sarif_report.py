@@ -17,6 +17,12 @@ def to_sarif(report: dict[str, Any]) -> dict[str, Any]:
         rules.setdefault(rule_id, {"id": rule_id, "name": rule_id, "shortDescription": {"text": rule_id}})
         level = _sarif_level(issue.get("severity") or issue.get("risk"))
         file_path = issue.get("file") or "omniflow"
+        location = {"artifactLocation": {"uri": file_path}}
+        if report.get("diagnostic_audience") == "repository":
+            if type(issue.get("line")) is int and issue["line"] > 0:
+                location["region"] = {"startLine": issue["line"]}
+        else:
+            location["region"] = {"startLine": 1}
         results.append(
             {
                 "ruleId": rule_id,
@@ -28,10 +34,7 @@ def to_sarif(report: dict[str, Any]) -> dict[str, Any]:
                 "message": {"text": issue.get("message") or issue.get("summary") or "OmniFlow issue"},
                 "locations": [
                     {
-                        "physicalLocation": {
-                            "artifactLocation": {"uri": file_path},
-                            "region": {"startLine": 1},
-                        }
+                        "physicalLocation": location
                     }
                 ],
             }

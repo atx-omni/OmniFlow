@@ -65,7 +65,9 @@ AI_EVAL_KEYS = {
 }
 PROMPT_SET_KEYS = {"id", "label", "model_id"}
 MAX_PROMPT_SETS = 20
-REPORTING_KEYS = {"formats", "output_dir"}
+REPORTING_KEYS = {"formats", "output_dir", "diagnostics"}
+DIAGNOSTICS_KEYS = {"mode"}
+DIAGNOSTICS_MODES = {"repository", "minimal"}
 SECURITY_KEYS = {
     "redact_logs",
     "allow_raw_response_output",
@@ -255,6 +257,7 @@ class AiEvalSettings:
 class ReportingSettings:
     formats: list[str] = field(default_factory=lambda: list(DEFAULT_REPORT_FORMATS))
     output_dir: str = ".omniflow"
+    diagnostics_mode: str = "repository"
 
 
 @dataclass
@@ -488,6 +491,7 @@ def _to_config(raw: dict[str, Any], source: Path | None) -> OmniFlowConfig:
     reporting = ReportingSettings(
         formats=formats,
         output_dir=output_dir,
+        diagnostics_mode=_diagnostics_mode(reporting_raw),
     )
     security = SecuritySettings(
         redact_logs=parse_bool("security.redact_logs", security_raw.get("redact_logs"), True),
@@ -809,6 +813,7 @@ def _validate_config_schema(raw: dict[str, Any]) -> None:
     _reject_unknown_keys(omni, OMNI_KEYS, "omni")
     _reject_unknown_keys(checks, CHECK_KEYS, "checks")
     _reject_unknown_keys(reporting, REPORTING_KEYS, "reporting")
+    _diagnostics_mode(reporting)
     _reject_unknown_keys(security, SECURITY_KEYS, "security")
     _reject_unknown_keys(contracts, CONTRACT_KEYS, "contracts")
     _reject_unknown_keys(repairs, REPAIR_KEYS, "repairs")
@@ -899,6 +904,19 @@ def _report_formats(value: Any) -> list[str]:
     if unknown:
         raise ConfigError(f"Unknown reporting format(s): {', '.join(unknown)}")
     return formats
+
+
+def _diagnostics_mode(reporting: dict[str, Any]) -> str:
+    """Disclosure policy is literal; environment expansion must not enable it."""
+    diagnostics = reporting.get("diagnostics", {})
+    if not isinstance(diagnostics, dict):
+        raise ConfigError("reporting.diagnostics must be a mapping")
+    if any(key not in DIAGNOSTICS_KEYS for key in diagnostics):
+        raise ConfigError("reporting.diagnostics contains unsupported keys")
+    mode = diagnostics.get("mode", "repository")
+    if not isinstance(mode, str) or mode not in DIAGNOSTICS_MODES:
+        raise ConfigError("reporting.diagnostics.mode must be 'repository' or 'minimal'")
+    return mode
 
 
 def _output_dir(value: Any) -> str:

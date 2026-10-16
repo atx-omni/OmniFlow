@@ -12,6 +12,7 @@ from copy import deepcopy
 from typing import Any
 from uuid import uuid4
 
+from .diagnostic_catalog import CHANGE_MESSAGES, CHECK_GUIDANCE, LINT_MESSAGES
 from .exceptions import MissingPolicyError
 from .validators.content_identity import IDENTITY_MESSAGES
 
@@ -60,7 +61,7 @@ TYPES = frozenset({
     "field_deleted", "field_added", "field_renamed", "field_type_changed", "field_changed",
     "file_renamed", "governance_changed", "relationship_changed", "relationship_deleted",
     "relationship_added", "view_deleted", "view_added", "topic_changed", "topic_deleted",
-    "omniflow_finding",
+    "omniflow_finding", *CHANGE_MESSAGES,
 })
 REASONS = frozenset({
     "invalid_issue_container", "invalid_issue_entry", "missing_issue_message",
@@ -153,8 +154,18 @@ def public_diagnostic(payload: dict[str, Any]) -> dict[str, Any]:
         identity = tuple(value.get(key) for key in ("model_id", "branch_id", "branch_name"))
         if any(identity) and all(item is None or isinstance(item, str) for item in identity):
             result["context_reference"] = contexts.setdefault(identity, f"context-{len(contexts) + 1}")
+        elif payload.get("diagnostic_schema_version") == 2:
+            # Re-rendering a public report must retain context associations, not
+            # copy its labels or collapse distinct models after identity removal.
+            reference = value.get("context_reference")
+            if isinstance(reference, str) and reference:
+                key = ("public_context", reference)
+                result["context_reference"] = contexts.setdefault(key, f"context-{len(contexts) + 1}")
         for key, item in value.items():
-            if key in ENUMS and isinstance(item, str) and item in ENUMS[key]:
+            if key == "rule_id" and value.get("validator") == "semantic_lint":
+                if isinstance(item, str) and item in LINT_MESSAGES:
+                    result[key] = item
+            elif key in ENUMS and isinstance(item, str) and item in ENUMS[key]:
                 result[key] = item
             elif key in COUNTS and type(item) is int and 0 <= item <= 2**31 - 1:
                 result[key] = item
@@ -182,6 +193,8 @@ def public_diagnostic(payload: dict[str, Any]) -> dict[str, Any]:
 
 def _finding_message(issue: dict[str, Any]) -> str:
     noun = "model" if issue.get("validator") == "model" else "content"
+    if issue.get("validator") == "semantic_lint" and issue.get("rule_id") in LINT_MESSAGES:
+        return LINT_MESSAGES[issue["rule_id"]]
     if isinstance(issue.get("reason_code"), str) and issue["reason_code"] in IDENTITY_MESSAGES:
         return IDENTITY_MESSAGES[issue["reason_code"]]
     if issue.get("reason_code") == "missing_policy_config":
@@ -202,19 +215,37 @@ def _finding_message(issue: dict[str, Any]) -> str:
     if issue.get("reason_code") in {"model_comparison_unavailable", "ambiguous_model_identity"}:
         return ("Model validation comparison could not be established; this does not prove a new model defect. "
                 "Restore complete, unambiguous baseline and branch evidence before rerunning.")
+    if issue.get("type") == "dependency_coverage_gap":
+        return ("Downstream dependency coverage is incomplete. Verify content read permissions and reference lookup "
+                "coverage, then rerun. Missing evidence does not establish that dependent content is safe.")
+    if issue.get("type") in {"validation_execution_failed", "internal_execution_failure"}:
+        return "This check did not complete. " + CHECK_GUIDANCE.get(issue.get("validator"), CHECK_GUIDANCE["execution"])
+    if issue.get("validator") in {"contracts", "semantic_diff"} and issue.get("type") in CHANGE_MESSAGES:
+        return CHANGE_MESSAGES[issue["type"]]
     if issue.get("state") == "existing":
+        if issue.get("active") is False:
+            return f"Existing {noun} issue is inactive and does not block this run."
+        if issue.get("blocking") is False:
+            return f"Existing {noun} issue matched the baseline and does not block under the configured policy."
+        if issue.get("blocking") is True:
+            return f"Existing {noun} issue matched the baseline, but the configured policy still blocks it."
         return f"Existing {noun} issue; blocking status follows the configured comparison policy."
     if issue.get("state") == "resolved":
         return f"Previously reported {noun} issue is resolved."
     if issue.get("state") == "improved":
         return f"Previously reported {noun} issue has improved; current severity remains visible."
     if issue.get("type") == "model_validation_issue":
-        return "Model validation finding; review new-versus-existing counts and validate the same model branch in Omni."
+        return "Model validation reported an issue. Validate the same model branch in Omni and inspect its reported definition errors."
     if issue.get("type") == "content_validation_issue":
         if issue.get("issue_type") == "dashboard_filter":
-            return "Dashboard-filter validation finding; inspect Content Validator in Omni for the same model and branch."
-        return "Content validation finding; review new-versus-existing counts and Content Validator in Omni."
-    return "OmniFlow finding; sensitive details are withheld from shareable diagnostics."
+            return ("Dashboard-filter validation failed. Open Content Validator for the same model and branch, "
+                    "inspect the reported dashboard filter, and correct its configuration or model references.")
+        if issue.get("issue_type") == "query":
+            return ("Content query validation failed. Open Content Validator for the same model and branch "
+                    "and inspect the reported query and model references.")
+        return "Content validation failed. Open Content Validator in Omni for the same model and branch."
+    return ("No recognized diagnostic category was supplied for this check. "
+            + CHECK_GUIDANCE.get(issue.get("validator"), CHECK_GUIDANCE["execution"]))
 
 
 def safe_exception_message(exc: Exception) -> str:

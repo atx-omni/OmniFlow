@@ -9,6 +9,7 @@ from .diagnostics import public_diagnostic, record_private_report
 from .exceptions import OmniFlowError, SecurityPolicyError
 from .git import tool_revision
 from .reporting.writer import write_reports
+from .repository_diagnostics import clear_repository_reports, write_repository_reports
 from .security import secure_write_text
 from .timestamps import utc_now_iso
 
@@ -34,6 +35,7 @@ def write_public_reports(
     report = dict(report)
     report.setdefault("tool_revision", tool_revision())
     try:
+        clear_repository_reports(output_dir)
         safe_report = public_diagnostic(report)
         # A changed format preference must not leave a previous, possibly
         # identity-rich report available for the workflow to upload.
@@ -52,6 +54,7 @@ def write_public_reports(
                 # envelope next. Until then, only current safe evidence remains.
                 secure_write_text(evidence_path, json.dumps(safe_report, indent=2) + "\n")
         record_private_report(report)
+        write_repository_reports(report, safe_report, output_dir=output_dir)
     except SecurityPolicyError:
         # Never retry an output path rejected by the filesystem safety checks.
         raise
@@ -67,6 +70,7 @@ def write_emergency_failure(*, output_dir: str | Path) -> None:
     Deliberately fixed text: arbitrary exceptions, payloads and partial model
     metadata must never be serialized by this last-resort public path.
     """
+    clear_repository_reports(output_dir)
     message = "OmniFlow could not complete this run. Current validation evidence is incomplete; do not merge."
     issue = {"validator": "execution", "type": "internal_execution_failure", "severity": "error", "message": message}
     report = {
@@ -121,6 +125,7 @@ def write_artifact_manifest(
     public_files = _inventory_files(root / PUBLIC_DIR)
     restricted_files = _inventory_files(root / RESTRICTED_DIR)
     restricted_present = (root / RESTRICTED_DIR).exists()
+    repository_files = _inventory_files(root / "repository")
     categories: dict[str, int] = {}
     for path in restricted_files:
         category = next(
@@ -139,6 +144,12 @@ def write_artifact_manifest(
         "public_artifacts": [f"{PUBLIC_DIR}/{path.as_posix()}" for path in public_files
                              if path.as_posix() in PUBLIC_REPORT_NAMES],
         "unrecognized_public_file_count": sum(path.as_posix() not in PUBLIC_REPORT_NAMES for path in public_files),
+        "repository_diagnostics": {
+            "audience": "repository_readers",
+            "artifacts": [f"repository/{path.as_posix()}" for path in repository_files
+                          if path.as_posix() in {"report.json", "report.md", "report.sarif", "junit.xml", "status.json"}],
+            "shareable": False,
+        },
         # This manifest is public. Count all restricted files, but never publish
         # customer model IDs, authored filenames, or content-derived paths.
         "restricted_inventory": {

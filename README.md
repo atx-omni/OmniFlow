@@ -188,7 +188,7 @@ The two optional dbt policies are complements:
 4. A credential-free preflight routes non-Omni pull requests to a successful `skipped` result before the validation process receives `OMNI_API_KEY`.
 5. OmniFlow selects the changed model from trusted base-branch metadata and resolves the Omni branch from the GitHub head branch.
 6. It pulls base and branch YAML, validates the model and content, computes the semantic diff, and searches Omni for downstream references.
-7. The pull request receives a redacted reviewer summary; detailed artifacts remain restricted to the runner unless explicitly uploaded.
+7. The pull request receives a minimal reviewer summary. Verified private-repository runs also generate source-location diagnostics; the updated validation workflow uploads those separately for repository readers, never into the PR comment.
 8. GitHub branch protection blocks merge when required OmniFlow checks fail.
 9. After review and approval, the pull request is merged. Omni's configured pull-request webhook promotes the Omni branch and publishes associated draft content.
 10. When the repository also deploys dbt, the protected production job can run `omniflow dbt sync --auto` after dbt succeeds, then rerun every enabled OmniFlow check against the refreshed model.
@@ -348,10 +348,23 @@ Each run writes root and minimal public summaries (diagnostic schema version 2):
   dbt-sync.json          # present for dbt synchronization runs
   artifact-manifest.json
   public/
+  repository/           # eligible private validation runs; source metadata, not shareable
   restricted/<model_id>/
 ```
 
 Public outputs are constructed from fixed diagnostic codes, statuses, bounded counts, booleans, anonymous context references and a random run reference. They do not copy customer messages, names, resource IDs, paths, URLs, Git identities, raw responses or runner details. Both legacy `standard` and `strict` settings use this minimal public schema; neither re-enables detailed public output. Automation consuming the old identity-rich schema must migrate. Deployment readiness uses private, in-memory evidence instead of public artifacts. See [Diagnostic Privacy](docs/DIAGNOSTIC_PRIVACY.md).
+
+**Private-repository default:** `omniflow run` now generates a separate repository-only report when GitHub.com confirms a private same-repository run and the authored Omni snapshots match the immutable Git revisions. It adds verified source files, line numbers and supported field/view/topic identifiers with corrective guidance. No source excerpts, data values, raw API messages or Omni-only dashboard identities are copied. Unsupported findings remain unmapped rather than receiving guessed locations. Public/fork/unverifiable runs and standalone report commands remain minimal; PR comments, logs, annotations and Code Security uploads stay minimal in all modes.
+
+To opt out, merge this setting into the required root `.omniflow.yml` on the trusted target branch (usually `main`):
+
+```yaml
+reporting:
+  diagnostics:
+    mode: minimal
+```
+
+The default is `repository` when omitted. The new nested setting requires a supporting OmniFlow revision. Upgrading can therefore increase artifact detail for eligible private runs; review the [upgrade notice](docs/RELEASE_NOTES.md) and update the validation workflow's separate artifact-upload step. Download `omniflow-repository-diagnostics` from the workflow run to inspect `report.md` (readable summary) or `report.json` (all findings). Repository readers can access this artifact; metadata itself can be confidential. Do not forward it as a shareable support report. `repository/status.json` records a fixed fallback reason when no detailed report is produced. The standard workflow uploads only freshly authorized detail and uses seven-day retention.
 
 Restricted artifacts are deleted by default and are never uploaded by the example workflows. Explicit retention is only for an approved private support investigation on an isolated, ephemeral runner, with owner-only files. It is not a PII/PHI/payment-data sanitizer or a compliance certification. Previously generated artifacts and copied comments are not retroactively sanitized. Upload only the explicitly listed output files, never the entire `.omniflow` or `public` directory.
 

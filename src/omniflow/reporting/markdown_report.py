@@ -5,10 +5,12 @@ from pathlib import Path
 from typing import Any
 
 from ..security import redact, secure_write_text
+from .finding_groups import group_findings
 from .issue_policy import is_blocking
 
 
 def _render_minimal_diagnostic(report: dict[str, Any]) -> str:
+    repository_detail = report.get("diagnostic_audience") == "repository"
     summary = report.get("summary", {})
     findings = report.get("issues", [])
     blocking_count = sum(is_blocking(finding) for finding in findings)
@@ -20,7 +22,10 @@ def _render_minimal_diagnostic(report: dict[str, Any]) -> str:
         f"- Validation complete: `{str(report.get('validation_complete', False)).lower()}`",
         f"- Blocking issues (all checks): `{blocking_count}`",
         f"- Recorded errors: `{summary.get('errors', 0)}`; warnings: `{summary.get('warnings', 0)}`",
-        "", "This is a minimal diagnostic report. Customer text and resource identities are omitted.",
+        "", ("Repository-only diagnostics: verified source identifiers and locations are included. "
+             "Do not forward as a shareable support report. Raw API messages and data values remain excluded."
+             if repository_detail else
+             "This report explains check categories and policy decisions without exposing customer text or resource identities."),
         "Health counts and policy blockers are different. A passing regression check does not establish "
         "that all model or content issues are resolved.",
     ]
@@ -32,6 +37,15 @@ def _render_minimal_diagnostic(report: dict[str, Any]) -> str:
             f"- Reason: `{_safe_code(classification.get('reason_code', 'unknown'))}`",
             "- Content validation remains required: Git-only classification cannot verify live content or drafts.",
         ])
+    if repository_detail:
+        detail = report.get("repository_diagnostics", {})
+        lines.extend([
+            "", f"- Findings with verified source locations: `{detail.get('mapped_findings', 0)}`",
+            f"- Findings without verified source locations: `{detail.get('unmapped_findings', 0)}`",
+            "- Locations refer to the recorded head or base snapshot, not necessarily the latest branch contents.",
+            "- Unmapped findings retain safe guidance. No location or underlying cause is guessed.",
+        ])
+    lines.extend(_public_finding_lines(findings, repository_detail=repository_detail))
     contexts = report.get("model_reports") or [report]
     lines.extend(["", "## Check Execution", ""])
     for context in contexts:
@@ -60,24 +74,6 @@ def _render_minimal_diagnostic(report: dict[str, Any]) -> str:
                 if key in check:
                     value = "unknown" if check[key] is None else str(check[key])
                     lines.append(f"- {key.replace('_', ' ')}: `{_safe_code(value)}`")
-    lines.extend(["", "## Findings", ""])
-    if not findings:
-        lines.append("No findings recorded. Check execution completeness before interpreting this as a pass.")
-    # Sample only after prioritizing blockers; a large unchanged baseline must
-    # never hide the new issue or evidence failure that actually blocks the PR.
-    ordered_findings = sorted(findings, key=lambda issue: (not is_blocking(issue), issue.get("active") is False))
-    for index, finding in enumerate(ordered_findings[:20], 1):
-        lines.append(f"{index}. `{_safe_code(finding.get('validator', 'execution'))}` / "
-                     f"`{_safe_code(finding.get('type', 'omniflow_finding'))}` "
-                     f"({ _safe_code(finding.get('severity', 'unknown')) }): "
-                     f"{_safe_text(finding.get('message', 'Details withheld.'))}")
-        for key in ("context_reference", "validation_scope", "state", "reason_code", "candidate_reason", "comparison_mode",
-                    "comparison_status", "content_health", "model_health", "regression_status", "blocking", "active"):
-            if key in finding:
-                value = str(finding[key]).lower() if type(finding[key]) is bool else finding[key]
-                lines.append(f"   - {key.replace('_', ' ')}: `{_safe_code(value)}`")
-    if len(findings) > 20:
-        lines.append("Additional safe findings are available in the JSON report.")
     lines.extend([
         "", "## Next Steps", "",
         "- For readable content findings, inspect Content Validator in Omni for the same model, branch, "
@@ -91,6 +87,46 @@ def _render_minimal_diagnostic(report: dict[str, Any]) -> str:
         "missing evidence as a clean baseline or disable validation to obtain a pass.",
     ])
     return "\n".join(lines) + "\n"
+
+
+def _public_finding_lines(findings: list[dict[str, Any]], *, repository_detail: bool = False) -> list[str]:
+    lines = ["", "## Findings", ""]
+    if not findings:
+        return lines + ["No findings recorded. Check execution completeness before interpreting this as a pass."]
+    groups = group_findings(findings)
+    for blocking, title in ((True, "Blocking findings"), (False, "Nonblocking findings")):
+        selected = [(finding, count) for finding, count in groups if is_blocking(finding) is blocking]
+        total = sum(count for _, count in selected)
+        lines.extend([f"### {title} — {total} occurrence{'s' if total != 1 else ''}", ""])
+        if not selected:
+            lines.extend(["None recorded.", ""])
+            continue
+        if not blocking:
+            lines.extend(["These findings do not cause this run to fail. Counts are occurrences, not unique objects. "
+                          "Lint findings describe the checked model; they are not proof of a new PR regression.", ""])
+        for index, (finding, count) in enumerate(selected[:20], 1):
+            code = finding.get("rule_id") or finding.get("type", "omniflow_finding")
+            lines.append(f"{index}. `{_safe_code(finding.get('validator', 'execution'))}` / `{_safe_code(code)}` "
+                         f"({_safe_code(finding.get('severity', 'unknown'))}) — "
+                         f"**{count} occurrence{'s' if count != 1 else ''}**: "
+                         f"{_safe_text(finding.get('message', 'No recognized diagnostic category was supplied.'))}")
+            lines.append(f"   - policy: `{'blocking' if blocking else 'nonblocking'}`")
+            if repository_detail:
+                for key in ("file", "line", "field", "view", "topic", "source_revision", "diagnostic_code"):
+                    if key in finding:
+                        lines.append(f"   - {key.replace('_', ' ')}: `{_safe_code(finding[key])}`")
+            for key in ("context_reference", "validation_scope", "state", "reason_code", "candidate_reason",
+                        "comparison_mode", "comparison_status", "content_health", "model_health",
+                        "regression_status", "active"):
+                if key in finding:
+                    value = str(finding[key]).lower() if type(finding[key]) is bool else finding[key]
+                    lines.append(f"   - {key.replace('_', ' ')}: `{_safe_code(value)}`")
+        if len(selected) > 20:
+            omitted = sum(count for _, count in selected[20:])
+            lines.append(f"Additional safe findings are available in the JSON report: "
+                         f"{len(selected) - 20} more categories, {omitted} occurrences.")
+        lines.append("")
+    return lines
 
 
 def _comparison_outcome(check: dict[str, Any], validator: str) -> str:

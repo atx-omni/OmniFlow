@@ -48,7 +48,7 @@ from .exceptions import ConfigError, ExitCodes, OmniAuthError, OmniFlowError, Om
 from .execution import ValidationProgress, scope_findings
 from .exposures import run_dbt_exposure_enrichment
 from .git import current_branch, current_sha, event_name, git_executable, git_value, is_pull_request_event, pr_number
-from .github.annotations import annotation_lines
+from .github.annotations import public_annotation_lines
 from .github.repair_attempt import GitHubRepairAttemptGuard, load_repair_event
 from .logging import configure_logging
 from .nonsemantic import classify_pr_change
@@ -57,6 +57,16 @@ from .repair.orchestrator import run_ai_repair, validate_ai_repair_policy
 from .repair.reporting import write_repair_artifacts
 from .reporting.issue_policy import is_blocking
 from .reporting.json_report import write_json_report
+from .repository_diagnostics import (
+    REPORT_NAMES as REPOSITORY_REPORT_NAMES,
+)
+from .repository_diagnostics import (
+    clear_repository_reports,
+    finish_repository_context,
+    publish_repository_output,
+    repository_reporting,
+    start_repository_context,
+)
 from .revision_data import pull_request_changed_files, pull_request_revision
 from .security import redact, validate_path_segment, validate_repo_output_path
 from .timestamps import utc_now_iso
@@ -224,7 +234,8 @@ def cmd_run(args: argparse.Namespace, *, changed_files: list[str] | None = None)
     output_dir = Path(config.reporting.output_dir)
     _validate_run_output_layout(output_dir)
     try:
-        return _execute_run(args, config=config, output_dir=output_dir, changed_files=changed_files)
+        with repository_reporting(config, output_dir=output_dir):
+            return _execute_run(args, config=config, output_dir=output_dir, changed_files=changed_files)
     except OmniFlowError:
         raise
     except Exception:
@@ -335,6 +346,7 @@ def _execute_run(args, *, config, output_dir: Path, changed_files: list[str] | N
         redaction_level=config.security.redaction_level,
     )
     _emit_hold_output(all_issues, settings=config.breaking_change_hold)
+    publish_repository_output()
     print(f"OmniFlow complete: models={len(contexts)} issues={summary['total_issues']} exit_code={exit_code}")
     return exit_code
 
@@ -751,6 +763,12 @@ def _run_context_steps(
         if regression_pr:
             baseline_proof = verify_candidate(client, context, revision_side="base")
 
+    repository_evidence = start_repository_context(
+        context, client, branch_id=branch_id,
+        head_proof=context.candidate_verification if verify_provenance else None,
+        base_proof=baseline_proof,
+    )
+
     if config.content_validation.enabled:
         progress.begin("content")
         content_report, content_exit = run_content_validation(
@@ -946,6 +964,11 @@ def _run_context_steps(
             raise ConfigError("Base evidence changed during validation; rerun the current PR")
         context.candidate_verification = after
         progress.complete("candidate")
+    finish_repository_context(
+        repository_evidence, context, client, all_issues, branch_id=branch_id,
+        head_proof=context.candidate_verification if verify_provenance else None,
+        base_proof=baseline_proof,
+    )
     progress.begin("reporting")
     progress.complete("reporting")
     scope_findings(all_issues, model_id=context.model_id, branch_id=branch_id, branch_name=context.branch_name)
@@ -1846,8 +1869,7 @@ def _runner_metadata() -> dict[str, Any]:
 def _emit_github_annotations(issues: list[dict[str, Any]], *, limit: int) -> None:
     if os.getenv("GITHUB_ACTIONS") != "true":
         return
-    prioritized = sorted(issues, key=lambda issue: not is_blocking(issue))
-    for line in annotation_lines(prioritized[:limit]):
+    for line in public_annotation_lines(issues, limit=limit):
         print(line)
 
 
@@ -1878,12 +1900,20 @@ def _validate_run_output_layout(output_dir: Path) -> None:
         "repair.json",
         "repair.md",
     )
-    for path in (output_dir, public_dir(output_dir), restricted_dir(output_dir)):
+    for path in (output_dir, public_dir(output_dir), restricted_dir(output_dir), output_dir / "repository"):
         validate_repo_output_path(path)
     for name in report_names:
         validate_repo_output_path(output_dir / name)
         validate_repo_output_path(public_dir(output_dir) / name)
     validate_repo_output_path(output_dir / "artifact-manifest.json")
+    for name in (*REPOSITORY_REPORT_NAMES, "status.json"):
+        path = output_dir / "repository" / name
+        validate_repo_output_path(path)
+        if path.exists() and not path.is_file():
+            raise SecurityPolicyError("Repository diagnostic output must be a regular file")
+    # Routing, repair, and early standalone guards may never reach the common
+    # report writer. Preflight every expected path before clearing old detail.
+    clear_repository_reports(output_dir)
 
 
 def _validate_context_output_layout(output_dir: Path) -> None:
