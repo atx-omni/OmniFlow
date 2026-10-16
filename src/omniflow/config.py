@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .exceptions import ConfigError, SecurityPolicyError
+from .exceptions import ConfigError, MissingPolicyError, SecurityPolicyError
 from .security import contains_secret_key, reject_secret_keys, validate_repo_output_path
 from .trust import read_trusted_repo_text
 from .yaml_security import parse_secure_yaml
@@ -40,21 +40,34 @@ OMNI_KEYS = {
     "include_personal_folders",
     "timeout",
 }
-CHECK_KEYS = {"content_validation", "model_validation", "semantic_lint", "dbt_exposures", "dbt_impact"}
-CONTENT_KEYS = {"enabled", "fail_on_new_only", "labels"}
-MODEL_KEYS = {"enabled", "fail_on_warnings"}
+CHECK_KEYS = {"content_validation", "model_validation", "semantic_lint", "dbt_exposures", "dbt_impact", "ai_eval"}
+CONTENT_KEYS = {"enabled", "fail_on_new_only", "labels", "classify_comment_only"}
+MODEL_KEYS = {"enabled", "fail_on_warnings", "fail_on_new_only"}
 LINT_KEYS = {"enabled", "rules"}
 EXPOSURE_KEYS = {"enabled", "fail_on_unavailable"}
 DBT_IMPACT_KEYS = {
     "enabled",
     "manifest_path",
     "fail_on_orphaned_references",
+    "fail_on_incomplete_coverage",
     "omni_yaml_paths",
     "table_mapping",
 }
 TABLE_MAPPING_KEYS = {"dbt_model", "omni_view", "sql_table_name"}
 MAX_TABLE_MAPPINGS = 500
-REPORTING_KEYS = {"formats", "output_dir"}
+AI_EVAL_KEYS = {
+    "enabled",
+    "prompt_sets",
+    "fail_on_regression",
+    "poll_interval_seconds",
+    "timeout_seconds",
+    "scoring_grace_seconds",
+}
+PROMPT_SET_KEYS = {"id", "label", "model_id"}
+MAX_PROMPT_SETS = 20
+REPORTING_KEYS = {"formats", "output_dir", "diagnostics"}
+DIAGNOSTICS_KEYS = {"mode"}
+DIAGNOSTICS_MODES = {"repository", "minimal"}
 SECURITY_KEYS = {
     "redact_logs",
     "allow_raw_response_output",
@@ -159,19 +172,17 @@ def config_hash(payload: dict[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def load_raw_config(path: str | Path | None = None) -> tuple[dict[str, Any], Path | None]:
-    candidates = [Path(path)] if path else [Path(DEFAULT_CONFIG_PATH)]
-    for candidate in candidates:
-        text = read_trusted_repo_text(candidate)
-        if text is None:
-            continue
-        payload = parse_secure_yaml(text, source=str(candidate))
-        if not isinstance(payload, dict):
-            raise ConfigError(f"Config file '{candidate}' must contain a top-level mapping")
-        reject_secret_keys(payload, source=str(candidate))
-        _validate_config_schema(payload)
-        return expand_env_vars(payload), candidate
-    return {}, None
+def load_raw_config(path: str | Path | None = None) -> tuple[dict[str, Any], Path]:
+    candidate = Path(path) if path else Path(DEFAULT_CONFIG_PATH)
+    text = read_trusted_repo_text(candidate)
+    if text is None:
+        raise MissingPolicyError()
+    payload = parse_secure_yaml(text, source=str(candidate))
+    if not isinstance(payload, dict) or not payload:
+        raise ConfigError(f"Config file '{candidate}' must contain a non-empty top-level mapping")
+    reject_secret_keys(payload, source=str(candidate))
+    _validate_config_schema(payload)
+    return expand_env_vars(payload), candidate
 
 
 @dataclass
@@ -189,6 +200,7 @@ class OmniSettings:
 class ContentValidationSettings:
     enabled: bool = True
     fail_on_new_only: bool = False
+    classify_comment_only: bool = False
     labels: list[str] = field(default_factory=list)
 
 
@@ -196,6 +208,7 @@ class ContentValidationSettings:
 class ModelValidationSettings:
     enabled: bool = True
     fail_on_warnings: bool = False
+    fail_on_new_only: bool = False
 
 
 @dataclass
@@ -225,14 +238,26 @@ class DbtImpactSettings:
     enabled: bool = False
     manifest_path: str | None = None
     fail_on_orphaned_references: bool = True
+    fail_on_incomplete_coverage: bool = True
     omni_yaml_paths: list[str] = field(default_factory=list)
     table_mapping: list[dict[str, str]] = field(default_factory=list)
+
+
+@dataclass
+class AiEvalSettings:
+    enabled: bool = False
+    prompt_sets: list[dict[str, str]] = field(default_factory=list)
+    fail_on_regression: bool = True
+    poll_interval_seconds: int = 10
+    timeout_seconds: int = 900
+    scoring_grace_seconds: int = 180
 
 
 @dataclass
 class ReportingSettings:
     formats: list[str] = field(default_factory=lambda: list(DEFAULT_REPORT_FORMATS))
     output_dir: str = ".omniflow"
+    diagnostics_mode: str = "repository"
 
 
 @dataclass
@@ -282,6 +307,7 @@ class OmniFlowConfig:
     contracts: ContractSettings
     dbt_exposures: DbtExposureSettings
     dbt_impact: DbtImpactSettings
+    ai_eval: AiEvalSettings
     reporting: ReportingSettings
     security: SecuritySettings
     ai_repair: AIRepairSettings
@@ -313,6 +339,7 @@ def _to_config(raw: dict[str, Any], source: Path | None) -> OmniFlowConfig:
     lint_raw = _mapping(checks_raw.get("semantic_lint"), "checks.semantic_lint")
     exposures_raw = _mapping(checks_raw.get("dbt_exposures"), "checks.dbt_exposures")
     dbt_impact_raw = _mapping(checks_raw.get("dbt_impact"), "checks.dbt_impact")
+    ai_eval_raw = _mapping(checks_raw.get("ai_eval"), "checks.ai_eval")
     lint_rules = _lint_rules(lint_raw.get("rules"))
     formats = _report_formats(reporting_raw.get("formats"))
     output_dir = _output_dir(reporting_raw.get("output_dir"))
@@ -348,6 +375,9 @@ def _to_config(raw: dict[str, Any], source: Path | None) -> OmniFlowConfig:
     )
     content = ContentValidationSettings(
         enabled=parse_bool("content_validation.enabled", content_raw.get("enabled"), True),
+        classify_comment_only=parse_bool(
+            "content_validation.classify_comment_only", content_raw.get("classify_comment_only"), False
+        ),
         fail_on_new_only=parse_bool(
             "content_validation.fail_on_new_only",
             os.getenv("OMNI_FAIL_ON_NEW_ONLY", content_raw.get("fail_on_new_only")),
@@ -358,6 +388,7 @@ def _to_config(raw: dict[str, Any], source: Path | None) -> OmniFlowConfig:
     model = ModelValidationSettings(
         enabled=parse_bool("model_validation.enabled", model_raw.get("enabled"), True),
         fail_on_warnings=parse_bool("model_validation.fail_on_warnings", model_raw.get("fail_on_warnings"), False),
+        fail_on_new_only=parse_bool("model_validation.fail_on_new_only", model_raw.get("fail_on_new_only"), False),
     )
     lint = SemanticLintSettings(
         enabled=parse_bool("semantic_lint.enabled", lint_raw.get("enabled"), True),
@@ -419,14 +450,48 @@ def _to_config(raw: dict[str, Any], source: Path | None) -> OmniFlowConfig:
             dbt_impact_raw.get("fail_on_orphaned_references"),
             True,
         ),
+        fail_on_incomplete_coverage=parse_bool(
+            "dbt_impact.fail_on_incomplete_coverage",
+            dbt_impact_raw.get("fail_on_incomplete_coverage"),
+            True,
+        ),
         omni_yaml_paths=_repo_path_list(
             dbt_impact_raw.get("omni_yaml_paths"), name="checks.dbt_impact.omni_yaml_paths"
         ),
         table_mapping=_table_mapping(dbt_impact_raw.get("table_mapping")),
     )
+    ai_eval = AiEvalSettings(
+        enabled=parse_bool("ai_eval.enabled", ai_eval_raw.get("enabled"), False),
+        prompt_sets=_prompt_sets(ai_eval_raw.get("prompt_sets")),
+        fail_on_regression=parse_bool(
+            "ai_eval.fail_on_regression", ai_eval_raw.get("fail_on_regression"), True
+        ),
+        poll_interval_seconds=_bounded_int(
+            "checks.ai_eval.poll_interval_seconds",
+            ai_eval_raw.get("poll_interval_seconds", 10),
+            minimum=2,
+            maximum=30,
+            default=10,
+        ),
+        timeout_seconds=_bounded_int(
+            "checks.ai_eval.timeout_seconds",
+            ai_eval_raw.get("timeout_seconds", 900),
+            minimum=30,
+            maximum=3_600,
+            default=900,
+        ),
+        scoring_grace_seconds=_bounded_int(
+            "checks.ai_eval.scoring_grace_seconds",
+            ai_eval_raw.get("scoring_grace_seconds", 180),
+            minimum=0,
+            maximum=600,
+            default=180,
+        ),
+    )
     reporting = ReportingSettings(
         formats=formats,
         output_dir=output_dir,
+        diagnostics_mode=_diagnostics_mode(reporting_raw),
     )
     security = SecuritySettings(
         redact_logs=parse_bool("security.redact_logs", security_raw.get("redact_logs"), True),
@@ -520,6 +585,7 @@ def _to_config(raw: dict[str, Any], source: Path | None) -> OmniFlowConfig:
         contracts=contracts,
         dbt_exposures=dbt_exposures,
         dbt_impact=dbt_impact,
+        ai_eval=ai_eval,
         reporting=reporting,
         security=security,
         ai_repair=ai_repair,
@@ -689,6 +755,44 @@ def _table_mapping(value: Any) -> list[dict[str, str]]:
     return mappings
 
 
+def _prompt_sets(value: Any) -> list[dict[str, str]]:
+    """Validate the ai_eval prompt sets to evaluate, modeled on _table_mapping."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ConfigError("checks.ai_eval.prompt_sets must be a list of prompt set mappings")
+    if len(value) > MAX_PROMPT_SETS:
+        raise SecurityPolicyError(f"checks.ai_eval.prompt_sets cannot exceed {MAX_PROMPT_SETS} entries")
+    prompt_sets: list[dict[str, str]] = []
+    seen_ids: set[str] = set()
+    for item in value:
+        if not isinstance(item, dict):
+            raise ConfigError("checks.ai_eval.prompt_sets entries must be mappings")
+        _reject_unknown_keys(item, PROMPT_SET_KEYS, "checks.ai_eval.prompt_sets entry")
+        prompt_set_id = item.get("id")
+        if not isinstance(prompt_set_id, str) or not prompt_set_id.strip() or len(prompt_set_id.strip()) > 128:
+            raise ConfigError(
+                "checks.ai_eval.prompt_sets entries require a non-empty id no longer than 128 characters"
+            )
+        prompt_set_id = prompt_set_id.strip()
+        if prompt_set_id in seen_ids:
+            raise ConfigError(f"checks.ai_eval.prompt_sets id '{prompt_set_id}' is duplicated")
+        seen_ids.add(prompt_set_id)
+        label = item.get("label")
+        if label is not None and (not isinstance(label, str) or not label.strip() or len(label.strip()) > 200):
+            raise ConfigError(
+                "checks.ai_eval.prompt_sets label must be a non-empty string no longer than 200 characters"
+            )
+        entry = {"id": prompt_set_id, "label": label.strip() if label else prompt_set_id}
+        model_id = item.get("model_id")
+        if model_id is not None:
+            if not isinstance(model_id, str) or not model_id.strip() or len(model_id.strip()) > 128:
+                raise ConfigError("checks.ai_eval.prompt_sets model_id must be a non-empty string of at most 128 characters")
+            entry["model_id"] = model_id.strip()
+        prompt_sets.append(entry)
+    return prompt_sets
+
+
 def _mapping(value: Any, name: str) -> dict[str, Any]:
     if value is None:
         return {}
@@ -709,6 +813,7 @@ def _validate_config_schema(raw: dict[str, Any]) -> None:
     _reject_unknown_keys(omni, OMNI_KEYS, "omni")
     _reject_unknown_keys(checks, CHECK_KEYS, "checks")
     _reject_unknown_keys(reporting, REPORTING_KEYS, "reporting")
+    _diagnostics_mode(reporting)
     _reject_unknown_keys(security, SECURITY_KEYS, "security")
     _reject_unknown_keys(contracts, CONTRACT_KEYS, "contracts")
     _reject_unknown_keys(repairs, REPAIR_KEYS, "repairs")
@@ -748,6 +853,11 @@ def _validate_config_schema(raw: dict[str, Any]) -> None:
         _mapping(checks.get("dbt_impact"), "checks.dbt_impact"),
         DBT_IMPACT_KEYS,
         "checks.dbt_impact",
+    )
+    _reject_unknown_keys(
+        _mapping(checks.get("ai_eval"), "checks.ai_eval"),
+        AI_EVAL_KEYS,
+        "checks.ai_eval",
     )
     _reject_unknown_keys(
         _mapping(contracts.get("fail_on"), "contracts.fail_on"),
@@ -794,6 +904,19 @@ def _report_formats(value: Any) -> list[str]:
     if unknown:
         raise ConfigError(f"Unknown reporting format(s): {', '.join(unknown)}")
     return formats
+
+
+def _diagnostics_mode(reporting: dict[str, Any]) -> str:
+    """Disclosure policy is literal; environment expansion must not enable it."""
+    diagnostics = reporting.get("diagnostics", {})
+    if not isinstance(diagnostics, dict):
+        raise ConfigError("reporting.diagnostics must be a mapping")
+    if any(key not in DIAGNOSTICS_KEYS for key in diagnostics):
+        raise ConfigError("reporting.diagnostics contains unsupported keys")
+    mode = diagnostics.get("mode", "repository")
+    if not isinstance(mode, str) or mode not in DIAGNOSTICS_MODES:
+        raise ConfigError("reporting.diagnostics.mode must be 'repository' or 'minimal'")
+    return mode
 
 
 def _output_dir(value: Any) -> str:

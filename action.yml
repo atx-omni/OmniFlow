@@ -6,12 +6,16 @@ inputs:
     required: false
     default: validate
   config:
-    description: Path to .omniflow.yml
+    description: Required policy file path (default repository-root .omniflow.yml, separate from the GitHub workflow). Must exist on the trusted base for PR validation.
     required: false
     default: .omniflow.yml
   omni-api-key:
     description: Dedicated least-privilege Omni personal access token. Exposed only to the validation step.
     required: false
+  validation-environment:
+    description: Version 2 target environment bound to the supplied environment-scoped validation credential.
+    required: false
+    default: ""
   repair-api-key:
     description: Separate write-capable Omni PAT. Exposed only to the opt-in repair step.
     required: false
@@ -25,15 +29,21 @@ inputs:
   last-sync-sha:
     description: >-
       Commit SHA recorded by the last successful dbt sync. The calling workflow
-      should pass vars.OMNIFLOW_LAST_SYNC_SHA to enable pending-deployment
-      detection in the breaking-change hold policy.
+      should pass vars.OMNIFLOW_LAST_SYNC_SHA as deployment evidence for the
+      breaking-change hold policy. When enabled with action: fail, the policy
+      blocks breaking changes if that evidence is missing, blank, unreachable,
+      or not an ancestor of the trusted base.
     required: false
     default: ""
 outputs:
+  repository-diagnostics-ready:
+    description: Fresh repository-only reports were generated for this trusted private run. Not shareable output.
+    value: ${{ steps.validate.outputs.repository_diagnostics_ready }}
   hold-triggered:
     description: >-
-      "true" when the breaking-change hold policy parked this pull request because a dbt
-      deployment must land first. Empty unless the policy is enabled in trusted policy config.
+      "true" when the breaking-change hold policy found same-PR dbt overlap,
+      pending dbt deployment, or unavailable sync evidence for a breaking change.
+      Empty unless the policy is enabled in trusted policy config.
     value: ${{ steps.validate.outputs.hold_triggered }}
   hold-pending-label:
     description: Label a protected workflow should apply while the pull request is held.
@@ -93,6 +103,7 @@ runs:
       if: inputs.mode == 'validate' && inputs['skip-reason'] != ''
       shell: bash
       env:
+        OMNIFLOW_ACTION_REF: ${{ github.action_ref }}
         OMNIFLOW_INPUT_CONFIG: ${{ inputs.config }}
         OMNIFLOW_INPUT_SKIP_REASON: ${{ inputs['skip-reason'] }}
       run: |
@@ -105,6 +116,7 @@ runs:
       if: inputs.mode == 'validate' && inputs['skip-reason'] == ''
       shell: bash
       env:
+        OMNIFLOW_ACTION_REF: ${{ github.action_ref }}
         OMNIFLOW_INPUT_CONFIG: ${{ inputs.config }}
         OMNIFLOW_GITHUB_TOKEN: ${{ github.token }}
       run: |
@@ -114,13 +126,26 @@ runs:
 
     - name: Run OmniFlow
       id: validate
-      if: inputs.mode == 'validate' && inputs['skip-reason'] == '' && steps.route.outputs.should_run == 'true'
+      if: inputs.mode == 'validate' && inputs['skip-reason'] == '' && steps.route.outputs.should_run == 'true' && steps.route.outputs.requires_omni == 'true'
       shell: bash
       env:
+        OMNIFLOW_ACTION_REF: ${{ github.action_ref }}
         OMNI_API_KEY: ${{ inputs['omni-api-key'] }}
+        OMNIFLOW_ENVIRONMENT: ${{ inputs['validation-environment'] }}
         OMNIFLOW_INPUT_CONFIG: ${{ inputs.config }}
         OMNIFLOW_GITHUB_TOKEN: ${{ github.token }}
         OMNIFLOW_LAST_SYNC_SHA: ${{ inputs['last-sync-sha'] }}
+      run: |
+        set -euo pipefail
+        omniflow run --auto --config "$OMNIFLOW_INPUT_CONFIG"
+
+    - name: Run dbt impact without Omni credentials
+      if: inputs.mode == 'validate' && inputs['skip-reason'] == '' && steps.route.outputs.should_run == 'true' && steps.route.outputs.requires_omni == 'false'
+      shell: bash
+      env:
+        OMNIFLOW_ACTION_REF: ${{ github.action_ref }}
+        OMNIFLOW_INPUT_CONFIG: ${{ inputs.config }}
+        OMNIFLOW_GITHUB_TOKEN: ${{ github.token }}
       run: |
         set -euo pipefail
         omniflow run --auto --config "$OMNIFLOW_INPUT_CONFIG"
@@ -129,6 +154,7 @@ runs:
       if: inputs.mode == 'repair'
       shell: bash
       env:
+        OMNIFLOW_ACTION_REF: ${{ github.action_ref }}
         OMNIFLOW_REPAIR_API_KEY: ${{ inputs['repair-api-key'] }}
         OMNIFLOW_INPUT_CONFIG: ${{ inputs.config }}
         OMNIFLOW_GITHUB_TOKEN: ${{ github.token }}
@@ -140,6 +166,7 @@ runs:
       if: inputs.mode == 'dbt-sync'
       shell: bash
       env:
+        OMNIFLOW_ACTION_REF: ${{ github.action_ref }}
         OMNIFLOW_SYNC_API_KEY: ${{ inputs['sync-api-key'] }}
         OMNIFLOW_INPUT_CONFIG: ${{ inputs.config }}
       run: |

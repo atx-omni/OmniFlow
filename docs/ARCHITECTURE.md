@@ -1,5 +1,13 @@
 # OmniFlow Architecture And Operating Guide
 
+> **Historical v0.4.0 reference — not current setup or security guidance.**
+> Preserved from the ATX repository during synchronization with ExploreOmni.
+> The implementation has since changed, including trusted policy, validation
+> comparisons, diagnostic privacy, and AI safeguards. Use the current
+> [installation guide](INSTALLATION.md), [configuration reference](CONFIGURATION.md),
+> [security model](SECURITY_MODEL.md), [diagnostic privacy guide](DIAGNOSTIC_PRIVACY.md),
+> and [testing guide](TESTING.md) for current behavior and acceptance requirements.
+
 **Version:** 0.4.0 (controlled alpha)
 **Audience:** Omni product management and engineering
 **Repositories:** [atx-omni/OmniFlow](https://github.com/atx-omni/OmniFlow), [exploreomni/OmniFlow](https://github.com/exploreomni/OmniFlow)

@@ -4,6 +4,8 @@ OmniFlow is an open-source, local-first CI/CD companion for Omni semantic-layer 
 
 > **Status:** Controlled alpha. The complete Omni-created PR, validation, evidence, merge, and Omni synchronization path has passed on a maintainer-controlled non-production model. The post-deployment dbt schema-refresh stage has automated contract coverage but still requires its first live non-production connection test. Each adopter must complete the live installation gate against its own model, permissions, dbt deployment, Git settings, GitHub plan, and branch protections before making OmniFlow a required check.
 
+Historical pilot success does not qualify a new commit. Core validation is the initial release candidate scope; dbt impact, sync/hold, and AI eval require separate acceptance and remain opt-in. AI repair remains unsupported. Use the [release and adopter acceptance checklist](docs/RELEASE_READINESS.md) to record the exact candidate and outstanding gates.
+
 ## Quick Start
 
 The complete walkthrough is in [Install OmniFlow In A GitHub Repository](docs/INSTALLATION.md). The short path is:
@@ -12,7 +14,7 @@ The complete walkthrough is in [Install OmniFlow In A GitHub Repository](docs/IN
 2. Copy [`.omni/flow.example.json`](.omni/flow.example.json) to `.omni/flow.json`, then add the tenant URL, model ID, repository model path, and base branch.
 3. Copy [the workflow example](.github/workflow-examples/omniflow.yml) to `.github/workflows/omniflow.yml`, pin both action references to the same reviewed 40-character OmniFlow commit SHA, and add CODEOWNERS coverage.
 4. Protect the base branch before storing any Omni credential. Require pull requests, normal reviewer approval, and review from the owners of the workflow and trusted metadata.
-5. Optionally copy [`.omniflow.example.yml`](.omniflow.example.yml) to `.omniflow.yml`, then merge the setup files through the protected process.
+5. Copy the canonical [`.omniflow.yml`](.omniflow.yml) into the **customer repository root**, then merge it with the workflow and model metadata through the protected setup process before validating Omni pull requests. The policy file is required; it is separate from `.github/workflows/omniflow.yml`.
 6. Create a dedicated least-privilege Omni personal access token and store it as the GitHub Actions secret `OMNI_API_KEY`. Do not use an Organization API Key.
 7. Create a harmless model change in an Omni branch, select **Create pull request**, and confirm OmniFlow validates the resulting GitHub pull request.
 8. For repositories that deploy dbt, optionally add the protected [post-deployment dbt sync](docs/DBT_SYNC.md) after the production dbt command succeeds.
@@ -25,7 +27,7 @@ The workflow always preserves `report.sarif` in the evidence artifact. Repositor
 
 ## What OmniFlow Checks
 
-- Omni model validation, with separate error and warning policy
+- Omni model validation, with independent branch-to-base regression and warning policy
 - Omni Content Validator results, including branch-to-base comparison for new-only policy
 - Authored Models, Topics, Views, fields, and global or topic-level Relationship YAML
 - Semantic lint rules for descriptions, primary keys, labels, topic owners, cardinality, and governance
@@ -34,9 +36,10 @@ The workflow always preserves `report.sarif` in the evidence artifact. Repositor
 - Optional post-deployment dbt metadata refresh with asynchronous job polling and full revalidation
 - Optional single-branch breaking-change hold that keeps dbt and Omni merges in a safe order
 - Optional dbt impact analysis that blocks dbt changes which would orphan Omni references
+- Optional [AI eval](docs/AI_EVAL.md) regression check that compares Omni AI accuracy between `main` and the branch
 - JSON, Markdown, SARIF, JUnit, and evidence artifacts
 
-Core OmniFlow validation does not execute warehouse queries, store query results, write model YAML, or merge pull requests. An [AI Repair development scaffold](docs/AI_REPAIR.md) is present but is disabled, unreleased, and not supported for customer installation because Omni does not currently document a public Modeling Agent mutation API.
+Core OmniFlow validation does not execute warehouse queries, store query results, write model YAML, or merge pull requests. An [AI Repair development scaffold](docs/AI_REPAIR.md) is present but is disabled, unreleased, and not supported for customer installation because Omni does not currently document a public Modeling Agent mutation API. Optional [AI eval](docs/AI_EVAL.md) starts agentic jobs for curated prompt sets and stays disabled pending non-production acceptance. Its narrow binary-score policy blocks unsupported scores and incomplete results; permissions, service capacity, query behavior, and costs must be confirmed in the selected tenant before enablement.
 
 ## How OmniFlow Works — By Example
 
@@ -85,29 +88,22 @@ Developer adds a new column in dbt + adds the field in Omni (same PR)
   → Merge → dbt deploys → omniflow dbt sync → Omni refreshes
 ```
 
-**Breaking change — OmniFlow sequences automatically:**
+**Breaking change — preserve compatibility through every phase:**
 
 ```text
-Developer renames customer_id → customer_key in dbt AND updates the Omni view (same PR)
-  → OmniFlow detects: breaking Omni change + dbt source change in the same PR
-  → BLOCKS merge: "Split required for safe deployment"
-
-Developer splits into two PRs:
-
-PR 1 (dbt only): renames the column in dbt
-  → Passes → merges → dbt deploys → warehouse now has customer_key
-  → omniflow dbt sync → Omni refreshes → sync SHA recorded
-
-PR 2 (Omni only): updates the view to reference customer_key
-  → Hold clears (no pending dbt changes)
-  → OmniFlow validates contracts: no content references the old name
-  → Auto-merge completes → Omni promotes safely
+1. Expand: add customer_key while retaining customer_id and compatible values.
+   → Review → dbt deploys → refresh and validation succeed → sync SHA recorded.
+2. Migrate: update Omni definitions and consumers to customer_key.
+   → Explicitly revalidate the current PR head against durable sync evidence.
+   → Fresh checks and independent review → manual merge.
+3. Contract: remove customer_id only after proving no consumer requires it.
+   → Review downstream evidence → deploy → verify and record recovery evidence.
 ```
 
 **Breaking change in separate PRs, wrong order:**
 
 ```text
-PR A (dbt): renames customer_id → customer_key (merges, but dbt hasn't deployed yet)
+PR A (dbt): adds customer_key alongside customer_id (merges, but hasn't deployed yet)
 PR B (Omni): updates the view to reference customer_key
 
   → OmniFlow validates PR B:
@@ -117,11 +113,12 @@ PR B (Omni): updates the view to reference customer_key
     → PR B is labeled omniflow/awaiting-deploy
 
   → dbt deploys → omniflow dbt sync → sync SHA recorded
-  → Workflow removes the label → enables auto-merge
-  → GitHub re-runs OmniFlow on PR B:
+  → Maintainer explicitly dispatches current-head revalidation for PR B:
     - No pending dbt changes → hold clears
     - Contract validation: no dashboards reference old name
-    → PASSES → PR B merges → Omni promotes against a ready warehouse
+    → Verify head and sync evidence did not change during validation
+    → Attach successful readiness check to that head and clear configured label
+    → Independent review and manual merge → Omni promotes against a ready warehouse
 ```
 
 ### Scenario 4: Two dbt-Only PRs With Breaking Changes
@@ -161,8 +158,11 @@ External contributor opens a PR from a fork
 | Additive model change (new field, new view) | Pass |
 | Breaking change with no downstream references | Warning (pass) |
 | Breaking change referenced by a dashboard | Fail (contract violation) |
-| Model validation errors | Fail |
-| Content Validator issues (new-only policy) | Fail |
+| New model errors or additional occurrences (new-only policy) | Fail |
+| New model warnings (new-only policy) | Warning; fail only with `fail_on_warnings: true` |
+| New Content Validator issues or additional occurrences (new-only policy) | Fail |
+| Unchanged, identity-matched model/content issues on the live base | Reported; nonblocking under the respective new-only policy |
+| Missing, malformed, or ambiguous comparison evidence | Block; never assume inherited issues |
 | Breaking Omni + dbt change in same PR (hold enabled) | Fail (split required) |
 | Breaking Omni while dbt deployment pending (hold enabled) | Fail (held until sync) |
 | dbt-only PR removing a column Omni references (impact enabled) | Fail (orphaned reference) |
@@ -188,7 +188,7 @@ The two optional dbt policies are complements:
 4. A credential-free preflight routes non-Omni pull requests to a successful `skipped` result before the validation process receives `OMNI_API_KEY`.
 5. OmniFlow selects the changed model from trusted base-branch metadata and resolves the Omni branch from the GitHub head branch.
 6. It pulls base and branch YAML, validates the model and content, computes the semantic diff, and searches Omni for downstream references.
-7. The pull request receives a redacted reviewer summary; detailed artifacts remain restricted to the runner unless explicitly uploaded.
+7. The pull request receives a minimal reviewer summary. Verified private-repository runs also generate source-location diagnostics; the updated validation workflow uploads those separately for repository readers, never into the PR comment.
 8. GitHub branch protection blocks merge when required OmniFlow checks fail.
 9. After review and approval, the pull request is merged. Omni's configured pull-request webhook promotes the Omni branch and publishes associated draft content.
 10. When the repository also deploys dbt, the protected production job can run `omniflow dbt sync --auto` after dbt succeeds, then rerun every enabled OmniFlow check against the refreshed model.
@@ -208,7 +208,7 @@ Copy `.github/workflow-examples/omniflow.yml` into the customer repository as `.
 The action installs from that pinned checkout during alpha testing:
 
 ```yaml
-- uses: atx-omni/OmniFlow@<pinned-commit-sha>
+- uses: exploreomni/OmniFlow@<pinned-commit-sha>
   with:
     omni-api-key: ${{ secrets.OMNI_API_KEY }}
 ```
@@ -221,7 +221,7 @@ The command remains `omniflow`, while the future Python distribution name is `om
 
 Create a dedicated Omni service user with access only to the models and content being validated, then create a personal access token for that user and save it as the GitHub Actions secret `OMNI_API_KEY`. Do not use an Organization API Key: Omni documents that organization keys have Organization Admin permissions, while personal access tokens inherit their user's permissions. Tokens do not expire automatically, so define a rotation schedule and revoke them immediately after suspected exposure or maintainer access changes. See [Omni API authentication](https://docs.omni.co/api/authentication).
 
-The token must be able to list model branches, read model YAML, validate the model, run the Content Validator, and retrieve content labels. The optional dbt exposures endpoint requires Connection Admin permissions according to the [Omni API reference](https://docs.omni.co/api/dbt/get-dbt-exposures). Never place credentials in repository files.
+The token must be able to list model branches, read model YAML, validate the model, run the Content Validator, and retrieve content labels. Comparing branch-attached dashboard drafts also requires read access to their published documents' [draft metadata](https://docs.omni.co/api/documents/list-document-drafts) (Viewer or higher on those documents). No additional write permission or configuration switch is needed. The optional dbt exposures endpoint requires Connection Admin permissions according to the [Omni API reference](https://docs.omni.co/api/dbt/get-dbt-exposures). Never place credentials in repository files.
 
 ### 3. Commit Trusted Model Identity Once
 
@@ -245,9 +245,17 @@ Commit `.omni/flow.json` to the protected base branch:
 
 This is non-secret bootstrap metadata, not per-PR configuration. Branch identity is discovered automatically. Omni's public documentation guarantees a branch-content link in an Omni-created PR description, but it does not currently document a stable machine-readable PR payload containing the Omni host and model ID. Until a live PR proves a safe contract, OmniFlow deliberately does not send a token to a host parsed from PR text.
 
-### 4. Add Optional Policy
+For leader/follower environments sharing a model folder across `develop` and `main`,
+use the opt-in [version 2 environment-target guide](docs/ENVIRONMENT_TARGETS.md).
+It selects the environment by the trusted PR base and verifies the actual candidate's
+authored YAML before and after checks. This enhancement is validation-only: deployment,
+repair and hold-release workflows remain outside its supported scope.
 
-`.omniflow.yml` is optional. Defaults run model validation, content validation, semantic lint, semantic diff, and downstream contracts. Start with `.omniflow.example.yml` when customization is needed.
+### 4. Add The Required Policy
+
+Copy the canonical [`.omniflow.yml`](.omniflow.yml) into the customer repository root. This required policy is **not** the GitHub workflow at `.github/workflows/omniflow.yml`. It enables model validation, content validation, semantic lint, semantic diff, and downstream contracts, with independent `fail_on_new_only: true` settings for model and content regression gating. Optional integrations and label filters remain commented until deliberately configured. The new model setting requires a reviewed Action revision that supports it; follow the [upgrade sequence](docs/INSTALLATION.md#step-5-merge-the-setup-into-the-base-branch) for existing installations.
+
+The following excerpt illustrates key gates; start with the complete canonical file when installing:
 
 ```yaml
 contracts:
@@ -262,8 +270,11 @@ checks:
   content_validation:
     fail_on_new_only: true
   model_validation:
+    fail_on_new_only: true
     fail_on_warnings: false
 ```
+
+Commit the policy to the protected base branch before PR validation. A file added only in the PR head is not trusted. A missing policy stops execution with configuration exit code `2`; OmniFlow does not silently fall back to built-in defaults. Environment variables and identity flags cannot substitute for the file. An explicit `--config` path (or Action `config` input) is supported, but that selected file must exist and satisfy the same trust requirements.
 
 ### 5. Protect The Base Branch
 
@@ -285,9 +296,9 @@ The command rejects pull-request events and non-base branches. Use a dedicated `
 
 Monorepos that keep dbt, Omni, and other tooling on one protected branch can enable a pull-request policy that blocks a merge which would promote breaking Omni model changes before the matching dbt deployment reaches the warehouse.
 
-Omni promotes model YAML on merge, so a combined column rename can break production content until dbt finishes deploying. The policy detects that case, and the case where an Omni-only pull request lands while a dbt deployment is still pending, then holds the pull request until the protected deployment records a successful `omniflow dbt sync`.
+Omni promotes model YAML on merge, so a combined column rename can break production content until dbt finishes deploying. The policy detects that case and requires an expand/contract sequence that preserves old warehouse references while consumers migrate. It also holds breaking Omni-only changes when dbt deployment is pending or sync evidence is unavailable. After a protected deployment and successful `omniflow dbt sync` are recorded, fresh current-head revalidation must pass before the hold label clears; merge remains manual and subject to required checks and reviews.
 
-It is disabled by default, never fires for additive changes, and does nothing in repositories with no configured dbt paths. It prevents the unsafe merge; it does not intercept Omni's webhook. See [Breaking Change Hold](docs/BREAKING_CHANGE_HOLD.md).
+It is disabled by default and never fires for additive changes. Leave it disabled for repositories that do not deploy dbt. When enabled with `action: fail`, missing, blank, unreachable, or non-ancestor sync state blocks breaking changes; `action: warn` is explicitly advisory. It prevents the unsafe merge; it does not intercept Omni's webhook. See [Breaking Change Hold](docs/BREAKING_CHANGE_HOLD.md).
 
 ### 9. Optional dbt Impact Analysis
 
@@ -325,7 +336,7 @@ The Content Validator still validates the model server-side. Label filtering is 
 
 ## Evidence And Privacy
 
-Each run writes root and redacted public summaries:
+Each run writes root and minimal public summaries (diagnostic schema version 2):
 
 ```text
 .omniflow/
@@ -337,14 +348,45 @@ Each run writes root and redacted public summaries:
   dbt-sync.json          # present for dbt synchronization runs
   artifact-manifest.json
   public/
+  repository/           # eligible private validation runs; source metadata, not shareable
   restricted/<model_id>/
 ```
 
-Public reports exclude API keys, raw payloads, email addresses, document URLs, and folder paths. `security.redaction_level: strict` also removes content names, query names, owners, labels, and free-text messages. Restricted artifacts are deleted by default and are never uploaded by the example workflow. Opt-in retention is intended only for an isolated, ephemeral runner and writes files with owner-only permissions.
+Public outputs are constructed from fixed diagnostic codes, statuses, bounded counts, booleans, anonymous context references and a random run reference. They do not copy customer messages, names, resource IDs, paths, URLs, Git identities, raw responses or runner details. Both legacy `standard` and `strict` settings use this minimal public schema; neither re-enables detailed public output. Automation consuming the old identity-rich schema must migrate. Deployment readiness uses private, in-memory evidence instead of public artifacts. See [Diagnostic Privacy](docs/DIAGNOSTIC_PRIVACY.md).
 
-Raw response output cannot be enabled in CI policy. The explicit `--unsafe-raw-output` option exists only on the local `content validate` debugging command.
+**Private-repository default:** `omniflow run` now generates a separate repository-only report when GitHub.com confirms a private same-repository run and the authored Omni snapshots match the immutable Git revisions. It adds verified source files, line numbers and supported field/view/topic identifiers with corrective guidance. No source excerpts, data values, raw API messages or Omni-only dashboard identities are copied. Unsupported findings remain unmapped rather than receiving guessed locations. Public/fork/unverifiable runs and standalone report commands remain minimal; PR comments, logs, annotations and Code Security uploads stay minimal in all modes.
 
-The unreleased AI Repair scaffold emits `repair.json` and `repair.md` during maintainer testing. These contain status, IDs, file names, counts, validation summaries, rollback status, and commit metadata only. Authored YAML, prompts, AI result summaries, chat URLs, and query results are not persisted by OmniFlow.
+To opt out, merge this setting into the required root `.omniflow.yml` on the trusted target branch (usually `main`):
+
+```yaml
+reporting:
+  diagnostics:
+    mode: minimal
+```
+
+The default is `repository` when omitted. The new nested setting requires a supporting OmniFlow revision. Upgrading can therefore increase artifact detail for eligible private runs; review the [upgrade notice](docs/RELEASE_NOTES.md) and update the validation workflow's separate artifact-upload step. Download `omniflow-repository-diagnostics` from the workflow run to inspect `report.md` (readable summary) or `report.json` (all findings). Repository readers can access this artifact; metadata itself can be confidential. Do not forward it as a shareable support report. `repository/status.json` records a fixed fallback reason when no detailed report is produced. The standard workflow uploads only freshly authorized detail and uses seven-day retention.
+
+Restricted artifacts are deleted by default and are never uploaded by the example workflows. Explicit retention is only for an approved private support investigation on an isolated, ephemeral runner, with owner-only files. It is not a PII/PHI/payment-data sanitizer or a compliance certification. Previously generated artifacts and copied comments are not retroactively sanitized. Upload only the explicitly listed output files, never the entire `.omniflow` or `public` directory.
+
+Raw response output cannot be enabled in CI policy. The local `content validate --unsafe-raw-output` debugging option additionally requires explicit restricted retention, is rejected in GitHub Actions, and never places raw data in its shareable report. Standalone validation history is restricted and deleted unless retention is enabled; explicit history output must stay inside the restricted directory.
+
+The unreleased AI Repair scaffold emits minimal `repair.json` and `repair.md` during maintainer testing: status, counts and safety outcomes, without resource IDs, filenames or commit metadata. Sensitive support evidence must not be attached to public issues or copied into PR comments.
+
+### Existing issues versus PR regressions
+
+The required canonical `.omniflow.yml` explicitly sets `fail_on_new_only: true` under both `checks.content_validation` and `checks.model_validation`. For PR branch validation, each validator compares its branch findings with a fresh response from the same model's live base, using the same credential and applicable visibility scope. Each switch is independent: custom policies that omit it retain the strict `false` default for that validator. `OMNI_FAIL_ON_NEW_ONLY` remains content-only and does not change model policy. A missing policy file is an error, not a request for defaults.
+
+Unchanged, matched issues remain visible but nonblocking for the validator using new-only policy. Additional occurrences and changed model severity count as new; model warnings block only when `fail_on_warnings: true`. A passing regression gate means **no new blocking issues were detected in the compared scope**, not that the model or content is healthy or that the PR is proven to have caused every new finding. Unavailable or ambiguous comparison evidence cannot establish a pass; downstream contracts, lint, and other enabled checks can still block independently.
+
+New-only PR runs verify live authored candidate/base YAML against the immutable Git head/base before and after checks. Missing or out-of-sync evidence blocks rather than falling back to an unrelated baseline. These are sampled checks, not an atomic live-content lock; Content Validator's default API depth also does not establish exhaustive instance coverage.
+
+Orchestrated runs without a branch, post-sync validation, and repair verification use strict health enforcement, not base-versus-itself comparison or historical suppression. Standalone no-branch content validation also defaults to strict health; explicit `--history-in` or `--fail-on-new-only` requests scoped history comparison and a missing usable baseline exits `4`. In GitHub PRs, standalone content/model new-only validation is rejected: use `omniflow run --auto` for verified Git head/base comparison. Existing content errors remain error-severity findings with `blocking: false` under new-only policy, not informational or fixed issues. See [Validation Diagnostics](docs/VALIDATION_DIAGNOSTICS.md).
+
+Dashboard-filter errors support both legacy messages and the grouped `filter_name` / `issues` response observed in live testing. Filter identity is retained privately so different filters and additional occurrences cannot be hidden as existing issues. Empty/non-JSON API responses remain distinct incomplete-evidence failures. Updating OmniFlow does not update a consumer's pinned Action automatically: review and update its full commit SHA, then rerun the original PR.
+
+Branch drafts can have different API identifiers from their published dashboards. OmniFlow verifies the exact active draft-to-published relationship for the selected branch before comparing findings or applying labels. An unchanged mapped draft must not turn existing errors into new ones. Missing, conflicting, stale, or changing identity evidence blocks with a sanitized evidence reason, not a claim that the PR introduced a defect. Matching never uses dashboard names or error text alone. Private comparison history now uses schema version 2; older history is invalidated rather than reused. Live PR comparisons use a fresh base and do not require a history migration.
+
+Optional `checks.content_validation.classify_comment_only: true` classifies narrow, verified comment/format-only Git changes without executing PR code. It is explanatory only: extra live branch edits and attached drafts cannot yet be excluded reliably, so content validation still runs. See [Validation Diagnostics](docs/VALIDATION_DIAGNOSTICS.md).
 
 ## CLI
 
@@ -360,13 +402,48 @@ omniflow exposures pull --base-url https://example.omniapp.co --model-id <id>
 omniflow diff --base path/to/base/yaml --head path/to/head/yaml
 ```
 
+YAML pulls accept API `viewNames` metadata in either file-path → canonical-name or
+canonical-name → file-path form. They normalize the whole response into a canonical-name →
+exact file-path map in the restricted `manifest.json`; existing normalized snapshots keep
+the same format. Exact-empty entries are omitted only for verified non-view files.
+Validation and snapshot diffs use this normalized mapping, including scoped names and
+query views; folder names are not used to invent schema prefixes.
+Missing, incomplete, or ambiguous snapshot identity metadata fails closed. Re-pull older
+snapshots that lack this map. Standalone diffs of raw files still accept flat or already-qualified
+filenames, but unresolved nested view names require an API snapshot. Do not add a `name:`
+parameter to view YAML to work around identity errors. See Omni's
+[documented view-to-file resolution](https://docs.omni.co/guides/api/data-lineage-integration#resolve-topics-and-views-from-model-yaml).
+API metadata processing failures identify a safe reason category and leave dependent checks
+incomplete; repeatedly refreshing an unsupported response format is not a fix. See
+[metadata troubleshooting](docs/TROUBLESHOOTING.md#yaml-viewnames-metadata-processing-failed)
+and [unreleased compatibility notes](docs/RELEASE_NOTES.md).
+Top-level view `filters` are analyzed as filter-only fields; nested measure/topic filter
+expressions are not treated as separate field definitions.
+
+Snapshot reads use only the current manifest's file inventory and verify SHA-256 hashes.
+Stale files left by an earlier pull are excluded, not deleted; missing or changed snapshot
+files require a fresh pull. Explicit `.view` types take precedence over names like `model`
+and `relationships`.
+
+When inheritance is present, validation retains the authored snapshot and separately pulls
+Omni's `fullyResolved=true` YAML for impact analysis. Pre-sync comparisons preserve that
+resolved baseline before refresh. Standalone diffs reject unresolved inheritance: use
+`omniflow yaml pull --fully-resolved` for those inputs. No local inheritance rules are invented.
+See the [resolved YAML contract](https://docs.omni.co/api/models/get-model-yaml).
+
+Same-name changes between field kinds (dimension, measure, filter) follow
+`contracts.fail_on.referenced_field_type_changes`. New relationship diff events verify both
+endpoint roles in every relevant revision, including self-joins. Supplied Content Validator
+model/branch identities must match the request; absent optional identity metadata remains
+unverified rather than being treated as a contradiction.
+
 Explicit identity flags are for local debugging. The customer workflow uses `omniflow run --auto`.
 
 Exit codes are `0` success, `1` validation failure, `2` configuration error, `3` authentication or authorization error, `4` Omni API error, `5` security policy violation, and `6` internal error.
 
 ## Documentation
 
-- [Architecture and operating guide](docs/ARCHITECTURE.md)
+- [Historical v0.4.0 architecture guide](docs/ARCHITECTURE.md) — archival context only; use the current guides below for setup and security.
 - [Step-by-step installation](docs/INSTALLATION.md)
 - [Configuration reference](docs/CONFIGURATION.md)
 - [Testing and live validation](docs/TESTING.md)
@@ -387,7 +464,7 @@ Exit codes are `0` success, `1` validation failure, `2` configuration error, `3`
 ```bash
 python3.11 -m venv .venv
 . .venv/bin/activate
-python -m pip install --upgrade "pip==26.1.2" "setuptools==83.0.0"
+python -m pip install --upgrade "pip==26.2" "setuptools==83.0.0"
 python -m pip install -e ".[dev]"
 pytest --cov=omniflow
 ruff check .

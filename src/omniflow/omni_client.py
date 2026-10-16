@@ -9,7 +9,8 @@ from typing import Any
 import requests
 
 from . import __version__
-from .exceptions import ConfigError, OmniAPIError, OmniAuthError
+from .exceptions import ConfigError, OmniAPIError, OmniAuthError, OmniResponseError
+from .model_response import normalize_model_response
 from .model_yaml import validate_editable_yaml_file_name
 from .security import redact, validate_base_url, validate_path_segment
 
@@ -19,6 +20,9 @@ MAX_PAGINATION_PAGES = 500
 MAX_PAGINATION_RECORDS = 50_000
 MAX_AI_PROMPT_BYTES = 16 * 1024
 AI_JOB_STATES = {"CANCELLED", "COMPLETE", "DELIVERING", "EXECUTING", "FAILED", "QUEUED"}
+AI_EVAL_TERMINAL_STATES = {"COMPLETE", "CANCELLED", "FAILED"}
+AI_EVAL_STATES = AI_EVAL_TERMINAL_STATES | {"RUNNING"}
+MAX_AI_EVAL_DESCRIPTION_CHARS = 200
 SCHEMA_REFRESH_STATES = {"RUNNING", "COMPLETED", "FAILED"}
 SCHEMA_REFRESH_MODEL_KINDS = {"SHARED", "SHARED_EXTENSION"}
 
@@ -69,9 +73,7 @@ class OmniClient:
         model_id = validate_path_segment(model_id, name="model_id")
         params = {"branchId": branch_id} if branch_id else None
         payload = self._request("GET", f"/api/v1/models/{model_id}/validate", params=params)
-        if not isinstance(payload, list):
-            raise OmniAPIError("Model validation returned an unexpected response shape")
-        return [item for item in payload if isinstance(item, dict)]
+        return normalize_model_response(payload)
 
     def validate_content(
         self,
@@ -94,7 +96,9 @@ class OmniClient:
             params["find"] = find
         if find_type:
             params["find_type"] = _content_validator_find_type(find_type)
-        return self._request("GET", f"/api/v1/models/{model_id}/content-validator", params=params)
+        payload = self._request("GET", f"/api/v1/models/{model_id}/content-validator", params=params)
+        _validate_content_response_identity(payload, model_id=model_id, branch_id=branch_id or None)
+        return payload
 
     def search_content_references(
         self,
@@ -264,6 +268,29 @@ class OmniClient:
             records.extend(self._paginate("/api/v1/content", params=restricted_params))
         return records
 
+    def list_document_drafts(self, published_identifier: str) -> list[dict[str, Any]]:
+        """Read active draft identity metadata, never workbook or actor details.
+
+        The documented endpoint returns an array, not a paginated envelope.
+        Omitting ``include=archived`` requests active drafts only. Preserve any
+        returned status/staleness/branch values for the resolver to evaluate;
+        this adapter does not select, silently discard, or authorize a draft.
+        """
+        if not isinstance(published_identifier, str) or not published_identifier:
+            raise ConfigError("Published document identifier must be a non-empty string")
+        published_identifier = validate_path_segment(published_identifier, name="published_identifier")
+        try:
+            payload = self._request("GET", f"/api/v1/documents/{published_identifier}/drafts")
+        except OmniAuthError:
+            raise OmniAuthError("Document draft lookup was not authorized") from None
+        except OmniAPIError:
+            # The shared transport error can contain the requested API path.
+            # Do not copy the document identifier into this adapter's errors.
+            raise OmniAPIError("Document draft lookup failed") from None
+        if not isinstance(payload, list):
+            raise OmniAPIError("Document draft lookup returned an invalid response shape")
+        return [_document_draft_metadata(record) for record in payload]
+
     def create_ai_job(self, model_id: str, *, branch_id: str, prompt: str) -> dict[str, str]:
         model_id = validate_path_segment(model_id, name="model_id")
         branch_id = validate_path_segment(branch_id, name="branch_id")
@@ -308,6 +335,95 @@ class OmniClient:
         if state not in {"CANCELLED", "COMPLETE", "FAILED"}:
             raise OmniAPIError("AI job cancellation did not return a terminal state")
         return {"job_id": job_id, "state": state}
+
+    def get_ai_eval_prompt_set(self, prompt_set_id: str) -> dict[str, Any]:
+        prompt_set_id = validate_path_segment(prompt_set_id, name="prompt_set_id")
+        payload = self._request("GET", f"/api/v1/ai/eval/prompt-sets/{prompt_set_id}")
+        if not isinstance(payload, dict) or not isinstance(payload.get("prompt_set"), dict):
+            raise OmniAPIError("AI eval prompt set returned an unexpected response shape")
+        prompt_set = payload["prompt_set"]
+        if prompt_set.get("id") != prompt_set_id:
+            raise OmniAPIError("AI eval prompt set returned a mismatched ID")
+        if not isinstance(prompt_set.get("model_id"), str) or not prompt_set["model_id"].strip():
+            raise OmniAPIError("AI eval prompt set did not identify its model")
+        if not isinstance(prompt_set.get("prompts"), list):
+            raise OmniAPIError("AI eval prompt set returned an unexpected prompts shape")
+        return prompt_set
+
+    def start_ai_eval_run(
+        self,
+        *,
+        prompt_set_id: str,
+        description: str,
+        branch_id: str | None = None,
+    ) -> str:
+        prompt_set_id = validate_path_segment(prompt_set_id, name="prompt_set_id")
+        if not isinstance(description, str) or not description.strip():
+            raise ConfigError("AI eval run description must be a non-empty string")
+        description = description.strip()
+        if len(description) > MAX_AI_EVAL_DESCRIPTION_CHARS:
+            raise ConfigError(
+                f"AI eval run description must be {MAX_AI_EVAL_DESCRIPTION_CHARS} characters or fewer"
+            )
+        request_payload: dict[str, Any] = {"prompt_set_id": prompt_set_id, "description": description}
+        if branch_id:
+            request_payload["run_config"] = {"branch_id": validate_path_segment(branch_id, name="branch_id")}
+        payload = self._request(
+            "POST",
+            "/api/v1/ai/eval/runs",
+            json_payload=request_payload,
+            retry_transient=False,
+        )
+        if not isinstance(payload, dict) or not isinstance(payload.get("run"), dict):
+            raise OmniAPIError("AI eval run creation returned an unexpected response shape")
+        run_id = payload["run"].get("id")
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise OmniAPIError("AI eval run creation did not return a run ID")
+        return validate_path_segment(run_id.strip(), name="run_id")
+
+    def get_ai_eval_run(self, run_id: str) -> dict[str, Any]:
+        run_id = validate_path_segment(run_id, name="run_id")
+        payload = self._request("GET", f"/api/v1/ai/eval/runs/{run_id}")
+        if not isinstance(payload, dict) or not isinstance(payload.get("run"), dict):
+            raise OmniAPIError("AI eval run status returned an unexpected response shape")
+        run = payload["run"]
+        if run.get("id") != run_id:
+            raise OmniAPIError("AI eval run status returned a mismatched run ID")
+        status = run.get("status")
+        if not isinstance(status, str) or status not in AI_EVAL_STATES:
+            raise OmniAPIError("AI eval run status returned an invalid status")
+        results = run.get("results")
+        if results is not None and not isinstance(results, list):
+            raise OmniAPIError("AI eval run status returned an unexpected results shape")
+        if isinstance(results, list) and any(not isinstance(row, dict) for row in results):
+            raise OmniAPIError("AI eval run status returned a malformed result row")
+        # Keep only documented comparison and recovery fields. Future response
+        # additions must not silently persist query results or answer content.
+        safe_run = {key: run[key] for key in ("id", "model_id", "prompt_set_id", "branch_id", "status") if key in run}
+        safe_run["results"] = None if results is None else [
+            {key: value for key, value in row.items()
+             if key in {"id", "prompt", "score", "error_reason", "timing_ms", "query_count", "cost", "scoring_cost"}}
+            for row in results
+        ]
+        for original, safe_row in zip(results or [], safe_run["results"] or [], strict=True):
+            job = original.get("agentic_job")
+            if isinstance(job, dict):
+                safe_row["agentic_job"] = {
+                    key: job[key] for key in ("id", "state", "conversation_id") if key in job
+                }
+        return safe_run
+
+    def cancel_ai_eval_run(self, run_id: str) -> dict[str, Any]:
+        run_id = validate_path_segment(run_id, name="run_id")
+        payload = self._request(
+            "POST", f"/api/v1/ai/eval/runs/{run_id}/cancel", retry_transient=False
+        )
+        if not isinstance(payload, dict) or not isinstance(payload.get("run"), dict):
+            raise OmniAPIError("AI eval cancellation returned an unexpected response shape")
+        run = payload["run"]
+        if run.get("id") != run_id or run.get("status") not in AI_EVAL_TERMINAL_STATES:
+            raise OmniAPIError("AI eval cancellation did not confirm the requested run was terminal")
+        return run
 
     def update_model_yaml(
         self,
@@ -413,20 +529,30 @@ class OmniClient:
             if cursor:
                 page_params["cursor"] = cursor
             payload = self._request("GET", path, params=page_params)
-            page_records = payload.get("records", []) if isinstance(payload, dict) else []
+            if not isinstance(payload, Mapping):
+                raise OmniAPIError("Omni pagination returned an unexpected response shape")
+            page_records = payload.get("records")
             if not isinstance(page_records, list):
                 raise OmniAPIError("Omni pagination returned an unexpected records shape")
+            if any(not isinstance(item, dict) for item in page_records):
+                raise OmniAPIError("Omni pagination returned an invalid record")
             record_count += len(page_records)
             if record_count > MAX_PAGINATION_RECORDS:
                 raise OmniAPIError("Omni pagination exceeded the 50,000 record safety limit")
-            records.extend(item for item in page_records if isinstance(item, dict))
-            page_info = payload.get("pageInfo", {}) if isinstance(payload, dict) else {}
-            if not isinstance(page_info, dict):
+            records.extend(page_records)
+            # Preserve single-page compatibility when pageInfo is omitted;
+            # explicit malformed metadata cannot establish a complete inventory.
+            page_info = payload.get("pageInfo", {})
+            if not isinstance(page_info, Mapping):
                 raise OmniAPIError("Omni pagination returned an unexpected pageInfo shape")
+            if "hasNextPage" in page_info and not isinstance(page_info["hasNextPage"], bool):
+                raise OmniAPIError("Omni pagination returned an invalid hasNextPage flag")
             next_cursor = page_info.get("nextCursor")
             if next_cursor is not None and (not isinstance(next_cursor, str) or not next_cursor.strip()):
                 raise OmniAPIError("Omni pagination returned an invalid cursor")
             cursor = next_cursor.strip() if isinstance(next_cursor, str) else None
+            if "hasNextPage" in page_info and page_info["hasNextPage"] != bool(cursor):
+                raise OmniAPIError("Omni pagination returned inconsistent continuation metadata")
             if not cursor:
                 return records
             if cursor in seen_cursors:
@@ -494,6 +620,64 @@ def _retry_after_seconds(value: str | None) -> int | None:
         return None
 
 
+def _document_draft_metadata(record: Any) -> dict[str, Any]:
+    required = {"identifier", "publishedIdentifier", "branch", "status", "draftOutOfDate", "updatedAt"}
+    if not isinstance(record, Mapping) or not required.issubset(record):
+        raise OmniAPIError("Document draft lookup returned invalid metadata")
+    if any(not isinstance(record[key], str) or not record[key].strip()
+           for key in ("identifier", "publishedIdentifier", "updatedAt")):
+        raise OmniAPIError("Document draft lookup returned invalid metadata")
+    if record["status"] not in ("active", "archived") or type(record["draftOutOfDate"]) is not bool:
+        raise OmniAPIError("Document draft lookup returned invalid metadata")
+    branch = record["branch"]
+    if branch is not None and (
+        not isinstance(branch, Mapping) or not isinstance(branch.get("id"), str) or not branch["id"].strip()
+    ):
+        raise OmniAPIError("Document draft lookup returned invalid metadata")
+    return {
+        "identifier": record["identifier"],
+        "publishedIdentifier": record["publishedIdentifier"],
+        "branch": {"id": branch["id"]} if branch is not None else None,
+        "status": record["status"],
+        "draftOutOfDate": record["draftOutOfDate"],
+        "updatedAt": record["updatedAt"],
+    }
+
+
+def _validate_content_response_identity(payload: Any, *, model_id: str, branch_id: str | None) -> None:
+    """Reject contradictory optional identity metadata shared by validation and searches.
+
+    The API documents model_id and branch {id, name} | null. Omitted metadata
+    cannot establish identity, but must not be confused with explicit main/null.
+    Content envelope validation remains with the existing content parser.
+    """
+    if not isinstance(payload, dict):
+        return
+    if "model_id" in payload:
+        actual_model_id = payload["model_id"]
+        if not isinstance(actual_model_id, str) or not actual_model_id.strip():
+            raise OmniAPIError("Content Validator response contains an invalid model identity")
+        if actual_model_id != model_id:
+            raise OmniAPIError("Content Validator response identifies a different model")
+    if "branch" not in payload:
+        return
+    branch = payload["branch"]
+    if branch is None:
+        if branch_id is not None:
+            raise OmniAPIError("Content Validator response identifies main instead of the requested branch")
+        return
+    if not isinstance(branch, dict):
+        raise OmniAPIError("Content Validator response contains invalid branch metadata")
+    if branch_id is None:
+        raise OmniAPIError("Content Validator response identifies a branch instead of main")
+    if "id" in branch:
+        actual_branch_id = branch["id"]
+        if not isinstance(actual_branch_id, str) or not actual_branch_id.strip():
+            raise OmniAPIError("Content Validator response contains an invalid branch identity")
+        if actual_branch_id != branch_id:
+            raise OmniAPIError("Content Validator response identifies a different branch")
+
+
 def _content_validator_find_type(value: str) -> str:
     normalized = value.strip().upper()
     aliases = {
@@ -551,15 +735,17 @@ def _bounded_response_json(response: Any) -> Any:
                     raise OmniAPIError("Omni API response exceeded the 64 MiB safety limit")
         except requests.RequestException as exc:
             raise OmniAPIError("Omni API response could not be read safely") from exc
+        if not body:
+            raise OmniResponseError("empty_api_response")
         try:
             return json.loads(body)
         except (UnicodeDecodeError, ValueError) as exc:
-            raise OmniAPIError("Omni API did not return valid JSON") from exc
+            raise OmniResponseError("invalid_json_response") from exc
 
     try:
         payload = response.json()
     except ValueError as exc:
-        raise OmniAPIError("Omni API did not return valid JSON") from exc
+        raise OmniResponseError("invalid_json_response") from exc
     try:
         encoded_size = len(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
     except (TypeError, ValueError) as exc:

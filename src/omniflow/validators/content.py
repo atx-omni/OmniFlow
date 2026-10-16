@@ -2,19 +2,42 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections import Counter, defaultdict, deque
 from pathlib import Path
 from typing import Any, Iterable
 
+from ..exceptions import OmniAPIError, OmniResponseError
 from ..omni_client import OmniClient
 from ..security import redact, secure_write_text
 from ..timestamps import utc_now_iso
+from .content_identity import (
+    CANONICAL_DOCUMENT,
+    CANONICAL_QUERY,
+    IDENTITY_MESSAGES,
+    DocumentIdentityError,
+    evidence_signature,
+    resolve_documents,
+)
+
+HISTORY_SCHEMA_VERSION = 2
+QUERY_IDENTITY_KEYS = ("query_presentation_id", "query_id_map_key", "query_id")
+CONTENT_EVIDENCE_REASON_CODES = frozenset({
+    "invalid_issue_container", "invalid_issue_entry", "missing_issue_message",
+    "invalid_issue_message", "unsupported_issue_shape",
+    "invalid_filter_identity", *IDENTITY_MESSAGES,
+})
 
 
 def load_json(path: str | Path) -> dict[str, Any] | None:
     try:
-        return json.loads(Path(path).read_text(encoding="utf-8"))
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise OmniAPIError("Content validation history has an invalid envelope")
+        return payload
     except FileNotFoundError:
         return None
+    except (OSError, UnicodeError, ValueError):
+        raise OmniAPIError("Content validation history could not be read as valid JSON; comparison evidence is unavailable") from None
 
 
 def write_json(path: str | Path, payload: dict[str, Any]) -> None:
@@ -46,14 +69,171 @@ def extract_owner(record: dict[str, Any]) -> dict[str, str] | None:
     return normalized or None
 
 
+class ContentEvidenceError(OmniAPIError):
+    """Unreadable API evidence, with allowlisted context and no raw response."""
+
+    def __init__(
+        self, *, issue_type: str = "content", document: dict[str, Any] | None = None,
+        query: dict[str, Any] | None = None, reason_code: str = "unsupported_issue_shape",
+    ) -> None:
+        self.reason_code = (
+            reason_code if isinstance(reason_code, str) and reason_code in CONTENT_EVIDENCE_REASON_CODES
+            else "unsupported_issue_shape"
+        )
+        category = {"dashboard_filter": "dashboard-filter", "query": "query"}.get(issue_type, "content")
+        super().__init__(IDENTITY_MESSAGES.get(self.reason_code) or (
+            f"Content Validator response contains unreadable {category} issue details. "
+            "Validation evidence is incomplete; a specific content defect cannot be determined. "
+            f"Reason code: {self.reason_code}."
+        ))
+        self.issue_type = issue_type if issue_type in {"dashboard_filter", "query"} else "content"
+        self.validation_scope: str | None = None
+        self.comparison_mode = "unknown"
+        self.context: dict[str, str] = {}
+        for source, mapping in (
+            (document or {}, {"document_id": "document_id", "identifier": "document_identifier", "name": "document_name"}),
+            (query or {}, {key: key for key in (*QUERY_IDENTITY_KEYS, "query_name")}),
+        ):
+            for key, target in mapping.items():
+                value = source.get(key)
+                if isinstance(value, str) and value.strip():
+                    self.context[target] = redact(value.strip())[:512]
+
+    def report_issue(self, *, redact_document_names: bool = False) -> dict[str, Any]:
+        context = dict(self.context)
+        if redact_document_names:
+            for key in ("document_name", "query_name"):
+                if key in context:
+                    context[key] = "[REDACTED]"
+        return {
+            **context,
+            "validator": "content",
+            "type": "content_evidence_unavailable",
+            "issue_type": self.issue_type,
+            "reason_code": self.reason_code,
+            "validation_scope": self.validation_scope,
+            "comparison_mode": self.comparison_mode,
+            "comparison_status": "unavailable",
+            "content_health": "unknown",
+            "regression_status": "unknown",
+            "severity": "error",
+            "blocking": True,
+            "active": True,
+            "coverage_complete": False,
+            "message": str(self),
+        }
+
+
+def _issue_list(
+    value: Any, *, issue_type: str = "content", document: dict[str, Any] | None = None,
+    query: dict[str, Any] | None = None,
+) -> list[Any]:
+    if not isinstance(value, list):
+        raise ContentEvidenceError(
+            issue_type=issue_type, document=document, query=query, reason_code="invalid_issue_container",
+        )
+    for item in value:
+        # The published API uses strings; retain the existing message-object
+        # compatibility, but never guess undocumented nested error structures.
+        if isinstance(item, list):
+            reason_code = "unsupported_issue_shape"
+        elif not isinstance(item, (str, dict)):
+            reason_code = "invalid_issue_entry"
+        elif isinstance(item, dict) and "message" not in item:
+            reason_code = "missing_issue_message"
+        else:
+            reason_code = "invalid_issue_message"
+        message = item.get("message") if isinstance(item, dict) else item
+        if not isinstance(message, str) or not message.strip():
+            raise ContentEvidenceError(
+                issue_type=issue_type, document=document, query=query, reason_code=reason_code,
+            )
+    return value
+
+
+def _dashboard_filter_entries(value: Any, *, document: dict[str, Any]) -> list[dict[str, Any]]:
+    """Adapt the observed grouped API form without guessing arbitrary nesting.
+
+    A filter name is document-scoped identity, not a safe display field. Retain
+    its exact value for comparisons; the public diagnostic projection omits it.
+    """
+    if not isinstance(value, list):
+        raise ContentEvidenceError(
+            issue_type="dashboard_filter", document=document, reason_code="invalid_issue_container",
+        )
+    entries: list[dict[str, Any]] = []
+    named_groups: Counter[str] = Counter()
+    for item in value:
+        if isinstance(item, dict) and "issues" in item:
+            # Both a message and nested issues would be competing evidence.
+            # The live grouped form has exactly these two keys; do not drop an
+            # unfamiliar extra structure that might contain additional errors.
+            if set(item) != {"filter_name", "issues"}:
+                raise ContentEvidenceError(
+                    issue_type="dashboard_filter", document=document, reason_code="unsupported_issue_shape",
+                )
+            name = item["filter_name"]
+            if not isinstance(name, str) or not name.strip():
+                raise ContentEvidenceError(
+                    issue_type="dashboard_filter", document=document, reason_code="invalid_filter_identity",
+                )
+            messages = _issue_list(item["issues"], issue_type="dashboard_filter", document=document)
+            if any(not isinstance(message, str) for message in messages):
+                raise ContentEvidenceError(
+                    issue_type="dashboard_filter", document=document, reason_code="unsupported_issue_shape",
+                )
+            named_groups[name] += 1
+            # An explicit empty list contains no issues; null or absent lists
+            # are not equivalent and never reach this point.
+            entries.extend({"message": message, "raw_issue": message, "filter_name": name} for message in messages)
+            continue
+        _issue_list([item], issue_type="dashboard_filter", document=document)
+        entry = {"message": item.get("message") if isinstance(item, dict) else item, "raw_issue": item}
+        if isinstance(item, dict) and "filter_name" in item:
+            name = item["filter_name"]
+            if not isinstance(name, str) or not name.strip():
+                raise ContentEvidenceError(
+                    issue_type="dashboard_filter", document=document, reason_code="invalid_filter_identity",
+                )
+            entry["filter_name"] = name
+            named_groups[name] += 1
+        entries.append(entry)
+    for entry in entries:
+        if "filter_name" in entry:
+            # Repeated messages within one group remain countable occurrences;
+            # multiple groups with the same name cannot establish filter identity.
+            entry["comparison_eligible"] = named_groups[entry["filter_name"]] == 1
+    return entries
+
+
+def content_documents(payload: Any) -> list[dict[str, Any]]:
+    """Validate evidence-bearing members before filtering or interpreting emptiness."""
+    if not isinstance(payload, dict) or not isinstance(payload.get("content"), list):
+        raise OmniAPIError("Content Validator response has an unexpected content envelope")
+    for document in payload["content"]:
+        if not isinstance(document, dict):
+            raise OmniAPIError("Content Validator response contains an invalid document")
+        for key in ("document_id", "identifier"):
+            if key in document and (not isinstance(document[key], str) or not document[key].strip()):
+                raise OmniAPIError("Content Validator response contains an invalid document identity")
+        if "dashboard_filter_issues" in document:
+            _dashboard_filter_entries(document["dashboard_filter_issues"], document=document)
+        if "queries_and_issues" in document:
+            queries = document["queries_and_issues"]
+            if not isinstance(queries, list) or any(not isinstance(query, dict) for query in queries):
+                raise OmniAPIError("Content Validator response contains an invalid query list")
+            for query in queries:
+                for key in ("query_presentation_id", "query_id", "query_id_map_key"):
+                    if key in query and (not isinstance(query[key], str) or not query[key].strip()):
+                        raise OmniAPIError("Content Validator response contains an invalid query identity")
+                if "issues" in query:
+                    _issue_list(query["issues"], issue_type="query", document=document, query=query)
+    return payload["content"]
+
+
 def collect_content_issues(payload: dict[str, Any]) -> list[Any]:
     issues: list[Any] = []
-    content = payload.get("content")
-    if not isinstance(content, list):
-        return issues
-    for document in content:
-        if not isinstance(document, dict):
-            continue
+    for document in content_documents(payload):
         doc_context = {
             "document_id": document.get("document_id"),
             "document_identifier": document.get("identifier"),
@@ -65,13 +245,14 @@ def collect_content_issues(payload: dict[str, Any]) -> list[Any]:
             "document_labels": extract_label_names(document),
             "document_owner": extract_owner(document),
         }
+        if CANONICAL_DOCUMENT in document:
+            doc_context[CANONICAL_DOCUMENT] = document[CANONICAL_DOCUMENT]
         dashboard_issues = document.get("dashboard_filter_issues")
         if isinstance(dashboard_issues, list):
-            for item in dashboard_issues:
+            for item in _dashboard_filter_entries(dashboard_issues, document=document):
                 issues.append(
                     {
-                        "message": item.get("message") if isinstance(item, dict) else item,
-                        "raw_issue": item,
+                        **item,
                         "issue_type": "dashboard_filter",
                         **doc_context,
                     }
@@ -79,6 +260,7 @@ def collect_content_issues(payload: dict[str, Any]) -> list[Any]:
         queries = document.get("queries_and_issues")
         if not isinstance(queries, list):
             continue
+        query_keys = Counter(_query_identity(query) for query in queries)
         for query in queries:
             if not isinstance(query, dict):
                 continue
@@ -92,7 +274,9 @@ def collect_content_issues(payload: dict[str, Any]) -> list[Any]:
                         "raw_issue": item,
                         "issue_type": "query",
                         "query_name": query.get("query_name"),
-                        "query_presentation_id": query.get("query_presentation_id"),
+                        **{key: query.get(key) for key in QUERY_IDENTITY_KEYS},
+                        **({CANONICAL_QUERY: query[CANONICAL_QUERY]} if CANONICAL_QUERY in query else {}),
+                        "comparison_eligible": query_keys[_query_identity(query)] == 1,
                         **doc_context,
                     }
                 )
@@ -101,20 +285,16 @@ def collect_content_issues(payload: dict[str, Any]) -> list[Any]:
 
 def extract_issues(payload: Any) -> list[Any]:
     if isinstance(payload, list):
-        return payload
+        return _issue_list(payload)
     if not isinstance(payload, dict):
-        return []
-    for key in ("issues", "validation_issues", "errors"):
-        value = payload.get(key)
-        if isinstance(value, list):
-            return value
+        raise OmniAPIError("Content Validator response has an unexpected envelope")
     if "content" in payload:
         return collect_content_issues(payload)
-    for key in ("documents", "items", "results"):
-        value = payload.get(key)
-        if isinstance(value, list):
-            return value
-    return []
+    # Retain explicitly supported legacy issue envelopes, including valid empty lists.
+    for key in ("issues", "validation_issues", "errors", "documents", "items", "results"):
+        if key in payload:
+            return _issue_list(payload[key])
+    raise OmniAPIError("Content Validator response has an unexpected envelope")
 
 
 def issue_identity(issue: Any) -> str:
@@ -124,6 +304,8 @@ def issue_identity(issue: Any) -> str:
         try:
             comparable = dict(issue) if isinstance(issue, dict) else issue
             if isinstance(comparable, dict):
+                # filter_name is intentionally not stripped: grouped dashboard
+                # messages on different filters must never match as pre-existing.
                 for key in (
                     "document_labels",
                     "document_owner",
@@ -134,8 +316,23 @@ def issue_identity(issue: Any) -> str:
                     "folder_path",
                     "query_name",
                     "raw_issue",
+                    "comparison_eligible",
                 ):
                     comparable.pop(key, None)
+                # Prefer the strongest available query identity. Optional auxiliary
+                # identifiers must not make the same presentation appear new.
+                query_key = _query_identity(comparable)
+                comparable.pop(CANONICAL_QUERY, None)
+                for key in QUERY_IDENTITY_KEYS:
+                    comparable.pop(key, None)
+                if query_key is not None:
+                    comparable[query_key[0]] = query_key[1]
+                # A verified draft alias is the same logical document as its
+                # published parent. Physical document IDs differ across drafts.
+                logical = comparable.pop(CANONICAL_DOCUMENT, None)
+                if isinstance(logical, str) and logical.strip():
+                    comparable.pop("document_id", None)
+                    comparable["document_identifier"] = logical
             value = json.dumps(comparable, sort_keys=True, separators=(",", ":"))
         except TypeError:
             value = str(issue)
@@ -147,8 +344,6 @@ def issue_summary(issue: Any) -> str:
         return issue
     if isinstance(issue, dict):
         message = issue.get("message")
-        if message is not None and not isinstance(message, str):
-            message = str(message)
         if isinstance(message, str) and message.strip():
             prefix = " / ".join(
                 part.strip()
@@ -160,25 +355,61 @@ def issue_summary(issue: Any) -> str:
             value = issue.get(key)
             if isinstance(value, str) and value.strip():
                 return value
-        return json.dumps(issue, sort_keys=True)
-    return str(issue)
+        return "Content Validator issue details are unavailable; inspect the same model and branch in Omni."
+    return "Content Validator issue details are unavailable; inspect the same model and branch in Omni."
+
+
+def _query_identity(issue: dict[str, Any]) -> tuple[str, str] | None:
+    canonical = issue.get(CANONICAL_QUERY)
+    if isinstance(canonical, str) and canonical.strip():
+        return "query_id_map_key", canonical
+    return next(
+        ((key, issue[key]) for key in QUERY_IDENTITY_KEYS if isinstance(issue.get(key), str) and issue[key].strip()),
+        None,
+    )
+
+
+def _comparison_eligible(issue: Any) -> bool:
+    if not isinstance(issue, dict) or issue.get("comparison_eligible") is False:
+        return False
+    has_document = any(
+        isinstance(issue.get(key), str) and issue[key].strip()
+        for key in ("document_id", "document_identifier")
+    )
+    return bool(has_document and (
+        issue.get("issue_type") == "dashboard_filter"
+        or (issue.get("issue_type") == "query" and _query_identity(issue) is not None)
+    ))
 
 
 def normalize_issues(issues: Iterable[Any]) -> list[dict[str, Any]]:
-    return [{"id": issue_identity(issue), "summary": issue_summary(issue), "raw": issue} for issue in issues]
+    return [
+        {"id": issue_identity(issue), "summary": issue_summary(issue), "raw": issue,
+         "comparison_eligible": _comparison_eligible(issue)}
+        for issue in issues
+    ]
 
 
 def partition_issues(
     current: list[dict[str, Any]],
     previous: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-    previous_ids = {item["id"] for item in previous}
-    current_ids = {item["id"] for item in current}
-    return (
-        [item for item in current if item["id"] not in previous_ids],
-        [item for item in current if item["id"] in previous_ids],
-        [item for item in previous if item["id"] not in current_ids],
-    )
+    available: dict[str, deque[int]] = defaultdict(deque)
+    for index, item in enumerate(previous):
+        if item["comparison_eligible"]:
+            available[item["id"]].append(index)
+    new, existing, matched = [], [], set()
+    for item in current:
+        if item["comparison_eligible"] and available[item["id"]]:
+            matched.add(available[item["id"]].popleft())
+            existing.append(item)
+        else:
+            new.append(item)
+    resolved = [
+        item for index, item in enumerate(previous)
+        if item["comparison_eligible"] and index not in matched
+    ]
+    return new, existing, resolved
 
 
 def index_content_records(records: Iterable[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -195,12 +426,15 @@ def filter_validator_payload(payload: Any, allowed_identifiers: set[str]) -> Any
     if not isinstance(payload, dict) or not isinstance(payload.get("content"), list):
         return payload
     filtered = dict(payload)
+    documents = content_documents(payload)
+    if any(not isinstance(document.get("identifier"), str) for document in documents):
+        raise OmniAPIError("Content Validator response is missing an identity required for label filtering")
     filtered["content"] = [
         document
-        for document in payload["content"]
+        for document in documents
         if isinstance(document, dict)
         and isinstance(document.get("identifier"), str)
-        and document["identifier"] in allowed_identifiers
+        and document.get(CANONICAL_DOCUMENT, document["identifier"]) in allowed_identifiers
     ]
     return filtered
 
@@ -218,7 +452,8 @@ def enrich_validator_payload(
             enriched_content.append(document)
             continue
         next_document = dict(document)
-        identifiers = (next_document.get("identifier"), next_document.get("document_id"))
+        identifiers = (next_document.get(CANONICAL_DOCUMENT), next_document.get("identifier"),
+                       next_document.get("document_id"))
         content_record = next(
             (
                 content_records_by_identifier[value]
@@ -239,11 +474,71 @@ def enrich_validator_payload(
     return enriched
 
 
-def compare_history_labels(payload: dict[str, Any], labels: list[str]) -> list[dict[str, Any]]:
-    previous_labels = payload.get("labels") or []
-    if isinstance(previous_labels, str):
-        previous_labels = [part.strip() for part in previous_labels.split(",") if part.strip()]
-    return payload.get("issues", []) if previous_labels == labels else []
+def compare_history(
+    payload: Any, context: dict[str, Any],
+) -> tuple[list[dict[str, Any]], str]:
+    if payload is None:
+        return [], "missing"
+    if not isinstance(payload, dict):
+        raise OmniAPIError("Content validation history has an invalid envelope")
+    if "diagnostic_schema_version" in payload:
+        # Public output intentionally lacks identity evidence. Even a report
+        # augmented with history-like fields must never become a trusted baseline.
+        return [], "invalidated_public_diagnostic"
+    if "schema_version" not in payload:
+        return [], "invalidated_legacy"
+    if type(payload["schema_version"]) is not int:
+        raise OmniAPIError("Content validation history has an invalid schema version")
+    if payload["schema_version"] != HISTORY_SCHEMA_VERSION:
+        return [], "invalidated_version"
+    if any(key not in payload for key in context):
+        raise OmniAPIError("Content validation history is missing comparison context")
+    if (
+        not isinstance(payload["model_id"], str) or not payload["model_id"].strip()
+        or any(payload[key] is not None and (not isinstance(payload[key], str) or not payload[key].strip())
+               for key in ("branch_id", "user_id"))
+        or type(payload["include_personal_folders"]) is not bool
+        or not isinstance(payload["labels"], list)
+        or any(not isinstance(label, str) or not label.strip() for label in payload["labels"])
+    ):
+        raise OmniAPIError("Content validation history has invalid comparison context")
+    issues = payload.get("issues")
+    if not isinstance(issues, list):
+        raise OmniAPIError("Content validation history has an invalid issue list")
+    for item in issues:
+        if (
+            not isinstance(item, dict)
+            or not isinstance(item.get("summary"), str) or not item["summary"].strip()
+            or not isinstance(item.get("raw"), (str, dict))
+            or type(item.get("comparison_eligible")) is not bool
+            or item.get("id") != issue_identity(item["raw"])
+            or item["comparison_eligible"] != _comparison_eligible(item["raw"])
+        ):
+            raise OmniAPIError("Content validation history contains invalid issue evidence")
+    actual_context = {key: payload[key] for key in context}
+    actual_context["labels"] = sorted(set(actual_context["labels"]))
+    if actual_context != context:
+        return [], "invalidated_context"
+    # A missing user ID denotes the current credential's principal, not a stable
+    # actor identity. Reusing its history across credential changes is unsafe.
+    if context["user_id"] is None:
+        return [], "invalidated_unscoped_user"
+    return issues, "accepted"
+
+
+def _fetch_validator_payload(
+    client: OmniClient, model_id: str, *, branch_id: str | None, user_id: str | None,
+    include_personal_folders: bool, comparison_mode: str,
+) -> Any:
+    try:
+        return client.validate_content(
+            model_id, branch_id=branch_id, user_id=user_id,
+            include_personal_folders=include_personal_folders,
+        )
+    except OmniResponseError as exc:
+        exc.validation_scope = "branch" if branch_id else "base"
+        exc.comparison_mode = comparison_mode
+        raise
 
 
 def run_content_validation(
@@ -262,11 +557,16 @@ def run_content_validation(
     redact_document_names: bool = False,
     allow_raw_response_output: bool = False,
 ) -> tuple[dict[str, Any], int]:
-    payload = client.validate_content(
-        model_id,
+    comparison_mode = "new_only" if fail_on_new_only else "all_issues"
+    payload = _fetch_validator_payload(
+        client, model_id,
         branch_id=branch_id,
         user_id=user_id,
         include_personal_folders=include_personal_folders,
+        comparison_mode=comparison_mode,
+    )
+    payload = _prepare_validator_payload(
+        payload, [], {}, validation_scope="branch" if branch_id else "base", comparison_mode=comparison_mode,
     )
     records = client.list_content(
         labels=labels,
@@ -274,8 +574,76 @@ def run_content_validation(
         include_personal_folders=include_personal_folders,
         user_id=user_id,
     )
+    if labels and any(
+        not isinstance(record, dict) or not isinstance(record.get("identifier"), str) or not record["identifier"].strip()
+        for record in records
+    ):
+        raise OmniAPIError("Content metadata is missing an identity required for label filtering")
     records_by_identifier = index_content_records(records)
-    payload = _prepare_validator_payload(payload, labels, records_by_identifier)
+    baseline_payload = None
+    if branch_id and (fail_on_new_only or labels):
+        baseline_payload = _fetch_validator_payload(
+            client, model_id, branch_id=None, user_id=user_id,
+            include_personal_folders=include_personal_folders, comparison_mode=comparison_mode,
+        )
+        baseline_payload = _prepare_validator_payload(
+            baseline_payload, [], {}, validation_scope="base", comparison_mode=comparison_mode,
+        )
+        if (isinstance(payload, dict) and "content" in payload
+                and isinstance(baseline_payload, dict) and "content" in baseline_payload):
+            try:
+                current_docs = content_documents(payload)
+                base_docs = content_documents(baseline_payload)
+                identity_records = records
+                # Label-selected metadata alone cannot identify an unselected
+                # draft or prove that a previously healthy/new document is new.
+                if labels:
+                    identity_records = client.list_content(
+                        labels=[], branch_id=branch_id, include_personal_folders=include_personal_folders,
+                        user_id=user_id,
+                    )
+                current, base, proof = resolve_documents(
+                    client=client, branch_id=branch_id, current=current_docs, baseline=base_docs,
+                    records=identity_records,
+                )
+                if proof.mappings:
+                    # Bracket the actual validator evidence with mapping/version
+                    # reads. A changed draft must never reuse stale error waivers.
+                    for scope, before in ((branch_id, current_docs), (None, base_docs)):
+                        after = _fetch_validator_payload(
+                            client, model_id, branch_id=scope, user_id=user_id,
+                            include_personal_folders=include_personal_folders, comparison_mode=comparison_mode,
+                        )
+                        after = _prepare_validator_payload(
+                            after, [], {}, validation_scope="branch" if scope else "base",
+                            comparison_mode=comparison_mode,
+                        )
+                        if evidence_signature(before) != evidence_signature(content_documents(after)):
+                            raise DocumentIdentityError("document_identity_changed")
+                    proof.recheck()
+                    if labels:
+                        after_records = client.list_content(
+                            labels=labels, branch_id=branch_id, include_personal_folders=include_personal_folders,
+                            user_id=user_id,
+                        )
+                        if set(index_content_records(after_records)) != set(records_by_identifier):
+                            raise DocumentIdentityError("document_identity_changed")
+                payload = {**payload, "content": current}
+                baseline_payload = {**baseline_payload, "content": base}
+            except DocumentIdentityError as exc:
+                error = ContentEvidenceError(reason_code=exc.reason_code)
+                error.validation_scope = "branch"
+                error.comparison_mode = comparison_mode
+                raise error from None
+            except ContentEvidenceError as exc:
+                if exc.validation_scope is None:
+                    exc.validation_scope = "branch"
+                exc.comparison_mode = comparison_mode
+                raise
+    payload = _prepare_validator_payload(
+        payload, labels, records_by_identifier, validation_scope="branch" if branch_id else "base",
+        comparison_mode=comparison_mode,
+    )
 
     safe_issues = _sanitize_issues(
         extract_issues(payload),
@@ -284,14 +652,16 @@ def run_content_validation(
     )
     normalized = normalize_issues(safe_issues)
     comparison_source = "history"
+    history_context = {
+        "model_id": model_id, "branch_id": branch_id, "user_id": user_id,
+        "include_personal_folders": include_personal_folders, "labels": sorted(set(labels)),
+    }
+    history_status = "not_used_live_base"
     if branch_id and fail_on_new_only:
-        baseline_payload = client.validate_content(
-            model_id,
-            branch_id=None,
-            user_id=user_id,
-            include_personal_folders=include_personal_folders,
+        baseline_payload = _prepare_validator_payload(
+            baseline_payload, labels, records_by_identifier, validation_scope="base",
+            comparison_mode=comparison_mode,
         )
-        baseline_payload = _prepare_validator_payload(baseline_payload, labels, records_by_identifier)
         previous = normalize_issues(
             _sanitize_issues(
                 extract_issues(baseline_payload),
@@ -301,13 +671,43 @@ def run_content_validation(
         )
         comparison_source = "base_model"
     else:
-        previous_payload = load_json(history_in) or {}
-        previous = compare_history_labels(previous_payload, labels) if previous_payload else []
+        previous, history_status = compare_history(load_json(history_in), history_context)
+        # History may have been written under a less restrictive output policy.
+        # Rebuild summaries from evidence under the current policy before reporting.
+        previous = normalize_issues(_sanitize_issues(
+            [item["raw"] for item in previous],
+            redact_document_names=redact_document_names,
+            allow_raw_response_output=allow_raw_response_output,
+        ))
     new_items, existing_items, resolved_items = partition_issues(normalized, previous)
+    baseline_available = comparison_source == "base_model" or history_status == "accepted"
+    ambiguous_issues = sum(not item["comparison_eligible"] for item in [*normalized, *previous])
+    comparison_status = (
+        "baseline_unavailable" if not baseline_available else "ambiguous" if ambiguous_issues else "complete"
+    )
     report_new = [_report_issue(item, state="new", severity="error") for item in new_items]
-    existing_severity = "info" if fail_on_new_only else "error"
-    report_existing = [_report_issue(item, state="existing", severity=existing_severity) for item in existing_items]
+    report_existing = [_report_issue(item, state="existing", severity="error") for item in existing_items]
     report_resolved = [_report_issue(item, state="resolved", severity="info", active=False) for item in resolved_items]
+    for issue in report_new:
+        issue["blocking"] = True
+    for issue in report_existing:
+        issue["blocking"] = not fail_on_new_only
+    for issue in report_resolved:
+        issue["blocking"] = False
+    evidence = []
+    if fail_on_new_only and comparison_status != "complete":
+        evidence.append({
+            "validator": "content", "type": "content_evidence_unavailable",
+            "reason_code": "content_comparison_unavailable", "comparison_status": comparison_status,
+            "comparison_mode": comparison_mode, "regression_status": "unknown",
+            "severity": "error", "blocking": True, "active": True, "coverage_complete": False,
+            "message": "Content comparison evidence is unavailable or ambiguous; no regression conclusion can be made.",
+        })
+    for issue in [*report_new, *report_existing]:
+        issue["validation_scope"] = "branch" if branch_id else "base"
+    if comparison_source == "base_model":
+        for issue in report_resolved:
+            issue["validation_scope"] = "base"
     generated_at = utc_now_iso()
     report = {
         "tool": "omniflow",
@@ -318,11 +718,24 @@ def run_content_validation(
         "labels": labels,
         "include_personal_folders": include_personal_folders,
         "total_issues": len(normalized),
+        "current_issues": len(normalized),
+        "baseline_issues": len(previous) if baseline_available else None,
         "new_issues": len(new_items),
         "existing_issues": len(existing_items),
         "resolved_issues": len(resolved_items),
         "comparison_source": comparison_source,
-        "issues": [*report_new, *report_existing, *report_resolved],
+        "comparison_mode": comparison_mode,
+        "comparison_status": comparison_status,
+        "content_health": "issues_in_scope" if normalized else "no_issues_in_scope",
+        "regression_status": (
+            ("new_issues_detected" if new_items else "no_new_issues_detected")
+            if comparison_status == "complete" else "unknown"
+        ),
+        "history_status": history_status,
+        "comparison_ambiguous_issues": ambiguous_issues,
+        "blocking_issues": len(report_new) + (0 if fail_on_new_only else len(report_existing)) + len(evidence),
+        "validation_complete": not evidence,
+        "issues": [*report_new, *report_existing, *report_resolved, *evidence],
         "new_issue_samples": report_new[:max_samples],
         "existing_issue_samples": report_existing[:max_samples],
         "resolved_issue_samples": report_resolved[:max_samples],
@@ -335,15 +748,13 @@ def run_content_validation(
     write_json(
         history_out,
         {
+            "schema_version": HISTORY_SCHEMA_VERSION,
             "generated_at": generated_at,
-            "model_id": model_id,
-            "branch_id": branch_id,
-            "labels": labels,
-            "include_personal_folders": include_personal_folders,
+            **history_context,
             "issues": normalized,
         },
     )
-    exit_code = 1 if (len(new_items) if fail_on_new_only else len(normalized)) > 0 else 0
+    exit_code = 4 if evidence else 1 if (len(new_items) if fail_on_new_only else len(normalized)) > 0 else 0
     return report, exit_code
 
 
@@ -351,7 +762,16 @@ def _prepare_validator_payload(
     payload: Any,
     labels: list[str],
     records_by_identifier: dict[str, dict[str, Any]],
+    *,
+    validation_scope: str | None = None,
+    comparison_mode: str = "unknown",
 ) -> Any:
+    try:
+        extract_issues(payload)
+    except ContentEvidenceError as exc:
+        exc.validation_scope = validation_scope
+        exc.comparison_mode = comparison_mode if comparison_mode in {"all_issues", "new_only"} else "unknown"
+        raise
     if not isinstance(payload, dict) or not isinstance(payload.get("content"), list):
         return payload
     if labels:
@@ -366,9 +786,19 @@ def _report_issue(
     severity: str,
     active: bool = True,
 ) -> dict[str, Any]:
+    raw = item.get("raw")
+    context = {
+        key: raw[key]
+        for key in ("document_id", "document_identifier", "document_name", "query_name", "filter_name", *QUERY_IDENTITY_KEYS)
+        if isinstance(raw, dict) and isinstance(raw.get(key), str)
+    }
+    issue_type = raw.get("issue_type") if isinstance(raw, dict) else None
     return {
         **item,
+        **context,
         "validator": "content",
+        "type": "content_validation_issue",
+        "issue_type": issue_type if issue_type in {"dashboard_filter", "query"} else "content",
         "severity": severity,
         "message": item.get("summary") or "Omni content validation issue",
         "state": state,

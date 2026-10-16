@@ -90,7 +90,8 @@ class ContentModelTests(unittest.TestCase):
                 fail_on_new_only=True,
             )
         self.assertEqual(report["new_issues"], 1)
-        self.assertEqual(exit_code, 1)
+        self.assertEqual(exit_code, 4)
+        self.assertFalse(report["validation_complete"])
 
     def test_branch_content_compares_to_base_model_without_persisted_history(self):
         client = FakeClient()
@@ -100,8 +101,8 @@ class ContentModelTests(unittest.TestCase):
                     "identifier": "dash-1",
                     "name": "Revenue",
                     "queries_and_issues": [
-                        {"query_name": "Existing", "issues": [{"message": "Existing issue"}]},
-                        {"query_name": "New", "issues": [{"message": "New issue"}]},
+                        {"query_name": "Existing", "query_presentation_id": "existing", "issues": [{"message": "Existing issue"}]},
+                        {"query_name": "New", "query_presentation_id": "new", "issues": [{"message": "New issue"}]},
                     ],
                 }
             ]
@@ -111,7 +112,7 @@ class ContentModelTests(unittest.TestCase):
                 {
                     "identifier": "dash-1",
                     "name": "Revenue",
-                    "queries_and_issues": [{"query_name": "Existing", "issues": [{"message": "Existing issue"}]}],
+                    "queries_and_issues": [{"query_name": "Existing", "query_presentation_id": "existing", "issues": [{"message": "Existing issue"}]}],
                 }
             ]
         }

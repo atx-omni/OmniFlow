@@ -13,7 +13,14 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .artifacts import public_dir, restricted_dir, write_artifact_manifest, write_public_json, write_public_reports
+from .artifacts import (
+    public_dir,
+    restricted_dir,
+    write_artifact_manifest,
+    write_emergency_failure,
+    write_public_json,
+    write_public_reports,
+)
 from .breaking_hold import evaluate_breaking_hold, hold_triggered
 from .config import (
     DEFAULT_REPORT_FORMATS,
@@ -25,8 +32,9 @@ from .config import (
 from .contracts import evaluate_contracts
 from .dbt_impact import evaluate_dbt_impact
 from .dbt_sync import run_dbt_sync, validate_dbt_sync_environment
+from .diagnostics import diagnostic_session, public_diagnostic, safe_exception_message
 from .diff.diff_engine import diff_graphs
-from .diff.semantic_graph import build_graph
+from .diff.semantic_graph import has_inheritance, load_yaml_graph
 from .diff.yaml_loader import load_yaml_files
 from .discovery import (
     ModelContext,
@@ -36,38 +44,57 @@ from .discovery import (
     load_flow_metadata,
 )
 from .downstream import generate_downstream_dependencies
-from .exceptions import ConfigError, ExitCodes, OmniAuthError, OmniFlowError, SecurityPolicyError
+from .exceptions import ConfigError, ExitCodes, OmniAuthError, OmniFlowError, OmniResponseError, SecurityPolicyError
+from .execution import ValidationProgress, scope_findings
 from .exposures import run_dbt_exposure_enrichment
-from .git import current_branch, current_sha, event_name, git_executable, pr_number
-from .github.annotations import annotation_lines
+from .git import current_branch, current_sha, event_name, git_executable, git_value, is_pull_request_event, pr_number
+from .github.annotations import public_annotation_lines
 from .github.repair_attempt import GitHubRepairAttemptGuard, load_repair_event
 from .logging import configure_logging
+from .nonsemantic import classify_pr_change
 from .omni_client import OmniClient
 from .repair.orchestrator import run_ai_repair, validate_ai_repair_policy
 from .repair.reporting import write_repair_artifacts
+from .reporting.issue_policy import is_blocking
 from .reporting.json_report import write_json_report
-from .reporting.writer import write_reports
-from .security import redact, validate_repo_output_path
+from .repository_diagnostics import (
+    REPORT_NAMES as REPOSITORY_REPORT_NAMES,
+)
+from .repository_diagnostics import (
+    clear_repository_reports,
+    finish_repository_context,
+    publish_repository_output,
+    repository_reporting,
+    start_repository_context,
+)
+from .revision_data import pull_request_changed_files, pull_request_revision
+from .security import redact, validate_path_segment, validate_repo_output_path
 from .timestamps import utc_now_iso
-from .validators.content import run_content_validation
+from .validators.ai_eval import run_ai_eval_validation
+from .validators.content import ContentEvidenceError, run_content_validation
 from .validators.model import run_model_validation
 from .validators.yaml_lint import has_error, lint_graph
+from .view_identity import ViewNamesMetadataError
 from .yaml_pull import pull_yaml
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, changed_files: list[str] | None = None) -> int:
     if os.name == "posix":
         os.umask(0o077)
     parser = build_parser()
     args = parser.parse_args(argv)
     configure_logging("DEBUG" if getattr(args, "verbose", False) else "INFO")
     try:
+        if changed_files is not None:
+            if args.func is not cmd_run:
+                raise ConfigError("An internal revision inventory is only supported for run")
+            return cmd_run(args, changed_files=changed_files)
         return args.func(args)
     except OmniFlowError as exc:
-        print(redact(str(exc)), file=sys.stderr)
+        print(safe_exception_message(exc), file=sys.stderr)
         return exc.exit_code
     except Exception as exc:
-        print(redact(f"Internal omniflow error: {exc}"), file=sys.stderr)
+        print(safe_exception_message(exc), file=sys.stderr)
         return ExitCodes.INTERNAL_ERROR
 
 
@@ -181,7 +208,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _add_config_arg(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--config", default=None)
+    parser.add_argument(
+        "--config", default=None,
+        help="Required policy file (default: .omniflow.yml); PRs read the trusted base branch",
+    )
 
 
 def _add_common_omni_args(parser: argparse.ArgumentParser) -> None:
@@ -194,7 +224,8 @@ def _add_common_omni_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--include-personal-folders", action=argparse.BooleanOptionalAction, default=None)
 
 
-def cmd_run(args: argparse.Namespace) -> int:
+@diagnostic_session()
+def cmd_run(args: argparse.Namespace, *, changed_files: list[str] | None = None) -> int:
     try:
         config = _override_config(load_config(args.config), args)
     except OmniFlowError as exc:
@@ -202,11 +233,23 @@ def cmd_run(args: argparse.Namespace) -> int:
         raise
     output_dir = Path(config.reporting.output_dir)
     _validate_run_output_layout(output_dir)
+    try:
+        with repository_reporting(config, output_dir=output_dir):
+            return _execute_run(args, config=config, output_dir=output_dir, changed_files=changed_files)
+    except OmniFlowError:
+        raise
+    except Exception:
+        # Do not repeat an unsafe formatter or echo an arbitrary exception.
+        write_emergency_failure(output_dir=output_dir)
+        return ExitCodes.INTERNAL_ERROR
+
+
+def _execute_run(args, *, config, output_dir: Path, changed_files: list[str] | None) -> int:
     if not config.security.retain_restricted_artifacts:
         _purge_restricted_path(restricted_dir(output_dir))
     if args.skip_reason:
         _write_skipped_artifacts(config=config, output_dir=output_dir, reason=args.skip_reason)
-        print(f"OmniFlow skipped: {args.skip_reason}")
+        print("OmniFlow skipped under the trusted workflow policy; see the sanitized report.")
         return 0
     try:
         contexts = discover_contexts(
@@ -217,6 +260,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             branch_name=config.omni.branch_name,
             branch_id=config.omni.branch_id,
             allow_skip=True,
+            changed_files=changed_files,
         )
     except OmniFlowError as exc:
         _write_setup_failure_artifacts(config=config, output_dir=output_dir, exc=exc)
@@ -224,7 +268,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     if not contexts:
         # A pull request with no Omni model changes can still break Omni by
         # removing a warehouse column or model the committed YAML references.
-        impact_exit = _run_dbt_impact_check(config=config, output_dir=output_dir)
+        impact_exit = _run_dbt_impact_check(config=config, output_dir=output_dir, changed_files=changed_files)
         if impact_exit is not None:
             return impact_exit
         _write_skipped_artifacts(config=config, output_dir=output_dir)
@@ -233,7 +277,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     all_reports = []
     all_issues: list[dict[str, Any]] = []
     exit_code = 0
-    changed_files = get_changed_files() if config.breaking_change_hold.enabled else []
+    classification = classify_pr_change(contexts) if config.content_validation.classify_comment_only else None
+    if changed_files is None:
+        changed_files = get_changed_files() if config.breaking_change_hold.enabled else []
     for context in contexts:
         context_output_dir = restricted_dir(output_dir) / _safe_context_dir(context)
         _validate_context_output_layout(context_output_dir)
@@ -246,7 +292,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                     changed_files=changed_files,
                     enforce_breaking_hold=True,
                 )
-            except OmniFlowError as exc:
+            except Exception as exc:
                 context_report, context_exit = _write_context_failure_artifacts(
                     config=config,
                     context=context,
@@ -262,6 +308,10 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     summary = _summarize(all_issues)
     report = _aggregate_report(config, contexts, exit_code, all_issues, summary, all_reports)
+    if classification is not None:
+        # Classification is explanatory only. Git cannot prove the absence of
+        # extra Omni drafts; no classification may suppress an enabled check.
+        report["change_classification"] = classification
     public_report = write_public_reports(
         report,
         output_dir=output_dir,
@@ -282,6 +332,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         "validation_status": "failed" if exit_code else "passed",
         "policy_decision": "fail" if exit_code else "pass",
         "exit_code": exit_code,
+        "exit_code_reason": _exit_code_reason(exit_code),
+        "validation_complete": report["validation_complete"],
         "timestamp": utc_now_iso(),
     }
     write_public_json(output_dir / "evidence.json", evidence, redaction_level=config.security.redaction_level)
@@ -294,6 +346,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         redaction_level=config.security.redaction_level,
     )
     _emit_hold_output(all_issues, settings=config.breaking_change_hold)
+    publish_repository_output()
     print(f"OmniFlow complete: models={len(contexts)} issues={summary['total_issues']} exit_code={exit_code}")
     return exit_code
 
@@ -323,20 +376,32 @@ def cmd_route(args: argparse.Namespace) -> int:
         _write_setup_failure_artifacts(config=config, output_dir=output_dir, exc=exc)
         raise
 
-    should_run = bool(contexts)
+    requires_omni = bool(contexts)
+    dbt_impact_needed = config.dbt_impact.enabled and any(
+        _path_under_any(path, config.breaking_change_hold.dbt_paths) for path in get_dbt_changed_files()
+    )
+    should_run = requires_omni or dbt_impact_needed
     reason = "" if should_run else "no Omni PR context or changed Omni model files detected"
     if not should_run:
         _write_skipped_artifacts(config=config, output_dir=output_dir, reason=reason)
 
     payload = {
         "should_run": should_run,
+        "requires_omni": requires_omni,
         "reason": reason,
         "model_count": len(contexts),
     }
+    environment = contexts[0].environment if contexts else None
+    if environment:
+        payload.update(environment=environment, target_branch=contexts[0].base_branch)
     if args.format == "github":
         print(f"should_run={'true' if should_run else 'false'}")
+        print(f"requires_omni={'true' if requires_omni else 'false'}")
         print(f"reason={reason}")
         print(f"model_count={len(contexts)}")
+        if environment:
+            print(f"environment={environment}")
+            print(f"target_branch={contexts[0].base_branch}")
     elif args.format == "json":
         print(json.dumps(payload, sort_keys=True))
     else:
@@ -461,7 +526,7 @@ def _write_skipped_artifacts(
     )
 
 
-def _run_dbt_impact_check(*, config, output_dir: Path) -> int | None:
+def _run_dbt_impact_check(*, config, output_dir: Path, changed_files: list[str] | None = None) -> int | None:
     """Analyze a non-Omni pull request for dbt changes that orphan Omni references.
 
     Returns an exit code when the check ran, or None when it was not applicable so
@@ -471,26 +536,22 @@ def _run_dbt_impact_check(*, config, output_dir: Path) -> int | None:
     if not config.dbt_impact.enabled:
         return None
     dbt_paths = config.breaking_change_hold.dbt_paths
-    changed_files = get_changed_files()
+    changed_files = get_dbt_changed_files() if changed_files is None else changed_files
     if not any(_path_under_any(path, dbt_paths) for path in changed_files):
         return None
 
     omni_yaml_paths = config.dbt_impact.omni_yaml_paths or _flow_model_paths()
-    if not omni_yaml_paths:
-        print(
-            "omniflow warning: dbt impact analysis is enabled but no Omni model path is available. "
-            "Add checks.dbt_impact.omni_yaml_paths or model_path entries to .omni/flow.json.",
-            file=sys.stderr,
+    try:
+        report, issues = evaluate_dbt_impact(
+            changed_files=changed_files,
+            dbt_paths=dbt_paths,
+            settings=config.dbt_impact,
+            omni_yaml_paths=omni_yaml_paths,
+            base_ref=_base_ref(),
         )
-        return None
-
-    report, issues = evaluate_dbt_impact(
-        changed_files=changed_files,
-        dbt_paths=dbt_paths,
-        settings=config.dbt_impact,
-        omni_yaml_paths=omni_yaml_paths,
-        base_ref=_base_ref(),
-    )
+    except OmniFlowError as exc:
+        _write_setup_failure_artifacts(config=config, output_dir=output_dir, exc=exc)
+        raise
     exit_code = (
         ExitCodes.VALIDATION_FAILED
         if any(issue.get("severity") == "error" for issue in issues)
@@ -568,6 +629,11 @@ def _run_dbt_impact_check(*, config, output_dir: Path) -> int | None:
     return exit_code
 
 
+def get_dbt_changed_files() -> list[str]:
+    exact = pull_request_changed_files()
+    return exact if exact is not None else get_changed_files()
+
+
 def _flow_model_paths() -> list[str]:
     """Read model paths from trusted base-branch metadata."""
     try:
@@ -596,6 +662,9 @@ def _base_ref() -> str | None:
     None means no comparison base is available and the caller reports that rather
     than guessing.
     """
+    revision = pull_request_revision("base")
+    if revision is not None:
+        return revision[0]
     candidates: list[str] = []
     base_branch = os.getenv("GITHUB_BASE_REF")
     if base_branch:
@@ -603,7 +672,7 @@ def _base_ref() -> str | None:
     candidates.append("HEAD~1")
     for candidate in candidates:
         if _ref_exists(candidate):
-            return candidate
+            return git_value("rev-parse", candidate)
     return None
 
 
@@ -641,13 +710,67 @@ def _run_context(
     comparison_base_yaml_dir: Path | None = None,
     changed_files: list[str] | None = None,
     enforce_breaking_hold: bool = False,
+    strict_health: bool = False,
 ) -> tuple[dict[str, Any], int]:
+    progress = ValidationProgress(config, branch_id=context.branch_id, enforce_breaking_hold=enforce_breaking_hold)
+    regression_pr = not strict_health and is_pull_request_event() and (
+        (config.content_validation.enabled and config.content_validation.fail_on_new_only)
+        or (config.model_validation.enabled and config.model_validation.fail_on_new_only)
+    )
+    if context.environment or regression_pr:
+        progress.states["candidate"] = {"validator": "candidate", "status": "not_run"}
+    try:
+        return _run_context_steps(
+            config=config, context=context, output_dir=output_dir, api_key=api_key,
+            comparison_base_yaml_dir=comparison_base_yaml_dir, changed_files=changed_files,
+            enforce_breaking_hold=enforce_breaking_hold, progress=progress,
+            strict_health=strict_health, regression_pr=regression_pr,
+        )
+    except Exception as exc:
+        progress.fail(exc)
+        exc.omniflow_progress = progress
+        raise
+
+
+def _run_context_steps(
+    *, config, context: ModelContext, output_dir: Path, api_key: str | None,
+    comparison_base_yaml_dir: Path | None, changed_files: list[str] | None,
+    enforce_breaking_hold: bool, progress: ValidationProgress,
+    strict_health: bool, regression_pr: bool,
+) -> tuple[dict[str, Any], int]:
+    if context.environment and (config.breaking_change_hold.enabled or config.dbt_sync.enabled):
+        raise SecurityPolicyError(
+            "Version 2 environment targets are validation-only. Disable deployment synchronization and "
+            "breaking-change hold/readiness in this validation policy; repository-wide sync state is not "
+            "evidence for the selected environment. Keep separate governed deployment gates."
+        )
     client, branch_id = _client_and_branch_for_context(context, config.omni.timeout, api_key=api_key)
-    all_issues: list[dict[str, Any]] = []
-    reports: list[dict[str, Any]] = []
+    progress.branch_id = branch_id
+    progress.complete("context")
+    all_issues = progress.issues
+    reports = progress.reports
     exit_code = 0
+    verify_provenance = bool(context.environment) or regression_pr
+    baseline_proof = None
+    if verify_provenance:
+        from .candidate import verify_candidate
+
+        progress.begin("candidate")
+        context.candidate_verification = {"status": "unverified"}
+        context.candidate_verification = verify_candidate(client, context)
+        # Completion requires the second sample after every enabled check.
+        context.candidate_verification["status"] = "pending_recheck"
+        if regression_pr:
+            baseline_proof = verify_candidate(client, context, revision_side="base")
+
+    repository_evidence = start_repository_context(
+        context, client, branch_id=branch_id,
+        head_proof=context.candidate_verification if verify_provenance else None,
+        base_proof=baseline_proof,
+    )
 
     if config.content_validation.enabled:
+        progress.begin("content")
         content_report, content_exit = run_content_validation(
             client=client,
             model_id=context.model_id,
@@ -658,7 +781,7 @@ def _run_context(
             history_in=output_dir / "history.json",
             history_out=output_dir / "history.json",
             report_out=output_dir / "content-report.json",
-            fail_on_new_only=config.content_validation.fail_on_new_only,
+            fail_on_new_only=config.content_validation.fail_on_new_only and bool(branch_id) and not strict_health,
             max_samples=config.security.max_report_samples,
             redact_document_names=config.security.redact_document_names,
             allow_raw_response_output=config.security.allow_raw_response_output,
@@ -666,17 +789,44 @@ def _run_context(
         reports.append(content_report)
         all_issues.extend(content_report.get("issues", []))
         exit_code = max(exit_code, content_exit)
+        progress.complete("content", content_exit)
 
     if config.model_validation.enabled:
+        progress.begin("model")
         model_report, model_exit = run_model_validation(
             client=client,
             model_id=context.model_id,
             branch_id=branch_id,
             fail_on_warnings=config.model_validation.fail_on_warnings,
+            fail_on_new_only=config.model_validation.fail_on_new_only and not strict_health,
         )
         reports.append(model_report)
         all_issues.extend(model_report.get("issues", []))
         exit_code = max(exit_code, model_exit)
+        progress.complete("model", model_exit)
+
+    if config.ai_eval.enabled and config.ai_eval.prompt_sets:
+        progress.begin("ai_eval")
+        ai_eval_report, ai_eval_detail, ai_eval_exit = run_ai_eval_validation(
+            client=client,
+            model_id=context.model_id,
+            branch_id=branch_id,
+            prompt_sets=config.ai_eval.prompt_sets,
+            fail_on_regression=config.ai_eval.fail_on_regression,
+            poll_interval_seconds=config.ai_eval.poll_interval_seconds,
+            timeout_seconds=config.ai_eval.timeout_seconds,
+            scoring_grace_seconds=config.ai_eval.scoring_grace_seconds,
+            max_samples=config.security.max_report_samples,
+            record_runs=lambda journal: write_json_report(output_dir / "ai-eval-runs.json", journal),
+        )
+        # Full per-prompt detail (cost breakdown, conversation IDs, timing) carries
+        # customer prompt/answer content and stays restricted; only the bounded
+        # public summary below is appended to the aggregate report.
+        write_json_report(output_dir / "ai-eval-detail.json", ai_eval_detail)
+        reports.append(ai_eval_report)
+        all_issues.extend(ai_eval_report.get("issues", []))
+        exit_code = max(exit_code, ai_eval_exit)
+        progress.complete("ai_eval", ai_eval_exit)
 
     diff_report = None
     head_graph = None
@@ -684,27 +834,30 @@ def _run_context(
     # request one even when semantic lint and contracts are both disabled.
     needs_breaking_hold = enforce_breaking_hold and config.breaking_change_hold.enabled
     if config.semantic_lint.enabled or config.contracts.enabled or needs_breaking_hold:
+        progress.begin("semantic_diff")
         base_yaml_dir = comparison_base_yaml_dir or output_dir / "yaml-base"
         head_yaml_dir = output_dir / "yaml-head"
         if comparison_base_yaml_dir is None:
-            pull_yaml(
+            base_yaml_dir = _pull_analysis_yaml(
                 client=client,
                 model_id=context.model_id,
                 branch_id=None,
                 output_dir=base_yaml_dir,
             )
-        pull_yaml(
+        head_yaml_dir = _pull_analysis_yaml(
             client=client,
             model_id=context.model_id,
             branch_id=branch_id,
             output_dir=head_yaml_dir,
         )
-        base_graph = build_graph(load_yaml_files(base_yaml_dir))
-        head_graph = build_graph(load_yaml_files(head_yaml_dir))
+        base_graph = load_yaml_graph(base_yaml_dir, require_view_names=True)
+        head_graph = load_yaml_graph(head_yaml_dir, require_view_names=True)
         diff_report = diff_graphs(base_graph, head_graph)
         write_json_report(output_dir / "semantic-diff.json", diff_report)
+        progress.complete("semantic_diff")
 
     if config.semantic_lint.enabled and head_graph is not None:
+        progress.begin("semantic_lint")
         lint_issues = lint_graph(
             head_graph,
             configured_rules=config.semantic_lint.rules,
@@ -727,8 +880,10 @@ def _run_context(
         reports.append(lint_report)
         all_issues.extend(lint_issues)
         exit_code = max(exit_code, 1 if has_error(lint_issues) else 0)
+        progress.complete("semantic_lint", 1 if has_error(lint_issues) else 0)
 
     if config.contracts.enabled and diff_report is not None:
+        progress.begin("downstream")
         dependencies = generate_downstream_dependencies(
             client=client,
             model_id=context.model_id,
@@ -738,6 +893,8 @@ def _run_context(
             include_personal_folders=config.omni.include_personal_folders,
         )
         write_json_report(output_dir / "dependencies.json", dependencies)
+        progress.complete("downstream")
+        progress.begin("contracts")
         contract_report, contract_exit = evaluate_contracts(
             diff_result=diff_report,
             dependencies=dependencies,
@@ -748,8 +905,10 @@ def _run_context(
         reports.append(contract_report)
         all_issues.extend(contract_report.get("issues", []))
         exit_code = max(exit_code, contract_exit)
+        progress.complete("contracts", contract_exit)
 
     if config.dbt_exposures.enabled:
+        progress.begin("dbt_exposures")
         exposure_report, exposure_exit = run_dbt_exposure_enrichment(
             client=client,
             model_id=context.model_id,
@@ -760,8 +919,10 @@ def _run_context(
         reports.append(exposure_report)
         all_issues.extend(exposure_report.get("issues", []))
         exit_code = max(exit_code, exposure_exit)
+        progress.complete("dbt_exposures", exposure_exit)
 
     if enforce_breaking_hold and config.breaking_change_hold.enabled:
+        progress.begin("breaking_change_hold")
         hold_issues = evaluate_breaking_hold(
             diff_result=diff_report,
             changed_files=changed_files or [],
@@ -789,12 +950,49 @@ def _run_context(
             all_issues.extend(hold_issues)
             if config.breaking_change_hold.action == "fail":
                 exit_code = max(exit_code, ExitCodes.VALIDATION_FAILED)
+        progress.complete("breaking_change_hold", 1 if any(issue.get("severity") == "error" for issue in hold_issues) else 0)
 
+    if verify_provenance:
+        progress.begin("candidate")
+        before = dict(context.candidate_verification, status="verified")
+        after = verify_candidate(client, context)
+        if before != after:
+            context.candidate_verification = {"status": "unverified", "reason": "changed_during_validation"}
+            raise ConfigError("Candidate evidence changed during validation; rerun the current PR")
+        if baseline_proof is not None and baseline_proof != verify_candidate(client, context, revision_side="base"):
+            context.candidate_verification = {"status": "unverified", "reason": "changed_during_validation"}
+            raise ConfigError("Base evidence changed during validation; rerun the current PR")
+        context.candidate_verification = after
+        progress.complete("candidate")
+    finish_repository_context(
+        repository_evidence, context, client, all_issues, branch_id=branch_id,
+        head_proof=context.candidate_verification if verify_provenance else None,
+        base_proof=baseline_proof,
+    )
+    progress.begin("reporting")
+    progress.complete("reporting")
+    scope_findings(all_issues, model_id=context.model_id, branch_id=branch_id, branch_name=context.branch_name)
     summary = _summarize(all_issues)
     report = _base_report(config, context, branch_id, exit_code, all_issues, summary)
     report["check_reports"] = reports
+    report.update(progress.evidence())
     write_json_report(output_dir / "report.json", report)
     return report, exit_code
+
+
+def _pull_analysis_yaml(*, client, model_id: str, branch_id: str | None, output_dir: Path) -> Path:
+    """Retain authored evidence; use Omni's resolved representation for inheritance."""
+    pull_yaml(client=client, model_id=model_id, branch_id=branch_id, output_dir=output_dir)
+    if has_inheritance(load_yaml_files(output_dir)):
+        # Keep derived evidence outside the authored namespace: an authored
+        # file may legitimately live at resolved/orders.view.
+        resolved_dir = output_dir.with_name(f"{output_dir.name}-resolved")
+        pull_yaml(
+            client=client, model_id=model_id, branch_id=branch_id,
+            output_dir=resolved_dir, fully_resolved=True,
+        )
+        return resolved_dir
+    return output_dir
 
 
 def _write_context_failure_artifacts(
@@ -802,44 +1000,111 @@ def _write_context_failure_artifacts(
     config,
     context: ModelContext,
     output_dir: Path,
-    exc: OmniFlowError,
+    exc: Exception,
 ) -> tuple[dict[str, Any], int]:
+    progress = getattr(exc, "omniflow_progress", None)
+    if not isinstance(progress, ValidationProgress):
+        progress = ValidationProgress(config, branch_id=context.branch_id, enforce_breaking_hold=False)
+        progress.fail(exc)
+    code = exc.exit_code if isinstance(exc, OmniFlowError) else ExitCodes.INTERNAL_ERROR
     issue = {
         "severity": "error",
-        "validator": "context",
-        "message": redact(str(exc)),
+        "validator": progress.current,
+        "type": "validation_execution_failed",
+        "message": redact(str(exc)) if isinstance(exc, OmniFlowError) else "An internal validation error interrupted this context.",
     }
-    summary = _summarize([issue])
-    report = _base_report(config, context, context.branch_id, exc.exit_code, [issue], summary)
-    report["check_reports"] = []
-    report["exit_code_reason"] = _exit_code_reason(exc.exit_code)
+    if isinstance(exc, ContentEvidenceError):
+        issue = exc.report_issue(redact_document_names=config.security.redact_document_names)
+    if isinstance(exc, OmniResponseError):
+        issue = exc.report_issue(validator=progress.current)
+    if isinstance(exc, ViewNamesMetadataError):
+        issue.update(metadata_stage=exc.metadata_stage, metadata_reason=exc.metadata_reason)
+    if progress.current == "candidate":
+        reason = getattr(exc, "candidate_reason", "verification_unavailable")
+        issue.update(type="candidate_verification_failed", candidate_reason=reason, coverage_complete=False)
+        if getattr(exc, "validation_scope", None) in {"base", "branch"}:
+            issue["validation_scope"] = exc.validation_scope
+        context.candidate_verification = {"status": "unverified", "reason": reason}
+    issues = [*progress.issues, issue]
+    scope_findings(issues, model_id=context.model_id, branch_id=progress.branch_id, branch_name=context.branch_name)
+    summary = _summarize(issues)
+    report = _base_report(config, context, progress.branch_id, code, issues, summary)
+    report["check_reports"] = [*progress.reports, {
+        "validator": issue["validator"], "coverage_complete": False, "issues": [issue],
+    }]
+    report.update(progress.evidence())
+    report["validation_complete"] = False
+    report["exit_code_reason"] = _exit_code_reason(code)
     write_json_report(output_dir / "report.json", report)
-    return report, exc.exit_code
+    return report, code
 
 
+@diagnostic_session()
 def cmd_content_validate(args: argparse.Namespace) -> int:
     config = _override_config(load_config(args.config), args)
-    client, branch_id = _client_and_branch(config)
     output_dir = Path(config.reporting.output_dir)
     labels = _labels_from_args(args) or config.content_validation.labels
     fail_on_new_only = (
         config.content_validation.fail_on_new_only if args.fail_on_new_only is None else args.fail_on_new_only
     )
-    report, exit_code = run_content_validation(
-        client=client,
-        model_id=_required(config.omni.model_id, "omni.model_id"),
-        branch_id=branch_id,
-        user_id=config.omni.user_id,
-        include_personal_folders=config.omni.include_personal_folders,
-        labels=labels,
-        history_in=args.history_in or output_dir / "history.json",
-        history_out=args.history_out or output_dir / "history.json",
-        report_out=args.report_out or output_dir / "report.json",
-        fail_on_new_only=fail_on_new_only,
-        max_samples=config.security.max_report_samples,
-        redact_document_names=config.security.redact_document_names,
-        allow_raw_response_output=args.unsafe_raw_output,
-    )
+    _validate_run_output_layout(output_dir)
+    private = restricted_dir(output_dir) / "content-validation"
+    if args.unsafe_raw_output and (
+        os.getenv("GITHUB_ACTIONS") == "true" or not config.security.retain_restricted_artifacts
+    ):
+        raise SecurityPolicyError("Raw diagnostics require explicit local restricted retention and cannot run in CI")
+    history_out = Path(args.history_out) if args.history_out else private / "history.json"
+    if args.history_out:
+        if not config.security.retain_restricted_artifacts or not history_out.resolve().is_relative_to(
+            restricted_dir(output_dir).resolve()
+        ):
+            raise SecurityPolicyError("History output requires explicit retention inside the restricted directory")
+        validate_repo_output_path(history_out)
+    try:
+        if fail_on_new_only and is_pull_request_event():
+            raise ConfigError("PR regression validation requires omniflow run --auto for trusted Git snapshot verification")
+        client, branch_id = _client_and_branch(config)
+        fail_on_new_only = fail_on_new_only and bool(branch_id or args.history_in or args.fail_on_new_only is True)
+        report, exit_code = run_content_validation(
+            client=client,
+            model_id=_required(config.omni.model_id, "omni.model_id"),
+            branch_id=branch_id,
+            user_id=config.omni.user_id,
+            include_personal_folders=config.omni.include_personal_folders,
+            labels=labels,
+            history_in=args.history_in or private / "history.json",
+            history_out=history_out,
+            report_out=private / "report.json",
+            fail_on_new_only=fail_on_new_only,
+            max_samples=config.security.max_report_samples,
+            redact_document_names=config.security.redact_document_names,
+            allow_raw_response_output=args.unsafe_raw_output,
+        )
+        report.update(exit_code=exit_code, policy_decision="fail" if exit_code else "pass",
+                      validation_complete=report.get("validation_complete", True))
+        write_public_reports(report, output_dir=output_dir, formats=config.reporting.formats,
+                             redaction_level=config.security.redaction_level)
+        if args.report_out:
+            write_public_json(args.report_out, report, redaction_level=config.security.redaction_level)
+    except Exception as exc:
+        issue = exc.report_issue() if isinstance(exc, (ContentEvidenceError, OmniResponseError)) else {
+            "validator": "content", "type": "validation_execution_failed", "severity": "error",
+            "message": safe_exception_message(exc), "comparison_status": "unavailable",
+            "content_health": "unknown", "regression_status": "unknown",
+        }
+        failure = {"validator": "content", "exit_code": exc.exit_code if isinstance(exc, OmniFlowError) else 6,
+                              "policy_decision": "fail", "validation_complete": False,
+                              "issues": [issue]}
+        # A rejected filesystem target must never be retried by a fallback writer.
+        if not isinstance(exc, SecurityPolicyError):
+            write_public_reports(failure, output_dir=output_dir, formats=config.reporting.formats,
+                                 redaction_level=config.security.redaction_level)
+            if args.report_out:
+                write_public_json(args.report_out, failure, redaction_level=config.security.redaction_level)
+        raise
+    finally:
+        if not config.security.retain_restricted_artifacts:
+            _purge_restricted_path(private)
     print(
         "Content validator results: "
         f"total={report['total_issues']} new={report['new_issues']} "
@@ -848,19 +1113,42 @@ def cmd_content_validate(args: argparse.Namespace) -> int:
     return exit_code
 
 
+@diagnostic_session()
 def cmd_model_validate(args: argparse.Namespace) -> int:
     config = _override_config(load_config(args.config), args)
-    client, branch_id = _client_and_branch(config)
+    output_dir = Path(config.reporting.output_dir)
+    _validate_run_output_layout(output_dir)
     fail_on_warnings = (
         config.model_validation.fail_on_warnings if args.fail_on_warnings is None else args.fail_on_warnings
     )
-    report, exit_code = run_model_validation(
-        client=client,
-        model_id=_required(config.omni.model_id, "omni.model_id"),
-        branch_id=branch_id,
-        fail_on_warnings=fail_on_warnings,
-    )
-    write_json_report(Path(config.reporting.output_dir) / "model-report.json", report)
+    try:
+        if config.model_validation.fail_on_new_only and is_pull_request_event():
+            raise ConfigError("PR regression validation requires omniflow run --auto for trusted Git snapshot verification")
+        client, branch_id = _client_and_branch(config)
+        report, exit_code = run_model_validation(
+            client=client,
+            model_id=_required(config.omni.model_id, "omni.model_id"),
+            branch_id=branch_id,
+            fail_on_warnings=fail_on_warnings,
+            fail_on_new_only=config.model_validation.fail_on_new_only,
+        )
+        report.update(exit_code=exit_code, policy_decision="fail" if exit_code else "pass",
+                      validation_complete=report.get("validation_complete", True))
+        write_public_reports(report, output_dir=output_dir, formats=config.reporting.formats,
+                             redaction_level=config.security.redaction_level)
+        write_public_json(output_dir / "model-report.json", report, redaction_level=config.security.redaction_level)
+    except Exception as exc:
+        issue = exc.report_issue(validator="model") if isinstance(exc, OmniResponseError) else {
+            "validator": "model", "type": "validation_execution_failed", "severity": "error",
+            "message": safe_exception_message(exc),
+        }
+        failure = {"validator": "model", "exit_code": exc.exit_code if isinstance(exc, OmniFlowError) else 6,
+                   "policy_decision": "fail", "validation_complete": False, "issues": [issue]}
+        if not isinstance(exc, SecurityPolicyError):
+            write_public_reports(failure, output_dir=output_dir, formats=config.reporting.formats,
+                                 redaction_level=config.security.redaction_level)
+            write_public_json(output_dir / "model-report.json", failure, redaction_level=config.security.redaction_level)
+        raise
     print(f"Model validation: errors={report['summary']['errors']} warnings={report['summary']['warnings']}")
     return exit_code
 
@@ -896,6 +1184,7 @@ def cmd_exposures_pull(args: argparse.Namespace) -> int:
     return exit_code
 
 
+@diagnostic_session()
 def cmd_dbt_sync(args: argparse.Namespace) -> int:
     try:
         config = _override_config(load_config(args.config), args)
@@ -974,13 +1263,13 @@ def cmd_dbt_sync(args: argparse.Namespace) -> int:
                 context = prepared["context"]
                 snapshot_dir = restricted_dir(output_dir) / _safe_context_dir(context) / "pre-sync-yaml"
                 _validate_context_output_layout(snapshot_dir)
-                pull_yaml(
+                analysis_dir = _pull_analysis_yaml(
                     client=prepared["client"],
                     model_id=context.model_id,
                     branch_id=prepared["branch_id"],
                     output_dir=snapshot_dir,
                 )
-                prepared["comparison_base_yaml_dir"] = snapshot_dir
+                prepared["comparison_base_yaml_dir"] = analysis_dir
     except OmniFlowError as exc:
         if not config.security.retain_restricted_artifacts:
             _purge_restricted_path(restricted_dir(output_dir))
@@ -1043,8 +1332,9 @@ def cmd_dbt_sync(args: argparse.Namespace) -> int:
                         output_dir=validation_output_dir,
                         api_key=sync_api_key,
                         comparison_base_yaml_dir=prepared.get("comparison_base_yaml_dir"),
+                        strict_health=True,
                     )
-                except OmniFlowError as exc:
+                except Exception as exc:
                     validation_report, validation_exit = _write_context_failure_artifacts(
                         config=config,
                         context=context,
@@ -1174,13 +1464,13 @@ def cmd_dbt_sync(args: argparse.Namespace) -> int:
 
 
 def cmd_diff(args: argparse.Namespace) -> int:
-    base_graph = build_graph(load_yaml_files(args.base))
-    head_graph = build_graph(load_yaml_files(args.head))
+    base_graph = load_yaml_graph(args.base)
+    head_graph = load_yaml_graph(args.head)
     report = diff_graphs(base_graph, head_graph)
     if args.report_out:
-        write_json_report(args.report_out, report)
+        write_public_json(args.report_out, report, redaction_level="strict")
     else:
-        print(redact(report))
+        print(json.dumps(public_diagnostic(report), sort_keys=True))
     return 1 if report["risk_level"] in {"breaking", "security_sensitive"} else 0
 
 
@@ -1188,13 +1478,12 @@ def cmd_report(args: argparse.Namespace) -> int:
     import json
 
     report = json.loads(Path(args.input).read_text(encoding="utf-8"))
-    write_reports(report, output_dir=args.output_dir, formats=args.format)
+    write_public_reports(report, output_dir=args.output_dir, formats=args.format, redaction_level="strict")
     return 0
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
     config = _override_config(load_config(args.config), args)
-    api_key = require_api_key()
     if args.auto:
         contexts = discover_contexts(
             auto=True,
@@ -1219,7 +1508,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     issues = []
     warnings = []
     for context in contexts:
-        client, branch_id = _client_and_branch_for_context(context, config.omni.timeout, api_key=api_key)
+        client, branch_id = _client_and_branch_for_context(context, config.omni.timeout)
         client.get_model_yaml(
             context.model_id,
             branch_id=branch_id,
@@ -1236,12 +1525,15 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             issues.extend(_git_configuration_issues(context, git_config))
     if issues:
         raise ConfigError("Omni Git configuration mismatch: " + "; ".join(issues))
-    for warning in warnings:
-        print(f"omniflow doctor warning: {warning}", file=sys.stderr)
+    for _ in warnings:
+        print("omniflow doctor warning: Git metadata verification unavailable for one model context.", file=sys.stderr)
     print(f"omniflow doctor passed: {len(contexts)} model context(s) ready")
+    if any(context.environment for context in contexts):
+        print("Target access/settings verified only; run PR validation to establish candidate coverage.")
     return 0
 
 
+@diagnostic_session()
 def cmd_repair_ai(args: argparse.Namespace) -> int:
     try:
         config = _override_config(load_config(args.config), args)
@@ -1270,6 +1562,8 @@ def cmd_repair_ai(args: argparse.Namespace) -> int:
         if len(contexts) != 1:
             raise ConfigError("AI repair requires exactly one unambiguous Omni model context")
         context = contexts[0]
+        if context.environment:
+            raise SecurityPolicyError("Version 2 environment targets are validation-only; AI repair is not supported")
         repair_key = require_repair_api_key()
         client, branch_id = _client_and_branch_for_context(context, config.omni.timeout, api_key=repair_key)
         if not branch_id:
@@ -1288,6 +1582,7 @@ def cmd_repair_ai(args: argparse.Namespace) -> int:
                 context=context,
                 output_dir=validation_output,
                 api_key=repair_key,
+                strict_health=True,
             ),
         )
         write_repair_artifacts(
@@ -1319,6 +1614,12 @@ def cmd_repair_ai(args: argparse.Namespace) -> int:
         if not config.security.retain_restricted_artifacts:
             _purge_restricted_path(restricted_dir(output_dir))
 
+        write_artifact_manifest(
+            output_dir=output_dir,
+            restricted_artifacts_enabled=config.security.retain_restricted_artifacts,
+            redaction_level=config.security.redaction_level,
+        )
+
 
 def _client_and_branch(config):
     context = ModelContext(
@@ -1332,12 +1633,35 @@ def _client_and_branch(config):
 
 
 def _client_and_branch_for_context(context: ModelContext, timeout: int, *, api_key: str | None = None):
+    if context.environment and os.getenv("OMNIFLOW_ENVIRONMENT") != context.environment:
+        raise SecurityPolicyError(
+            f"Selected target requires OMNIFLOW_ENVIRONMENT={context.environment}. "
+            "Supply only that environment's dedicated validation credential from the trusted workflow."
+        )
     client = OmniClient(
         base_url=context.base_url,
         api_key=api_key or require_api_key(),
         timeout=timeout,
     )
-    branch_id = context.branch_id or client.resolve_branch_id(context.model_id, context.branch_name)
+    if context.environment:
+        _verify_target_git_configuration(context, client.get_git_configuration(context.model_id))
+        matching = []
+        if context.branch_name:
+            matching = [record for record in client.list_models(
+                model_kind="BRANCH", base_model_id=context.model_id, name=context.branch_name,
+            ) if record.get("modelKind") == "BRANCH" and record.get("baseModelId") == context.model_id
+                and record.get("name") == context.branch_name]
+            if len(matching) != 1 or not isinstance(matching[0].get("id"), str):
+                raise ConfigError(
+                    "Selected target must have exactly one corresponding Omni candidate branch. "
+                    "Enable Always create branches on the follower and rerun after Git synchronization; "
+                    "OmniFlow will not fall back to the production base model."
+                )
+        branch_id = validate_path_segment(matching[0]["id"], name="branch_id") if matching else None
+        if context.branch_id and context.branch_id != branch_id:
+            raise SecurityPolicyError("Candidate branch ID no longer matches the selected target branch")
+    else:
+        branch_id = context.branch_id or client.resolve_branch_id(context.model_id, context.branch_name)
     if context.branch_name and not branch_id:
         raise ConfigError(
             f"Could not resolve Omni branch '{context.branch_name}' for model {context.model_id}. "
@@ -1390,12 +1714,15 @@ def _base_report(
         "model_path": context.model_path,
         "branch_id": branch_id,
         "branch_name": context.branch_name,
+        "environment": context.environment,
+        "target_branch": context.base_branch,
+        "candidate_verification": context.candidate_verification or {"status": "not_applicable" if not context.environment else "unverified"},
         "config_hash": config.hash,
         "summary": summary,
         "issues": issues,
         "policy_decision": "fail" if exit_code else "pass",
         "exit_code": exit_code,
-        "exit_code_reason": "validation failed" if exit_code else "success",
+        "exit_code_reason": _exit_code_reason(exit_code),
     }
 
 
@@ -1414,9 +1741,10 @@ def _aggregate_report(config, contexts, exit_code, issues, summary, reports):
         "summary": summary,
         "issues": issues,
         "model_reports": reports,
+        "validation_complete": bool(reports) and all(report.get("validation_complete") is True for report in reports),
         "policy_decision": "fail" if exit_code else "pass",
         "exit_code": exit_code,
-        "exit_code_reason": "validation failed" if exit_code else "success",
+        "exit_code_reason": _exit_code_reason(exit_code),
     }
 
 
@@ -1431,6 +1759,8 @@ def _summarize(issues: list[dict[str, Any]]) -> dict[str, Any]:
         "new_issues": sum(1 for issue in issues if issue.get("state") == "new"),
         "existing_issues": sum(1 for issue in issues if issue.get("state") == "existing"),
         "resolved_issues": sum(1 for issue in issues if issue.get("state") == "resolved"),
+        "improved_issues": sum(1 for issue in issues if issue.get("state") == "improved"),
+        "blocking_issues": sum(is_blocking(issue) for issue in issues),
         "risk_level": max(
             risks or ["info"],
             key=lambda risk: risk_order.index(risk) if risk in risk_order else 0,
@@ -1470,7 +1800,42 @@ def _context_dict(context: ModelContext) -> dict[str, Any]:
         "base_branch": context.base_branch,
         "git_provider": context.git_provider,
         "web_url": context.web_url,
+        "environment": context.environment,
+        "target_branch": context.base_branch,
+        "candidate_verification": context.candidate_verification or {"status": "not_applicable" if not context.environment else "unverified"},
     }
+
+
+def _verify_target_git_configuration(context: ModelContext, git_config: dict[str, Any]) -> None:
+    """Version 2 cannot silently skip missing or unauthorized identity evidence."""
+    expected = {
+        "baseBranch": context.base_branch, "modelPath": context.model_path,
+        "gitServiceProvider": "github", "gitFollower": context.git_follower,
+    }
+    for key, value in expected.items():
+        actual = git_config.get(key)
+        if key == "modelPath" and context.model_path == "." and actual in {None, ""}:
+            actual = "."
+        if actual != value or (key == "gitFollower" and type(actual) is not bool):
+            raise ConfigError(f"Selected environment's Omni Git configuration does not match trusted {key}")
+    if context.git_follower and git_config.get("branchPerPullRequest") is not True:
+        raise ConfigError("Follower validation requires Always create branches (branchPerPullRequest=true)")
+    expected_url = str(context.web_url).removesuffix(".git").rstrip("/")
+    actual_url = git_config.get("webUrl")
+    clone_url = git_config.get("cloneUrl")
+    urls = [value.removesuffix(".git").rstrip("/") for value in (actual_url, clone_url) if isinstance(value, str)]
+    # SSH clone URLs are documented; compare repository identity without executing them.
+    for value in (clone_url,):
+        if isinstance(value, str) and value.startswith("git@") and ":" in value:
+            host, path = value[4:].split(":", 1)
+            urls.append(f"https://{host}/{path}".removesuffix(".git").rstrip("/"))
+    if expected_url not in urls:
+        raise ConfigError("Selected environment's Omni Git repository does not match trusted web_url")
+    if is_pull_request_event():
+        repository = os.getenv("GITHUB_REPOSITORY")
+        server = os.getenv("GITHUB_SERVER_URL", "https://github.com").rstrip("/")
+        if not repository or expected_url != f"{server}/{repository}":
+            raise ConfigError("Trusted target repository does not match the GitHub PR repository")
 
 
 def _git_configuration_issues(context: ModelContext, git_config: dict[str, Any]) -> list[str]:
@@ -1504,7 +1869,7 @@ def _runner_metadata() -> dict[str, Any]:
 def _emit_github_annotations(issues: list[dict[str, Any]], *, limit: int) -> None:
     if os.getenv("GITHUB_ACTIONS") != "true":
         return
-    for line in annotation_lines(issues[:limit]):
+    for line in public_annotation_lines(issues, limit=limit):
         print(line)
 
 
@@ -1520,8 +1885,8 @@ def _emit_hold_output(issues: list[dict[str, Any]], *, settings) -> None:
         with open(output_path, "a", encoding="utf-8") as handle:
             handle.write(f"hold_triggered={'true' if triggered else 'false'}\n")
             handle.write(f"hold_pending_label={settings.pending_label}\n")
-    except OSError as exc:
-        print(redact(f"Could not write the OmniFlow hold decision output: {exc}"), file=sys.stderr)
+    except OSError:
+        print("Could not write the OmniFlow hold decision output; path and details withheld.", file=sys.stderr)
 
 
 def _validate_run_output_layout(output_dir: Path) -> None:
@@ -1535,12 +1900,20 @@ def _validate_run_output_layout(output_dir: Path) -> None:
         "repair.json",
         "repair.md",
     )
-    for path in (output_dir, public_dir(output_dir), restricted_dir(output_dir)):
+    for path in (output_dir, public_dir(output_dir), restricted_dir(output_dir), output_dir / "repository"):
         validate_repo_output_path(path)
     for name in report_names:
         validate_repo_output_path(output_dir / name)
         validate_repo_output_path(public_dir(output_dir) / name)
     validate_repo_output_path(output_dir / "artifact-manifest.json")
+    for name in (*REPOSITORY_REPORT_NAMES, "status.json"):
+        path = output_dir / "repository" / name
+        validate_repo_output_path(path)
+        if path.exists() and not path.is_file():
+            raise SecurityPolicyError("Repository diagnostic output must be a regular file")
+    # Routing, repair, and early standalone guards may never reach the common
+    # report writer. Preflight every expected path before clearing old detail.
+    clear_repository_reports(output_dir)
 
 
 def _validate_context_output_layout(output_dir: Path) -> None:
@@ -1577,6 +1950,8 @@ def _write_unconfigured_failure_artifacts(*, output_dir: Path, exc: OmniFlowErro
     _validate_run_output_layout(output_dir)
     _purge_restricted_path(restricted_dir(output_dir))
     issue = {"severity": "error", "validator": "setup", "message": redact(str(exc))}
+    if getattr(exc, "reason_code", None) == "missing_policy_config":
+        issue["reason_code"] = "missing_policy_config"
     report = {
         "tool": "omniflow",
         "tool_version": __version__,

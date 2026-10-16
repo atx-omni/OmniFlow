@@ -8,6 +8,7 @@ REQUIRED_DOCUMENTS = [
     "docs/INSTALLATION.md",
     "docs/CONFIGURATION.md",
     "docs/TESTING.md",
+    "docs/RELEASE_READINESS.md",
     "docs/TROUBLESHOOTING.md",
     "docs/SECURITY_MODEL.md",
     "docs/AI_REPAIR.md",
@@ -90,14 +91,41 @@ class DocumentationTests(unittest.TestCase):
         manifest = (ROOT / "MANIFEST.in").read_text(encoding="utf-8")
         self.assertIn("include SUPPORT.md", manifest)
         self.assertIn("recursive-include docs *.md", manifest)
+        self.assertIn("include .omniflow.yml", manifest)
+        self.assertNotIn("include .omniflow.example.yml", manifest)
+
+    def test_required_policy_and_bootstrap_are_documented(self):
+        for relative in ("README.md", "docs/INSTALLATION.md", "docs/CONFIGURATION.md"):
+            text = (ROOT / relative).read_text(encoding="utf-8")
+            self.assertIn(".omniflow.yml", text)
+            self.assertIn(".github/workflows/omniflow.yml", text)
+            self.assertIn("customer repository root", text)
+            self.assertIn("required", text)
+            self.assertIn("PR head", text)
+            self.assertNotIn(".omniflow.example.yml", text)
+            self.assertNotIn("policy file is optional", text)
+        configuration = (ROOT / "docs/CONFIGURATION.md").read_text(encoding="utf-8")
+        self.assertIn("configuration exit code `2`", configuration)
+        self.assertIn("cannot replace it", configuration)
+        self.assertIn("fail_on_new_only: true", configuration)
+
+    def test_dual_validator_regression_and_strict_health_boundaries_are_documented(self):
+        text = (ROOT / "docs/CONFIGURATION.md").read_text(encoding="utf-8")
+        for phrase in (
+            "### Model Validation", "### Content Validation", "OMNI_FAIL_ON_NEW_ONLY",
+            "content validation only", "occurrence counts", "fail_on_warnings",
+            "Orchestrated runs without a branch", "post-sync validation", "repair verification",
+            "strict health", "Standalone `content validate`", "Older versions reject unknown policy keys",
+        ):
+            self.assertIn(phrase, text)
 
     def test_workflow_example_has_two_pinned_action_placeholders(self):
         workflow = (ROOT / ".github/workflow-examples/omniflow.yml").read_text(encoding="utf-8")
-        self.assertEqual(workflow.count("atx-omni/OmniFlow@<pinned-commit-sha>"), 2)
+        self.assertEqual(workflow.count("exploreomni/OmniFlow@<pinned-commit-sha>"), 2)
         repair = (ROOT / ".github/workflow-examples/omniflow-ai-repair.yml").read_text(encoding="utf-8")
-        self.assertEqual(repair.count("atx-omni/OmniFlow@<pinned-commit-sha>"), 1)
+        self.assertEqual(repair.count("exploreomni/OmniFlow@<pinned-commit-sha>"), 1)
         sync = (ROOT / ".github/workflow-examples/omniflow-dbt-sync.yml").read_text(encoding="utf-8")
-        self.assertEqual(sync.count("atx-omni/OmniFlow@<pinned-commit-sha>"), 1)
+        self.assertEqual(sync.count("exploreomni/OmniFlow@<pinned-commit-sha>"), 1)
 
 
 if __name__ == "__main__":

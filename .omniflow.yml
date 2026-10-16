@@ -1,0 +1,150 @@
+# REQUIRED: copy this file to .omniflow.yml at the root of your repository.
+# This is the policy file, NOT .github/workflows/omniflow.yml (the CI workflow).
+# Commit it to the trusted target branch (usually main) before validating PRs.
+# Keep the active baseline below; optional customizations are commented out.
+# Model identity belongs in .omni/flow.json. Credentials belong in secrets,
+# never in this file. See docs/INSTALLATION.md for the complete setup.
+
+contracts:
+  enabled: true
+  # Optional overrides: these safety gates already default to true.
+  # fail_on:
+  #   deleted_referenced_fields: true
+  #   renamed_referenced_fields: true
+  #   referenced_field_type_changes: true
+  #   referenced_join_cardinality_changes: true
+  #   coverage_gaps: true
+
+checks:
+  content_validation:
+    enabled: true
+    # Compare PR content against the live base model in the same visibility scope.
+    # Existing content debt is reported but does not alone block a PR.
+    # New issues and unavailable/ambiguous comparison evidence still block.
+    # Other enabled checks can independently block a PR.
+    # Orchestrated no-branch health checks, post-sync and repair stay strict.
+    fail_on_new_only: true
+    # Optional explanatory classification only; never skips live validation.
+    # classify_comment_only: true
+    # Optional scope restriction. Leave commented to validate all visible content.
+    # labels:
+    #   - Verified
+    #   - Executive
+
+  model_validation:
+    enabled: true
+    # Compare PR model findings against the live base model, including severity
+    # and occurrence counts. A pass does not mean existing model issues are fixed.
+    # No-branch health checks, post-sync validation and repair stay strict.
+    fail_on_new_only: true
+    # Optional: make model warnings blocking (default: false).
+    # fail_on_warnings: true
+
+  semantic_lint:
+    enabled: true
+    # Optional rule-severity overrides; built-in rules apply when omitted.
+    # rules:
+    #   require_field_descriptions: warn
+    #   require_primary_keys: warn
+    #   block_deleted_fields: warn
+    #   warn_relationship_cardinality_change: warn
+    #   require_topic_labels: warn
+
+  # Optional: add published Omni dashboard-to-dbt model lineage to reports.
+  # Requires a configured Omni dbt integration and Connection Admin permission.
+  # Leave this commented out when the Omni connection does not use dbt.
+  # dbt_exposures:
+  #   enabled: true
+  #   fail_on_unavailable: false
+
+  # Optional: block a dbt-only pull request that removes a warehouse column or
+  # model the committed Omni YAML still references. Runs without an Omni
+  # credential and needs no dbt invocation. Uses deployment.breaking_change_hold
+  # dbt_paths to identify dbt sources. See docs/DBT_IMPACT.md.
+  # dbt_impact:
+  #   enabled: true
+  #   manifest_path: target/manifest.json   # omit to use SQL heuristics
+  #   fail_on_orphaned_references: true
+  #   omni_yaml_paths:                      # defaults to .omni/flow.json model paths
+  #     - omni/my_model
+  #   table_mapping:                        # only for custom schema macros
+  #     - dbt_model: orders_v2
+  #       sql_table_name: analytics.marts.orders
+
+  # Optional: run Omni AI eval prompt sets against main and the PR branch, and
+  # fail on any regression. Unlike every other check here, this asks Omni AI
+  # to answer real prompts rather than performing deterministic YAML
+  # validation, so it stays disabled by default. Read docs/AI_EVAL.md before
+  # enabling it.
+  # Binary scoring only; unsupported scores and incomplete results always block.
+  # Public sampling limits never change the gate. Qualify the tenant before use.
+  # ai_eval:
+  #   enabled: true
+  #   fail_on_regression: true
+  #   poll_interval_seconds: 10
+  #   timeout_seconds: 900
+  #   scoring_grace_seconds: 180
+  #   prompt_sets:
+  #     - id: 00000000-0000-0000-0000-000000000000  # replace with your own prompt set ID
+  #       label: Core revenue prompts
+
+# Optional reporting overrides (shown defaults match the supplied workflow).
+# If changing output_dir, update the workflow artifact paths as well.
+# reporting:
+#   formats: [json, markdown, sarif, junit]
+#   output_dir: .omniflow
+#   diagnostics:
+#     # DEFAULT repository: separate source-location reports for verified private
+#     # same-repository GitHub.com runs. Public/fork/unknown contexts stay minimal.
+#     # To opt out, uncomment reporting/diagnostics and set mode: minimal on main.
+#     mode: repository
+# Public reports, logs, annotations and PR comments remain minimal in either mode.
+# Repository reports contain source metadata, not raw API messages or data values.
+
+# Optional security overrides. Public diagnostics always use the minimal v2
+# allowlist; these legacy options cannot re-enable customer text in public output.
+# Restricted artifacts stay OFF by default; retain only after a privacy review.
+# Never enable raw API response output in CI.
+# security:
+#   redact_logs: true
+#   allow_raw_response_output: false
+#   max_report_samples: 20
+#   redact_document_names: false
+#   redaction_level: standard
+#   retain_restricted_artifacts: false
+
+# Optional post-deployment sync for repositories that deploy dbt models.
+# Invoke only after the production dbt job succeeds. It is disabled by default
+# and has no effect on repositories that do not use dbt.
+# deployment:
+#   dbt_sync:
+#     enabled: true
+#     refresh_mode: hard
+#     poll_interval_seconds: 5
+#     timeout_seconds: 900
+#     post_sync_validation: true
+#
+#   # Optional single-branch safety policy for monorepos that hold dbt and Omni
+#   # model YAML on the same protected branch. Blocks a merge that would promote
+#   # breaking Omni changes before the matching dbt deployment reaches the
+#   # warehouse. Disabled by default. See docs/BREAKING_CHANGE_HOLD.md.
+#   breaking_change_hold:
+#     enabled: true
+#     action: fail          # fail blocks the merge; warn only reports
+#     dbt_paths:            # keep consistent with the deployment push.paths filter
+#       - models
+#       - seeds
+#       - snapshots
+#       - macros
+#     pending_label: omniflow/awaiting-deploy
+
+# Unreleased development scaffold: human-authorized Omni Modeling Agent repair.
+# Do not enable for customer use until Omni publishes a supported Modeling Agent API.
+# Omni's documented AI Jobs API may execute queries and has no no-query switch.
+# repairs:
+#   ai:
+#     enabled: true
+#     allow_query_execution: true
+#     max_changed_files: 3
+#     max_changed_lines: 200
+#     poll_timeout_seconds: 300

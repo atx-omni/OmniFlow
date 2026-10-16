@@ -234,7 +234,7 @@ checks:
     ),
     Scenario(
         name="breaking_change_hold_omni_only",
-        description="breaking Omni change without dbt evidence should not be held",
+        description="breaking Omni change without verified sync state should fail closed",
         expected_exit=1,
         changed_files="omni/model/views/orders.view",
         config="""deployment:
@@ -288,7 +288,7 @@ deployment:
     ),
     Scenario(
         name="dbt_impact_safe_addition",
-        description="dbt-only PR adding a column should skip cleanly",
+        description="dbt-only PR adding a column should record a complete-coverage pass",
         expected_exit=0,
         changed_files="models/marts/orders.sql",
         server_mode="unused",
@@ -457,7 +457,11 @@ def route_request(
                 files = SYNC_HEAD_FILES
             else:
                 files = HEAD_FILES if query.get("branchId") == [branch_id_for(model_id)] else BASE_FILES
-            return {"files": files, "checksums": {name: f"checksum-{name}" for name in files}}, 200
+            return {
+                "files": files,
+                "viewNames": {"orders": "views/orders.view"},
+                "checksums": {name: f"checksum-{name}" for name in files},
+            }, 200
         if method == "GET" and path == f"/api/v1/models/{model_id}/content-validator":
             if query.get("find") == ["orders.revenue"] and query.get("find_type") == ["FIELD"]:
                 return content_payload("Executive Revenue", "alice@example.com"), 200
@@ -622,6 +626,7 @@ security:
     (repo / ".omniflow.yml").write_text(config, encoding="utf-8")
     run(["git", "add", "."], cwd=repo)
     run(["git", "commit", "-q", "-m", "base"], cwd=repo)
+    base_sha = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
     if scenario.operation == "validate":
         run(["git", "checkout", "-q", "-b", BRANCH_NAME], cwd=repo)
     apply_changed_files(repo, scenario.changed_files)
@@ -637,7 +642,21 @@ security:
         run(["git", "commit", "-q", "-m", "deploy dbt"], cwd=repo)
         event = {"ref": "refs/heads/main", "commits": []}
     else:
-        event = {"pull_request": {"body": marker_body(scenario), "number": 1}}
+        # Exact-head analysis reads immutable Git objects rather than uncommitted
+        # checkout data. Keep distinct real base/head objects in every PR fixture.
+        run(["git", "add", "."], cwd=repo)
+        run(["git", "commit", "-q", "--allow-empty", "-m", "proposed change"], cwd=repo)
+        head_sha = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+        repository = {"full_name": "atx-omni/simulated"}
+        event = {
+            "number": 1,
+            "repository": repository,
+            "pull_request": {
+                "body": marker_body(scenario), "number": 1,
+                "base": {"sha": base_sha, "ref": "main", "repo": repository},
+                "head": {"sha": head_sha, "ref": BRANCH_NAME, "repo": repository},
+            },
+        }
     write_json(repo / "event.json", event)
 
 
@@ -669,6 +688,7 @@ def run_omniflow(repo: Path, scenario: Scenario) -> subprocess.CompletedProcess[
     for name in (
         "OMNI_API_KEY",
         "OMNIFLOW_SYNC_API_KEY",
+        "OMNIFLOW_LAST_SYNC_SHA",
         "GITHUB_ACTIONS",
         "GITHUB_HEAD_REF",
         "GITHUB_BASE_REF",
@@ -712,6 +732,10 @@ def run_omniflow(repo: Path, scenario: Scenario) -> subprocess.CompletedProcess[
         command = [sys.executable, "-m", "omniflow.cli", "run", "--auto", "--config", ".omniflow.yml"]
     if scenario.include_api_key and scenario.operation == "validate":
         env["OMNI_API_KEY"] = "simulation-secret"  # pragma: allowlist secret
+    # The synthetic fixture keeps exact decision evidence out of product outputs.
+    # Capture inside the CLI process so public schema changes cannot weaken the
+    # identity-sensitive assertions below. This file lives only in the temp repo.
+    command = [sys.executable, str(Path(__file__).resolve()), "--fixture-invoke", *command[3:]]
     return subprocess.run(
         command,
         cwd=repo,
@@ -722,20 +746,30 @@ def run_omniflow(repo: Path, scenario: Scenario) -> subprocess.CompletedProcess[
     )
 
 
+def invoke_fixture(argv: list[str]) -> int:
+    from omniflow.cli import main as cli_main
+    from omniflow.diagnostics import capture_private_reports
+
+    with capture_private_reports() as reports:
+        exit_code = cli_main(argv)
+    fd = os.open(".fixture-private-reports.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as stream:
+        json.dump(reports, stream)
+    return exit_code
+
+
 def inspect_artifacts(repo: Path) -> dict[str, Any]:
     root = repo / ".omniflow"
     artifacts: dict[str, Any] = {"exists": root.exists(), "files": []}
     if not root.exists():
         return artifacts
+    receipt = repo / ".fixture-private-reports.json"
+    if receipt.exists():
+        artifacts["_private_reports"] = json.loads(receipt.read_text(encoding="utf-8"))
     artifacts["files"] = sorted(str(path.relative_to(root)) for path in root.rglob("*") if path.is_file())
-    for relative in (
-        "report.json",
-        "public/report.json",
-        "public/report.md",
-        "public/dbt-sync.json",
-        "public/dbt-impact.json",
-        "artifact-manifest.json",
-    ):
+    for relative in artifacts["files"]:
+        if not (relative.startswith("public/") or "/" not in relative):
+            continue
         path = root / relative
         if path.exists():
             artifacts[relative] = path.read_text(encoding="utf-8")
@@ -754,6 +788,13 @@ def assert_result(
     requests: list[dict[str, Any]],
 ) -> tuple[bool, list[str]]:
     errors = []
+    private_reports = artifacts.get("_private_reports", [])
+    private = private_reports[-1] if private_reports else {}
+    report = artifacts.get("public/report.json:json", {})
+    if report.get("diagnostic_schema_version") != 2:
+        errors.append("public report did not use diagnostic schema 2")
+    if not private or private.get("exit_code") != report.get("exit_code"):
+        errors.append("missing current private fixture receipt or mismatched exit code")
     if exit_code != scenario.expected_exit:
         errors.append(f"expected exit {scenario.expected_exit}, got {exit_code}")
     if not artifacts.get("exists"):
@@ -761,16 +802,31 @@ def assert_result(
     if "public/report.json" not in artifacts.get("files", []):
         errors.append("missing public/report.json")
     public_text = artifacts.get("public/report.json", "")
-    public_blob = public_text + artifacts.get("public/report.md", "") + artifacts.get("public/dbt-sync.json", "")
-    if (
-        "simulation-secret" in public_blob
-        or "simulation-sync-secret" in public_blob
-        or "alice@example.com" in public_blob
-        or "https://omni.example/dashboards" in public_blob
-    ):
-        errors.append("public report leaked secret/email/dashboard URL")
-    if scenario.name == "strict_redaction" and "Executive Revenue" in public_text:
-        errors.append("strict public report leaked content name")
+    public_blob = "\n".join(
+        value for key, value in artifacts.items()
+        if isinstance(value, str) and (key.startswith("public/") or "/" not in key)
+    )
+    if any(marker in public_blob for marker in (
+        "simulation-secret", "simulation-sync-secret", "alice@example.com",
+        "https://omni.example/dashboards", "Executive Revenue", "orders.revenue",
+        MODEL_ID, SECOND_MODEL_ID, BRANCH_ID, BRANCH_NAME, "dash-1", "query-1",
+    )):
+        errors.append("shareable artifacts leaked fixture identity or sensitive content")
+    forbidden_keys = {
+        "model_id", "branch_id", "branch_name", "model_path", "git_sha", "column",
+        "affected_model_ids", "dbt_paths", "orphaned_fields", "document_id", "prompt_ids",
+    }
+    def identity_keys(value: Any) -> set[str]:
+        if isinstance(value, dict):
+            return (set(value) & forbidden_keys).union(*(identity_keys(item) for item in value.values()))
+        if isinstance(value, list):
+            return set().union(*(identity_keys(item) for item in value))
+        return set()
+    if any(identity_keys(value) for key, value in artifacts.items() if key.endswith(":json")
+           and key != "artifact-manifest.json:json"):
+        errors.append("shareable JSON retained forbidden identity fields")
+    if any(path.startswith("restricted/") for path in artifacts.get("files", [])):
+        errors.append("default run retained restricted artifacts")
     if scenario.name == "bad_marker_base_url" and "security policy violation" not in public_text.lower():
         errors.append("bad marker scenario did not report security policy violation")
     if scenario.name == "skip_non_omni_pr":
@@ -803,10 +859,11 @@ def assert_result(
             errors.append("dbt exposure report did not retain the dashboard record count")
         if summary.get("total_exposures") != 1 or summary.get("coverage_status") != expected_status:
             errors.append("dbt exposure report did not record the expected coverage status")
-        markdown = artifacts.get("public/report.md", "")
-        if "## dbt Exposure Coverage" not in markdown or "mapped exposure(s)" not in markdown:
-            errors.append("reviewer Markdown omitted successful dbt exposure coverage")
-        if scenario.name == "exposures_partial" and not exposure_report.get("coverage_gaps"):
+        private_exposure = next(
+            (item for item in private.get("model_reports", [{}])[0].get("check_reports", [])
+             if item.get("validator") == "dbt_exposures"), {},
+        )
+        if scenario.name == "exposures_partial" and not private_exposure.get("coverage_gaps"):
             errors.append("partial dbt exposure coverage did not produce a coverage gap")
     if scenario.operation == "dbt_sync":
         if "public/dbt-sync.json" not in artifacts.get("files", []):
@@ -839,9 +896,9 @@ def assert_result(
                 for item in report.get("model_reports", [])
             ):
                 errors.append("dbt sync did not complete post-refresh validation for every model")
-            affected = (sync.get("models") or [{}])[0].get("affected_model_ids", [])
+            affected = (private.get("model_reports") or [{}])[0].get("refresh", {}).get("affected_model_ids", [])
             if affected != [MODEL_ID, SECOND_MODEL_ID]:
-                errors.append("dbt sync evidence omitted affected models")
+                errors.append("private dbt sync evidence omitted affected models")
             post_refresh_yaml_reads = [
                 request
                 for request in requests[refresh_index + 1 :]
@@ -849,6 +906,11 @@ def assert_result(
             ]
             if len(post_refresh_yaml_reads) < len(scenario.model_ids):
                 errors.append("dbt sync did not compare post-refresh YAML for every affected model")
+            expected_paths = {f"/api/v1/models/{model_id}/yaml" for model_id in scenario.model_ids}
+            if {item["path"] for item in pre_refresh_yaml_reads} != expected_paths or {
+                item["path"] for item in post_refresh_yaml_reads
+            } != expected_paths:
+                errors.append("dbt sync YAML reads did not cover the exact affected model identities")
         if scenario.name == "dbt_sync_job_failure":
             statuses = [item.get("status") for item in sync.get("models", [])]
             if statuses != ["failed"]:
@@ -857,12 +919,16 @@ def assert_result(
         report = artifacts.get("public/report.json:json", {})
         hold_issues = [
             issue
-            for issue in report.get("issues", [])
+            for issue in private.get("issues", [])
             if issue.get("validator") == "breaking_change_hold"
         ]
         if scenario.name == "breaking_change_hold_omni_only":
-            if hold_issues:
-                errors.append("hold fired without any dbt change evidence")
+            if not any(
+                issue.get("rule") == "breaking_change_sync_state_unavailable"
+                and issue.get("severity") == "error"
+                for issue in hold_issues
+            ):
+                errors.append("missing sync evidence did not produce a blocking state-coverage hold")
         elif not hold_issues:
             errors.append("breaking change beside a dbt source change did not trigger the hold")
         else:
@@ -890,6 +956,11 @@ def assert_result(
             if scenario.name == "dbt_impact_safe_addition":
                 if issues:
                     errors.append("an additive dbt column should not orphan any Omni reference")
+                if impact.get("coverage_complete") is not True:
+                    errors.append("supported additive SQL did not record complete coverage")
+                report = artifacts.get("public/report.json:json", {})
+                if report.get("policy_decision") != "pass":
+                    errors.append("an analyzed additive dbt change must pass rather than skip")
             elif not issues:
                 errors.append("expected an orphaned Omni reference finding")
             else:
@@ -899,8 +970,9 @@ def assert_result(
                     if scenario.name == "dbt_impact_model_deleted"
                     else "dbt_column_removal_orphans_omni_field"
                 )
-                if issue.get("rule") != expected_rule:
-                    errors.append(f"expected rule {expected_rule}, got {issue.get('rule')}")
+                private_issue = (private.get("issues") or [{}])[0]
+                if private_issue.get("rule") != expected_rule:
+                    errors.append(f"expected private rule {expected_rule}, got {private_issue.get('rule')}")
                 expected_severity = (
                     "warning" if scenario.name == "dbt_impact_warning_mode" else "error"
                 )
@@ -909,9 +981,9 @@ def assert_result(
                         f"expected severity {expected_severity}, got {issue.get('severity')}"
                     )
                 if scenario.name in {"dbt_impact_orphaned_column", "dbt_impact_warning_mode"}:
-                    if issue.get("column") != "revenue":
+                    if private_issue.get("column") != "revenue":
                         errors.append("impact finding did not identify the removed 'revenue' column")
-                    orphaned = {item.get("field") for item in issue.get("orphaned_fields", [])}
+                    orphaned = {item.get("field") for item in private_issue.get("orphaned_fields", [])}
                     if "revenue" not in orphaned:
                         errors.append("impact finding did not name the orphaned Omni field")
     return not errors, errors
@@ -935,9 +1007,11 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def run(cmd: list[str], *, cwd: Path) -> None:
-    subprocess.run(cmd, cwd=cwd, check=True, text=True, capture_output=True)
+def run(cmd: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(cmd, cwd=cwd, check=True, text=True, capture_output=True)
 
 
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["--fixture-invoke"]:
+        raise SystemExit(invoke_fixture(sys.argv[2:]))
     raise SystemExit(main())
