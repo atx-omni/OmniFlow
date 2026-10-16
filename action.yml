@@ -36,6 +36,9 @@ inputs:
     required: false
     default: ""
 outputs:
+  repository-diagnostics-ready:
+    description: Fresh repository-only reports were generated for this trusted private run. Not shareable output.
+    value: ${{ steps.validate.outputs.repository_diagnostics_ready }}
   hold-triggered:
     description: >-
       "true" when the breaking-change hold policy found same-PR dbt overlap,

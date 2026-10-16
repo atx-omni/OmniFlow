@@ -93,6 +93,13 @@ checks:
 # reporting:
 #   formats: [json, markdown, sarif, junit]
 #   output_dir: .omniflow
+#   diagnostics:
+#     # DEFAULT repository: separate source-location reports for verified private
+#     # same-repository GitHub.com runs. Public/fork/unknown contexts stay minimal.
+#     # To opt out, uncomment reporting/diagnostics and set mode: minimal on main.
+#     mode: repository
+# Public reports, logs, annotations and PR comments remain minimal in either mode.
+# Repository reports contain source metadata, not raw API messages or data values.
 
 # Optional security overrides. Public diagnostics always use the minimal v2
 # allowlist; these legacy options cannot re-enable customer text in public output.

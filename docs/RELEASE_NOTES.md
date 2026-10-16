@@ -1,5 +1,17 @@
 # Release notes
 
+## Unreleased — repository-aware diagnostic default
+
+**Upgrade notice:** `reporting.diagnostics.mode` now defaults to `repository`. Eligible private same-repository GitHub.com `omniflow run` executions generate separate source-location diagnostics. Set `mode: minimal` in the trusted target-branch policy to opt out. This nested key requires the supporting revision; coordinate the Action pin, policy and workflow upload changes through review.
+
+- Detail requires live repository/PR identity and revision verification, literal trusted policy and model registration, and matching authored Git/Omni snapshots before and after checks. Public/fork/unknown contexts, standalone commands, stale revisions and unsupported GitHub origins stay minimal. Unknown or ambiguous source mappings never receive invented locations or causes.
+- Repository reports add verified paths, source-key lines, supported authored identifiers and fixed corrective guidance. Raw responses, SQL excerpts, data values, credentials and Omni-only content identities remain excluded. Source metadata can itself be confidential; this is not a DLP guarantee.
+- Public schema 2, root compatibility reports, logs, annotations, PR comments/email-facing summaries and Code Security uploads remain minimal. The updated validation examples upload separately named repository-only JSON/Markdown/SARIF/JUnit artifacts with seven-day retention, only after a fresh-run readiness receipt. A file left by an old run is not upload authorization.
+- Known generated detailed files are removed on rerun, opt-out, eligibility loss and failure. Saved detailed reports cannot authorize new disclosure. Validation decisions, counts, severity and new-versus-existing comparisons are unchanged.
+- Supported source locations include semantic lint, exact model YAML paths, semantic change references and narrowly recognized repository-backed content references. Unmapped content still needs investigation in the authorized Omni model/branch.
+
+These are local development changes, not a published release or fresh live-tenant acceptance. Update the reviewed pin and workflow example before expecting customers to receive the artifact.
+
 ## Unreleased — independent model and content regression gates
 
 - Added `checks.model_validation.fail_on_new_only`, independent from content policy and defaulting to `false` when omitted. The canonical required `.omniflow.yml` explicitly enables both new-only switches; model `fail_on_warnings` remains `false` by default. `OMNI_FAIL_ON_NEW_ONLY` continues to affect content only.

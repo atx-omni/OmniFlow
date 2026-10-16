@@ -270,9 +270,15 @@ All rules default to `warn` except `forbid_personal_folder_validation_scope`, wh
 reporting:
   formats: [json, markdown, sarif, junit]
   output_dir: .omniflow
+  diagnostics:
+    mode: repository  # default; set minimal to opt out
 ```
 
 The output directory must be a relative path inside the repository. Supported format names are `json`, `markdown` or `md`, `sarif`, and `junit` or `xml`.
+
+`diagnostics.mode` accepts the literal values `repository` (default) and `minimal`; environment substitution and unknown nested keys are rejected. Commit an opt-out to the trusted target branch. Repository detail is generated only by `omniflow run` with verified private same-repository GitHub.com eligibility, a trusted immutable policy/registry, and matching authored Git/Omni snapshots. It does not change pass/fail decisions. Forks, public/unknown repositories, stale revisions, standalone commands and unsupported origins remain minimal. Missing detail never waives a validator finding.
+
+Repository output is separate under `output_dir/repository/` (JSON, Markdown, SARIF, JUnit plus a safe status file). It always includes those four formats for consistent troubleshooting, independently of public `formats`. Only verified source metadata is added; no raw API prose, values, SQL or Omni-only document identities. Minimal public/root reports, PR comments, logs and annotations remain unchanged. Updated validation workflow examples upload the explicitly listed repository files only when the Action returns `repository-diagnostics-ready: true`, with seven-day retention. If changing `output_dir`, update those paths too. See [Diagnostic Privacy](DIAGNOSTIC_PRIVACY.md).
 
 ## Security Settings
 
@@ -289,7 +295,7 @@ security:
 - `redaction_level` accepts `standard` or `strict`.
 - Both values now use the minimal version-2 public diagnostic allowlist: fixed codes, counts and statuses, not customer text or identifiers. These legacy redaction settings do not loosen public output. See [Diagnostic Privacy](DIAGNOSTIC_PRIVACY.md) for the schema migration and restricted support boundary.
 - `allow_raw_response_output` cannot be enabled through policy.
-- Restricted artifacts are deleted by default. Opt-in retention writes owner-only files but should be used only on isolated, ephemeral runners. The official example uploads only redacted public artifacts.
+- Restricted artifacts are deleted by default. Opt-in retention writes owner-only files but should be used only on isolated, ephemeral runners. The validation examples upload minimal public artifacts and, when freshly authorized, a separate repository-metadata artifact; they never upload raw restricted artifacts.
 - Unknown configuration keys fail closed so misspelled security or policy settings cannot be silently ignored.
 - Personal folders are excluded by default.
 

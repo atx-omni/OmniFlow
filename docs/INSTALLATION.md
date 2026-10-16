@@ -77,6 +77,16 @@ The example workflow uses `pull_request_target` so it can read policy from the t
 
 ## Step 4: Add Ownership And Protect The Base Branch
 
+**New private-repository reporting default:** after upgrading to a supporting revision, eligible private GitHub.com runs generate repository-only diagnostics with verified source identifiers and locations. The updated validation workflow uploads these separately as `omniflow-repository-diagnostics` with seven-day retention; PR comments, logs and annotations stay minimal. Repository readers can download the detailed artifact. To opt out, merge the following into the required root policy on the trusted base before adopting the new pin:
+
+```yaml
+reporting:
+  diagnostics:
+    mode: minimal
+```
+
+Older revisions reject this new setting. For a pre-upgrade opt-out, use the normal reviewed rollout to coordinate the supporting Action pin and policy; do not activate an unsupported key against an old pin. Where a two-step bootstrap is necessary, omit the separate repository-artifact upload until the supported opt-out is active. No files are uploaded by the Action itself. See [Diagnostic Privacy](DIAGNOSTIC_PRIVACY.md) for eligibility, fallback behavior and the fact that source metadata is not automatically safe to forward.
+
 Protect the repository before storing an Omni credential:
 
 1. Add CODEOWNERS entries for `.github/workflows/omniflow.yml`, `.omni/flow.json`, and `.omniflow.yml` using a trusted maintainer team.
@@ -132,6 +142,7 @@ Never put the token in `.omni/flow.json`, `.omniflow.yml`, a workflow file, a pu
 5. Confirm the **OmniFlow** workflow starts.
 6. Review the OmniFlow pull-request comment, annotations, and public evidence artifact.
 7. Confirm the run selected the expected model and Omni branch.
+8. For an eligible private repository, inspect the separate repository diagnostics artifact. Confirm a known field maps to the correct file/line and that public reports still omit those identities. Test the `minimal` opt-out on the trusted base before adopting it as an organizational requirement.
 
 Expected behavior:
 
