@@ -10,7 +10,7 @@ The supported customer path is the pinned GitHub Action in [the installation gui
 - Python 3.11 from a full-SHA-pinned `actions/setup-python` step.
 - A full 40-character OmniFlow action commit SHA.
 - OmniFlow's checked-in, hash-verified action dependency lock.
-- A dedicated least-privilege Omni PAT supplied through the action's `omni-api-key` input.
+- An operator-selected Omni Organization API Key or dedicated service-user PAT supplied through the action's `omni-api-key` input, with the scope tradeoff below reviewed before installation.
 
 The optional dbt sync path is supported only inside the same protected production job that successfully deploys dbt, or a reviewed manual deployment. It requires `deployment.dbt_sync.enabled`, a protected environment, the separate `sync-api-key` action input, a base-branch `push` or `workflow_dispatch` event, and exact `base_branch` agreement with trusted metadata.
 
@@ -28,17 +28,26 @@ The pull-request description is untrusted. An optional marker may select a model
 
 New-only PR model/content validation requires immutable Git base/head evidence and verifies authored live base/candidate YAML against the corresponding revisions before and after checks. Missing or mismatched snapshots block rather than selecting another baseline. This is sampled consistency verification, not an atomic lock over live content/drafts or a guarantee of exhaustive API validation depth. Orchestrated no-branch, post-sync, and repair verification remain strict-health checks, not self-comparisons.
 
-With valid trusted policy, non-Omni pull requests return a successful `skipped` decision unless an enabled optional check applies. Fork pull requests do not receive the Omni PAT. Fork changes to Omni files fail closed and require a maintainer-controlled same-repository branch for full validation.
+With valid trusted policy, non-Omni pull requests return a successful `skipped` decision unless an enabled optional check applies. Fork pull requests do not receive the Omni credential. Fork changes to Omni files fail closed and require a maintainer-controlled same-repository branch for full validation.
 
 ## Credentials
 
-The GitHub workflow passes a dedicated Omni PAT as an action input. After installation, a credential-free route step reads only trusted metadata and GitHub changed-file context. The composite action exposes the PAT as `OMNI_API_KEY` only when that route selects at least one Omni model context. Install, routing, and skipped-report steps do not receive the token as an environment variable.
+The operator chooses an Omni Organization API Key or a dedicated service-user PAT and passes it through the existing `omni-api-key` action input. Both use the `OMNI_API_KEY` secret and environment-variable name; no separate credential-type configuration is required or currently supported. The client sends the credential as a Bearer token without identifying its type. A successful `doctor` check verifies the access and settings it actually checks, not credential type, every endpoint permission, or complete content coverage.
 
-The unreleased AI Repair scaffold uses a different `OMNIFLOW_REPAIR_API_KEY` during maintainer testing, exposed only to the repair process after protected-environment approval. It must never reuse the routine validation PAT. A dedicated Modeler-scoped user limited to a non-production model is the conservative development starting point; any narrower custom role remains unverified.
+After installation, a credential-free route step reads only trusted metadata and GitHub changed-file context. The composite action exposes the selected credential as `OMNI_API_KEY` only when that route selects at least one Omni model context. Install, routing, and skipped-report steps do not receive it as an environment variable. This selection does not change GitHub's automatic `GITHUB_TOKEN` or its workflow permissions.
 
-Post-deployment dbt sync uses `OMNIFLOW_SYNC_API_KEY`, exposed only to the `dbt-sync` action mode. Use a dedicated PAT with the Modeler or Connection Admin permission required by Omni's schema refresh endpoint plus read access required by enabled post-sync checks. Pull-request validation and AI repair action modes never receive this token. Customers may technically map the same GitHub secret to multiple inputs, but separate identities are the recommended least-privilege boundary.
+The unreleased AI Repair scaffold uses a different `OMNIFLOW_REPAIR_API_KEY` during maintainer testing, exposed only to the repair process after protected-environment approval. It must never reuse the routine validation credential. Its constrained, dedicated-user PAT requirement is unchanged; Organization API Keys are not an alternative for this scaffold. A dedicated Modeler-scoped user limited to a non-production model is the conservative development starting point; any narrower custom role remains unverified. Keep AI Repair disabled for customer installation.
 
-Omni documents that Organization API Keys have Organization Admin permissions. Use a PAT from a dedicated user whose access is limited to the models and content being validated. Omni tokens do not expire automatically, so maintainers must define rotation, revocation, and access-review procedures.
+Post-deployment dbt sync uses a separate `OMNIFLOW_SYNC_API_KEY`, exposed only to the `dbt-sync` action mode. Independently choose an Organization API Key or a dedicated service-user PAT with the Modeler or Connection Admin permission required by Omni's schema refresh endpoint plus read access required by enabled post-sync checks. Pull-request validation and AI repair action modes never receive this credential. Customers may technically map the same GitHub secret to multiple inputs, but separate credentials and identities are the recommended isolation boundary. Choosing an Organization API Key for validation does not enable dbt sync, AI eval, or AI repair.
+
+Choose the credential scope deliberately:
+
+- **Organization API Key:** Organization Admin permissions provide broad organizational access for governance workflows, with a correspondingly larger impact if the credential is exposed or misused. Routine validation's read-oriented behavior does not make this credential read-only.
+- **Dedicated service-user PAT:** inherits the user's model, content, and role permissions. It can support broader governance when that user is granted the necessary access, or a narrower boundary when only selected models and content are in scope. A PAT from an admin user still has that user's administrative access.
+
+Neither option changes which models OmniFlow routes or which content and checks are configured. Personal folders are excluded by default, labels can narrow results, and endpoint behavior and limits still apply. A passing run is not proof that every item across an instance was inventoried or exhaustively validated. Validate the chosen credential's actual coverage in the adopter's non-production live gate. The current `omni.user_id`/`OMNI_USER_ID` option has credential-specific API semantics; review [Configuration](CONFIGURATION.md) before using it rather than assuming it expands either credential's scope.
+
+Omni tokens do not expire automatically, so maintainers must define rotation, revocation, and access-review procedures for either type. See [Omni API authentication](https://docs.omni.co/api/authentication). Keep credentials out of repository files and use separate environment-scoped secrets for distinct targets.
 
 OmniFlow rejects secret-like configuration keys and environment expansion of secret-like names. The standard report path constructs a minimal allowlisted schema, and public failure messages/annotations use fixed vocabulary instead of customer-authored diagnostics. Legacy redaction helpers are not comprehensive PII, PHI, PCI, or credential detection. Separate approved handling is required for local/restricted evidence and any other workflow output.
 
@@ -68,6 +77,8 @@ Restricted YAML, dependency, semantic-diff, content, and contract files are dele
 
 The distinct repository-only diagnostic class defaults on for eligible private same-repository GitHub.com validation runs. It adds verified source locations and supported authored identifiers, not API prose, data values, SQL or Omni-only content identities. A live repository/revision check and matching authored snapshots are required; unknown eligibility stays minimal. The example validation workflows upload explicitly listed repository reports separately with seven-day retention and a fresh-run readiness receipt. PR comments, logs, annotations and Code Security uploads remain minimal. Opt out with `reporting.diagnostics.mode: minimal` on the trusted target branch. Repository readers can download repository-only metadata; it is not approved for external forwarding merely because it excludes raw values.
 
+Credential choice does not alter these output boundaries. Strict redaction is not an opt-out from repository-only diagnostics; use the trusted `reporting.diagnostics.mode` setting to select `minimal` or eligible `repository` output. An administrative credential still needs protection even when its reports are minimal.
+
 AI Repair keeps pre- and post-change YAML snapshots in process memory. Public repair evidence uses the same minimal schema; model/branch/job/commit identity must be verified from authorized private evidence and the actual Omni/Git state. The AI prompt, authored YAML, AI result summary, chat URL, progress, error body, and query data are not persisted by this repair path.
 
 Readiness and synchronization decisions use trusted, detailed internal evidence rather than public JSON. Generated context references are not credentials or attestations. Historical reports, logs, and artifacts created before schema 2 are not retroactively sanitized and require their own retention/access review.
@@ -82,11 +93,11 @@ Repository security automation includes tests, Ruff, Bandit, pip-audit, gitleaks
 
 ## Operator Responsibilities
 
-- Protect the base branch before adding the Omni PAT.
+- Protect the base branch before adding either Omni credential type.
 - Require review from trusted owners of workflows, metadata, policy, dependency locks, and security code.
 - Keep the action and every third-party action pinned to reviewed commit SHAs.
 - Review Dependabot and code-scanning alerts promptly.
-- Rotate and revoke the Omni PAT according to policy.
+- Review credential scope and rotate or revoke Organization API Keys and PATs according to policy.
 - Verify the first real Omni-created pull request and post-merge Omni promotion before making the check mandatory.
 - Run the first dbt refresh against a controlled non-production target and verify Git side effects before enabling production sync.
 - Keep dbt sync after the production dbt command, in a protected environment, and restrict its trigger paths to dbt sources.
