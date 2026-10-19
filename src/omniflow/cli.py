@@ -753,7 +753,7 @@ def _run_context_steps(
     verify_provenance = bool(context.environment) or regression_pr
     baseline_proof = None
     if verify_provenance:
-        from .candidate import verify_candidate
+        from .candidate import CandidateVerificationError, verify_candidate
 
         progress.begin("candidate")
         context.candidate_verification = {"status": "unverified"}
@@ -958,10 +958,14 @@ def _run_context_steps(
         after = verify_candidate(client, context)
         if before != after:
             context.candidate_verification = {"status": "unverified", "reason": "changed_during_validation"}
-            raise ConfigError("Candidate evidence changed during validation; rerun the current PR")
+            error = CandidateVerificationError("changed_during_validation")
+            error.validation_scope = "branch"
+            raise error
         if baseline_proof is not None and baseline_proof != verify_candidate(client, context, revision_side="base"):
             context.candidate_verification = {"status": "unverified", "reason": "changed_during_validation"}
-            raise ConfigError("Base evidence changed during validation; rerun the current PR")
+            error = CandidateVerificationError("changed_during_validation")
+            error.validation_scope = "base"
+            raise error
         context.candidate_verification = after
         progress.complete("candidate")
     finish_repository_context(
@@ -1020,8 +1024,13 @@ def _write_context_failure_artifacts(
     if isinstance(exc, ViewNamesMetadataError):
         issue.update(metadata_stage=exc.metadata_stage, metadata_reason=exc.metadata_reason)
     if progress.current == "candidate":
+        from .candidate import CANDIDATE_COUNT_FIELDS, CandidateVerificationError
+
         reason = getattr(exc, "candidate_reason", "verification_unavailable")
         issue.update(type="candidate_verification_failed", candidate_reason=reason, coverage_complete=False)
+        if isinstance(exc, CandidateVerificationError):
+            issue.update({key: value for key, value in exc.candidate_counts.items()
+                          if key in CANDIDATE_COUNT_FIELDS and type(value) is int and 0 <= value <= 2**31 - 1})
         if getattr(exc, "validation_scope", None) in {"base", "branch"}:
             issue["validation_scope"] = exc.validation_scope
         context.candidate_verification = {"status": "unverified", "reason": reason}

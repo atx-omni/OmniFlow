@@ -218,3 +218,100 @@ def test_remote_fallback_requires_complete_duplicate_free_inventory_and_immutabl
             "wrong_blob": "incomplete_git_snapshot",
         }[response]
     request.assert_called_once_with("GET", f"/git/trees/{snapshot.head}?recursive=1", max_bytes=candidate.MAX_TREE_BYTES)
+
+
+def _commit_snapshot(snapshot):
+    git("add", "omni")
+    git("commit", "-m", "Synthetic native export")
+    sha = git("rev-parse", "HEAD")
+    snapshot.event["pull_request"].update(
+        head={"sha": sha, "repo": {"full_name": "owner/repo"}},
+        base={"sha": sha, "repo": {"full_name": "owner/repo"}},
+    )
+    Path("event.json").write_text(json.dumps(snapshot.event))
+    return sha
+
+
+@pytest.mark.parametrize("wrapper", [".yaml", ".yml"])
+@pytest.mark.parametrize("side", ["head", "base"])
+def test_native_export_wrapper_matches_api_without_changing_git_proof(snapshot, wrapper, side):
+    from omniflow.model_paths import authored_file_identity
+
+    original_paths = {}
+    for path, text in snapshot.files.items():
+        wrapped = path + wrapper
+        if authored_file_identity(wrapped) == path:
+            Path("omni", path).rename(Path("omni", wrapped))
+            original_paths[wrapped] = text
+        else:
+            original_paths[path] = text
+    sha = _commit_snapshot(snapshot)
+    proof = verify_candidate(snapshot.client, snapshot.context, revision_side=side)
+    digest = hashlib.sha256()
+    for path, text in sorted(original_paths.items()):
+        name, raw = path.encode(), text.encode()
+        digest.update(len(name).to_bytes(8, "big") + name + len(raw).to_bytes(8, "big") + raw)
+    assert proof[f"{side}_sha"] == sha
+    assert proof["file_count"] == len(original_paths)
+    assert proof["snapshot_digest"] == digest.hexdigest()
+    assert snapshot.client.get_model_yaml.call_args.kwargs["branch_id"] == (
+        "candidate-id" if side == "head" else None
+    )
+
+
+@pytest.mark.parametrize("change,reason,counts", [
+    ("git_collision", "ambiguous_file_identity", (10, 9)),
+    ("api_collision", "ambiguous_file_identity", (9, 10)),
+    ("double_wrapper", "file_inventory_mismatch", (9, 9)),
+    ("generic_yaml", "file_inventory_mismatch", (9, 9)),
+    ("case_difference", "file_inventory_mismatch", (9, 9)),
+    ("changed_bytes", "content_mismatch", (9, 9)),
+])
+def test_filename_correspondence_does_not_weaken_verification(snapshot, change, reason, counts):
+    api = snapshot.client.get_model_yaml.return_value["files"]
+    old = Path("omni/SCHEMA/orders.view")
+    if change == "git_collision":
+        old.with_name("orders.view.yaml").write_text(old.read_text())
+    elif change == "api_collision":
+        api["SCHEMA/orders.view.yaml"] = api["SCHEMA/orders.view"]
+        old.rename(old.with_name("orders.view.yaml"))
+    elif change == "generic_yaml":
+        api["nested/settings"] = api.pop("nested/settings.yaml")
+        # A valid but unknown YAML basename is not aliased to its unwrapped name.
+        api["nested/settings.yml"] = api.pop("nested/settings")
+        old.rename(old.with_name("orders.view.yaml"))
+    else:
+        new = {"double_wrapper": "orders.view.yaml.yaml", "case_difference": "Orders.view.yaml",
+               "changed_bytes": "orders.view.yaml"}[change]
+        old.rename(old.with_name(new))
+        if change == "changed_bytes":
+            api["SCHEMA/orders.view"] += "# comment remains a byte-level difference\n"
+    _commit_snapshot(snapshot)
+    with pytest.raises(CandidateVerificationError) as caught:
+        verify_candidate(snapshot.client, snapshot.context)
+    error = caught.value
+    assert error.candidate_reason == reason
+    assert (error.candidate_counts["git_file_count"], error.candidate_counts["omni_file_count"]) == counts
+    assert "SCHEMA" not in str(error)
+    if change in {"double_wrapper", "generic_yaml", "case_difference"}:
+        assert error.candidate_counts["git_only_count"] == error.candidate_counts["omni_only_count"] == 1
+    if change == "changed_bytes":
+        assert error.candidate_counts["git_only_count"] == error.candidate_counts["omni_only_count"] == 0
+
+
+def test_native_export_remote_fallback_reads_original_git_paths(snapshot, monkeypatch):
+    from omniflow.model_paths import authored_file_identity
+
+    remote_files = {path + ".yaml" if authored_file_identity(path + ".yaml") == path else path: text
+                    for path, text in snapshot.files.items()}
+    entries = []
+    for path, text in remote_files.items():
+        raw = text.encode()
+        entries.append({"path": "omni/" + path, "type": "blob", "mode": "100644", "size": len(raw),
+                        "sha": hashlib.sha1(b"blob " + str(len(raw)).encode() + b"\0" + raw).hexdigest()})
+    monkeypatch.setattr(candidate, "_local_tree", Mock(side_effect=candidate._GitUnavailable))
+    monkeypatch.setattr(candidate, "_remote_tree", Mock(return_value=entries))
+    reader = Mock(side_effect=lambda repo, sha, path, **_: remote_files[path.removeprefix("omni/")])
+    monkeypatch.setattr(candidate, "read_github_text", reader)
+    assert verify_candidate(snapshot.client, snapshot.context)["file_count"] == 9
+    assert {call.args[2] for call in reader.call_args_list} == {"omni/" + path for path in remote_files}
