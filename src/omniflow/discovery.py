@@ -15,6 +15,7 @@ import requests
 
 from .exceptions import ConfigError, SecurityPolicyError
 from .git import current_branch, git_executable, github_event_payload, is_pull_request_event, pr_number
+from .model_paths import authored_file_identity
 from .security import reject_secret_keys, validate_base_url, validate_branch_name, validate_path_segment
 from .trust import read_trusted_repo_text
 
@@ -576,6 +577,8 @@ def _clear_base_branch_context(context: ModelContext) -> None:
 
 def _is_probable_omni_file(path: str) -> bool:
     normalized = path.strip().strip("/").lower()
+    if authored_file_identity(normalized) != normalized:
+        return True
     candidate = Path(normalized)
     name = candidate.name
     if name in {"model", "model.yaml", "model.yml", "relationships", "relationships.yaml", "relationships.yml"}:

@@ -1,5 +1,13 @@
 # Release notes
 
+## Unreleased — native authored filename correspondence
+
+- Candidate and base verification now recognize one `.yaml`/`.yml` serialization wrapper on known Omni authored filenames. Native Git exports can match extensionless API representations without renaming files or changing policy.
+- Complete inventory comparison, exact byte comparison, immutable Git blob verification, original-path proof digests, pre/post rechecks, path bounds and duplicate detection remain enforced. Ambiguous wrapped/unwrapped aliases fail closed.
+- Repository diagnostics use the same correspondence and retain real Git source paths and key-line numbers. Existing detail eligibility and path privacy restrictions are unchanged. Root-scoped routing recognizes nested typed native exports.
+- Public failure diagnostics distinguish inventory, duplicate identity, content and availability problems, with bounded counts and scope. They do not expose mismatch paths, raw payloads or model contents, and do not call an unexecuted validator a model/content failure.
+- Optional comment-only classification remains conservative and never skips live validation. No new configuration is required. Update all relevant Action pins to the same reviewed full SHA on the trusted default branch and perform a fresh non-production validation; source/CI evidence does not establish customer acceptance. See [troubleshooting](TROUBLESHOOTING.md#candidate-verification-git-and-omni-snapshots-differ).
+
 ## Unreleased — order-independent content evidence rechecks
 
 - Dashboard-draft evidence rechecks now ignore ordering-only differences in dashboard-filter groups, filter messages, and query issue lists. Identical existing findings no longer produce a false `document_identity_changed` failure solely because the API returns them in a different order.

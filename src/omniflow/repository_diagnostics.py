@@ -25,6 +25,7 @@ from .candidate import (
     _semantic_inventory,
 )
 from .exceptions import ConfigError, SecurityPolicyError
+from .model_paths import identity_index
 from .repository_locations import SnapshotIndex
 from .repository_policy import RepositoryPolicy, resolve_repository_policy
 from .revision_data import FULL_SHA, read_git_text, read_github_text
@@ -159,6 +160,9 @@ def _load_snapshot(policy: RepositoryPolicy, model_path: str, side: str) -> Snap
     inventory = _semantic_inventory(entries, model_path)
     if not inventory:
         raise ConfigError("Repository diagnostic snapshot is empty")
+    # Snapshot keys and digests remain exact Git paths. Independently reject
+    # ambiguous serialization aliases even when a candidate proof is supplied.
+    identity_index(inventory)
     files = {}
     digest = hashlib.sha256()
     for path, entry in sorted(inventory.items()):
@@ -182,7 +186,12 @@ def _matches(snapshot: Snapshot, *, proof: dict | None, side: str, client: Any,
         context.model_id, branch_id=branch_id if side == "head" else None,
         mode="combined", include_checksums=False, fully_resolved=False,
     ))
-    return actual == {path: text.encode("utf-8") for path, text in snapshot.files.items()}
+    expected_paths = identity_index(snapshot.files)
+    actual_paths = identity_index(actual)
+    return expected_paths.keys() == actual_paths.keys() and all(
+        snapshot.files[git_path].encode("utf-8") == actual[actual_paths[identity]]
+        for identity, git_path in expected_paths.items()
+    )
 
 
 def start_repository_context(context: Any, client: Any, *, branch_id: str | None,

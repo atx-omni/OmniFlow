@@ -30,6 +30,45 @@ Do not put the key in command history or a local file. Remove it from the proces
 
 ## Common Results
 
+### Candidate Verification: Git and Omni Snapshots Differ
+
+`candidate_verification_failed` with exit code `2` means OmniFlow could not establish
+that it is validating the proposed Git revision. It does **not** establish a model
+or dashboard defect. Check **Check Execution**: checks marked `not_run` have not
+validated anything. A failure during the final recheck also leaves validation incomplete.
+
+Use the public report's `candidate_reason`, `validation_scope` (`branch` or `base`),
+and available `git_file_count`, `omni_file_count`, `git_only_count`, `omni_only_count`:
+
+| Reason | What to check |
+| --- | --- |
+| `file_inventory_mismatch` | Check the exact trusted `model_path`, initial model export, and Git/Omni synchronization for that scope. Extra YAML inside a registered model directory is included, not silently ignored. |
+| `ambiguous_file_identity` | Resolve duplicate exports such as both `orders.view` and `orders.view.yaml`, or both `.yaml` and `.yml`. Even identical duplicate contents are ambiguous. |
+| `content_mismatch` | File identities match, but bytes differ. Save/synchronize the intended Omni branch or base and its corresponding PR Git revision. Comments and whitespace still count as byte differences. |
+| `changed_during_validation` | The snapshot changed during the checks. Let synchronization finish, then rerun against the current PR revision. |
+| `api_snapshot_unavailable` / `git_snapshot_unavailable` | Restore API/repository access or availability and complete Git history before rerunning. |
+
+**Native filename compatibility:** supporting revisions match one trailing `.yaml`
+or `.yml` on known Omni names: root `model`, root `relationships`, and typed
+`.view`, `.query.view`, `.topic`, `.composite_topic`, `.relationships` files.
+For example, Git `SCHEMA/orders.view.yaml` can match API `SCHEMA/orders.view`.
+Directories, capitalization and spaces stay significant; all file contents must
+still match exactly. Unknown YAML names and repeated suffixes are not guessed away.
+
+Older Action pins can report `file_inventory_mismatch` even when native exported
+files and API files have identical contents. Upgrade **every** applicable OmniFlow
+`uses:` entry to the same reviewed full commit SHA containing the filename fix;
+merge the workflow update into the trusted default branch through normal review,
+then run a fresh non-production PR validation. A green upgrade PR can still have
+run the old trusted workflow. No new policy switch is required. Do not rename model
+folders, remove `.yaml` suffixes, reinstall, or disable verification to work around it.
+
+Keep `.omni/flow.json` at the repository root's `.omni` directory, separate from
+model files. A path such as `omni/Snowflake Analytics` must match the real directory
+exactly. Source-file differences are intentionally not printed in public diagnostics;
+compare them inside your authorized repository and Omni instance. Matching file
+counts alone do not prove matching inventories or contents.
+
 ### Required Policy File Is Missing
 
 **Result:** Configuration exit code `2` with setup guidance.

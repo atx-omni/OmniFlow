@@ -82,7 +82,7 @@ CANDIDATE_REASONS = frozenset({
     "file_inventory_mismatch", "git_snapshot_unavailable", "incomplete_git_snapshot", "invalid_api_snapshot",
     "invalid_git_inventory", "invalid_pr_revision", "invalid_snapshot_encoding", "missing_candidate_branch",
     "missing_pr_revision", "snapshot_limit_exceeded", "unsafe_git_entry", "unsafe_snapshot_path",
-    "changed_during_validation", "verification_unavailable",
+    "changed_during_validation", "verification_unavailable", "ambiguous_file_identity",
 })
 ENUMS = {
     "validator": VALIDATORS, "type": TYPES, "issue_type": {"content", "dashboard_filter", "query"},
@@ -121,6 +121,7 @@ COUNTS = frozenset({
     "baseline_issues", "current_issues", "comparison_ambiguous_issues", "model_count", "dbt_file_count",
     "total_records", "total_exposures", "unmapped_dashboards", "coverage_gaps", "checks_completed",
     "checks_failed", "checks_not_run", "checks_disabled", "file_count", "changed_lines",
+    "git_file_count", "omni_file_count", "git_only_count", "omni_only_count",
     "modified_file_count", "regressed_count", "improved_count", "unchanged_count", "prompt_set_count",
     "refreshes_completed", "refreshes_failed", "post_sync_validations_failed", "refreshed_models", "models_requested",
 })
@@ -204,8 +205,55 @@ def _finding_message(issue: dict[str, Any]) -> str:
     if issue.get("reason_code") == "invalid_json_response":
         return f"Omni API returned invalid JSON; validation could not complete. This is not a {noun} finding."
     if issue.get("type") == "candidate_verification_failed":
-        return ("The selected Omni scope could not be verified against the corresponding pull-request Git revision. "
-                "Check branch/base synchronization and the reason category, then rerun. Do not bypass this check.")
+        reasons = {
+            "file_inventory_mismatch": (
+                "Git and Omni authored file inventories differ after matching supported YAML filename wrappers. "
+                "Check the trusted model_path and synchronize the selected Omni branch/base with its PR Git revision."
+            ),
+            "ambiguous_file_identity": (
+                "Multiple files map to the same Omni authored identity. Check for both wrapped and unwrapped names "
+                "or duplicate .yaml/.yml exports; resolve the duplicate mapping before rerunning."
+            ),
+            "content_mismatch": (
+                "Git and Omni file inventories match, but authored file contents differ. "
+                "Save and synchronize the selected Omni branch/base with its PR Git revision, then rerun."
+            ),
+            "changed_during_validation": (
+                "The verified snapshot changed during validation. Wait for synchronization to finish, "
+                "then rerun against the current PR revision."
+            ),
+            "api_snapshot_unavailable": (
+                "Omni authored YAML could not be retrieved. Check Omni API access and availability, then rerun."
+            ),
+            "git_snapshot_unavailable": (
+                "The immutable PR Git snapshot could not be retrieved. Check repository access and checkout "
+                "history, then rerun."
+            ),
+            "empty_git_snapshot": (
+                "No authored model files were found at the trusted model_path in the PR Git revision. "
+                "Check the exact registered path and initial model export."
+            ),
+            "missing_candidate_branch": (
+                "No corresponding Omni candidate branch was selected. Create or synchronize the matching "
+                "Omni branch before rerunning."
+            ),
+        }
+        message = reasons.get(issue.get("candidate_reason"), (
+            "The selected Omni scope could not be verified against the corresponding pull-request Git revision. "
+            "Check branch/base synchronization and the reason category, then rerun."
+        ))
+        counts = ", ".join(
+            f"{label}: {issue[key]}" for key, label in (
+                ("git_file_count", "Git files"), ("omni_file_count", "Omni files"),
+                ("git_only_count", "Git-only"), ("omni_only_count", "Omni-only"),
+            ) if type(issue.get(key)) is int and 0 <= issue[key] <= 2**31 - 1
+        )
+        if counts:
+            message += f" Counts: {counts}."
+        return message + (
+            " Validation is incomplete; this does not establish a model or content defect. "
+            "Check execution states for checks not run. Do not bypass verification."
+        )
     if issue.get("reason_code") == "content_comparison_unavailable":
         return ("Content validation comparison could not be established; this does not prove a new content defect. "
                 "Restore complete, unambiguous baseline and branch evidence before rerunning.")

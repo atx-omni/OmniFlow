@@ -16,6 +16,7 @@ from yaml.events import AliasEvent, MappingEndEvent, MappingStartEvent, Sequence
 from yaml.nodes import MappingNode, ScalarNode, SequenceNode
 
 from .diagnostic_catalog import CHANGE_MESSAGES, LINT_MESSAGES
+from .model_paths import AmbiguousModelPath, authored_file_identity, identity_index
 from .security import redact
 from .semantic_files import infer_file_kind
 
@@ -168,7 +169,12 @@ class SnapshotIndex:
         self._files: dict[str, _File] = {}
         self._references: dict[str, set[str]] = {}
         self._identities: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        self._model_path = model_path
         if (model_path != "." and not _path(model_path)) or not isinstance(files, dict) or len(files) > MAX_FILES:
+            return
+        try:
+            identity_index(path for path in files if _path(path))
+        except AmbiguousModelPath:
             return
         total = 0
         for path, text in files.items():
@@ -194,7 +200,11 @@ class SnapshotIndex:
                 continue
             item = _File(repo_path)
             self._files[path] = item
-            for reference in {path, repo_path}:
+            identity = authored_file_identity(path)
+            identity_repo_path = identity if model_path == "." else f"{model_path}/{identity}"
+            # Aliases only identify this already verified Git file; source
+            # coordinates always retain its original serialization suffix.
+            for reference in {path, repo_path, identity, identity_repo_path}:
                 self._references.setdefault(reference, set()).add(path)
             self._index_paths(item, root)
             # A nested basename cannot establish a scoped canonical view name.
@@ -251,7 +261,11 @@ class SnapshotIndex:
     def _file(self, reference: Any) -> _File | None:
         if not _path(reference):
             return None
-        matches = self._references.get(reference, set())
+        references = {reference, authored_file_identity(reference)}
+        prefix = f"{self._model_path}/"
+        if self._model_path != "." and reference.startswith(prefix):
+            references.add(prefix + authored_file_identity(reference[len(prefix):]))
+        matches = set().union(*(self._references.get(path, set()) for path in references))
         return self._files[next(iter(matches))] if len(matches) == 1 else None
 
     def _identity(self, kind: str, name: Any) -> dict[str, Any] | None:
