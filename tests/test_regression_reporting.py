@@ -159,7 +159,8 @@ def test_candidate_failure_keeps_only_fixed_reason_and_scope(reason):
     assert ("candidate_reason" in finding) is (reason != PRIVATE)
     assert finding["validation_scope"] == "base"
     text = render_markdown_report(safe)
-    assert "Check branch/base synchronization" in text
+    assert "Validation is incomplete" in text
+    assert "Do not bypass verification" in text
     if reason != PRIVATE:
         assert finding["candidate_reason"] == reason
         assert f"candidate reason: `{reason}`" in text

@@ -32,7 +32,7 @@ measures:
 
 
 @pytest.fixture
-def repository(tmp_path, monkeypatch):
+def repository(tmp_path, monkeypatch, request):
     monkeypatch.chdir(tmp_path)
 
     def git(*args):
@@ -43,15 +43,17 @@ def repository(tmp_path, monkeypatch):
     git("config", "user.email", "synthetic@example.invalid")
     (tmp_path / ".omni").mkdir()
     (tmp_path / "omni").mkdir()
-    (tmp_path / "omni/orders.view").write_text(YAML)
+    suffix = getattr(request, "param", "")
+    source_path = tmp_path / f"omni/orders.view{suffix}"
+    source_path.write_text(YAML)
     context = ModelContext(model_id="private-model", base_url="https://synthetic.omniapp.co",
                            model_path="omni", branch_id="candidate", branch_name="candidate")
     (tmp_path / ".omni/flow.json").write_text(json.dumps({"version": 1, "models": [vars(context)]}))
     git("add", ".")
     git("commit", "-m", "Synthetic base")
     base = git("rev-parse", "HEAD")
-    head_yaml = YAML + "# unrelated change\n"
-    (tmp_path / "omni/orders.view").write_text(head_yaml)
+    head_yaml = ("# Head-only source line\n" if suffix else "") + YAML + "# unrelated change\n"
+    source_path.write_text(head_yaml)
     git("add", ".")
     git("commit", "-m", "Synthetic head")
     head = git("rev-parse", "HEAD")
@@ -207,6 +209,77 @@ def test_verified_candidate_proofs_reuse_snapshot_without_extra_omni_reads(repos
                                   head_proof=proofs["head"], base_proof=proofs["base"])
         write(report(issues))
     assert Path(".omniflow/repository/report.json").exists()
+
+
+@pytest.mark.parametrize("repository", [".yaml", ".yml"], indirect=True)
+@pytest.mark.parametrize("use_proofs", [False, True])
+def test_serialized_git_paths_keep_head_base_locations_and_public_privacy(repository, monkeypatch, use_proofs):
+    from omniflow.candidate import verify_candidate
+
+    context, client, policy = repository
+    snapshots = {side: _load_snapshot(policy, context.model_path, side) for side in ("head", "base")}
+    source_name = next(iter(snapshots["head"].files))
+    assert source_name.endswith((".view.yaml", ".view.yml"))
+    proofs = {}
+    if use_proofs:
+        monkeypatch.setattr("omniflow.candidate.pull_request_revision",
+                            lambda side: (policy.head_sha if side == "head" else policy.base_sha, policy.repository))
+        proofs = {f"{side}_proof": verify_candidate(client, context, revision_side=side)
+                  for side in ("head", "base")}
+        for side, snapshot in snapshots.items():
+            assert proofs[f"{side}_proof"]["snapshot_digest"] == snapshot.digest
+        monkeypatch.setattr(client, "get_model_yaml", lambda *args, **kwargs: pytest.fail("proof should be reused"))
+    issues = [
+        {"validator": "model", "type": "model_validation_issue", "severity": "error",
+         "yaml_path": "orders.view,measures,total,sql", "message": "secret_patient_literal"},
+        {"validator": "model", "type": "model_validation_issue", "severity": "error",
+         "yaml_path": "omni/orders.view,measures,total,sql", "state": "resolved", "active": False,
+         "message": "secret_card_literal"},
+    ]
+    with repository_reporting(object(), output_dir=Path(".omniflow")):
+        evidence = start_repository_context(context, client, branch_id="candidate", **proofs)
+        assert evidence is not None and set(evidence.snapshots) == {"head", "base"}
+        finish_repository_context(evidence, context, client, issues, branch_id="candidate", **proofs)
+        safe = write(report(issues))
+    detail = json.loads(Path(".omniflow/repository/report.json").read_text())
+    assert [(item["file"], item["line"], item["source_revision"]) for item in detail["issues"]] == [
+        (f"omni/{source_name}", 8, "head"), (f"omni/{source_name}", 7, "base"),
+    ]
+    assert "orders" not in json.dumps(safe)
+    for path in Path(".omniflow").rglob("*"):
+        if path.is_file():
+            text = path.read_text()
+            assert "secret_patient_literal" not in text and "secret_card_literal" not in text
+            if path.parent.name != "repository":
+                assert source_name not in text and "orders.total" not in text
+
+
+@pytest.mark.parametrize("repository", [".yaml"], indirect=True)
+@pytest.mark.parametrize("side", ["git", "api"])
+def test_serialization_collisions_withhold_repository_details(repository, monkeypatch, side):
+    context, client, policy = repository
+    if side == "api":
+        original = client.get_model_yaml
+
+        def ambiguous(*args, **kwargs):
+            payload = original(*args, **kwargs)
+            payload["files"]["orders.view.yaml"] = payload["files"]["orders.view"]
+            return payload
+
+        monkeypatch.setattr(client, "get_model_yaml", ambiguous)
+    else:
+        Path("omni/orders.view").write_text(YAML)
+        subprocess.run(["git", "add", "omni/orders.view"], check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "Synthetic ambiguous alias"], check=True, capture_output=True)
+        head = subprocess.run(["git", "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+        changed = RepositoryPolicy(True, "repository_verified", policy.repository, head, policy.base_sha)
+        monkeypatch.setattr("omniflow.repository_diagnostics.resolve_repository_policy", lambda config: changed)
+    with repository_reporting(object(), output_dir=Path(".omniflow")):
+        assert execute(context, client, findings()) is None
+        safe = write(report(findings()))
+    assert safe["exit_code"] == 1
+    assert not Path(".omniflow/repository/report.json").exists()
+    assert "orders" not in json.dumps(safe)
 
 
 def test_deleted_and_resolved_findings_use_base_locations(repository):

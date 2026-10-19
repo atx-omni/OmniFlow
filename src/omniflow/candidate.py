@@ -11,19 +11,25 @@ from typing import Any
 
 from .exceptions import ConfigError, OmniFlowError
 from .git import git_executable
+from .model_paths import AmbiguousModelPath, identity_index
 from .revision_data import FULL_SHA, pull_request_revision, read_git_text, read_github_text
 from .yaml_security import MAX_YAML_FILE_BYTES, MAX_YAML_FILES, MAX_YAML_TOTAL_BYTES
 
 MAX_TREE_BYTES = 2 * 1024 * 1024
 MAX_TREE_ENTRIES = 10_000
 SEMANTIC_SUFFIXES = {".view", ".topic", ".composite_topic", ".relationships", ".yaml", ".yml"}
+CANDIDATE_COUNT_FIELDS = frozenset({"git_file_count", "omni_file_count", "git_only_count", "omni_only_count"})
 
 
 class CandidateVerificationError(ConfigError):
     """Public diagnostics use categories only, never model paths or contents."""
 
-    def __init__(self, reason: str) -> None:
+    def __init__(self, reason: str, **counts: int) -> None:
         self.candidate_reason = reason
+        self.candidate_counts = {
+            key: value for key, value in counts.items()
+            if key in CANDIDATE_COUNT_FIELDS and type(value) is int and 0 <= value <= 2**31 - 1
+        }
         super().__init__(
             f"Candidate provenance verification failed ({reason}). "
             "The selected Omni candidate or base must exactly match the corresponding immutable PR authored YAML. "
@@ -82,8 +88,18 @@ def _verify_snapshot(client: Any, context: Any, *, revision_side: str) -> dict[s
     except OmniFlowError:
         raise CandidateVerificationError("api_snapshot_unavailable") from None
     actual = _api_files(payload)
-    if set(actual) != set(expected):
-        raise CandidateVerificationError("file_inventory_mismatch")
+    counts = {"git_file_count": len(expected), "omni_file_count": len(actual)}
+    try:
+        expected_names, actual_names = identity_index(expected), identity_index(actual)
+    except AmbiguousModelPath:
+        raise CandidateVerificationError("ambiguous_file_identity", **counts) from None
+    counts.update(git_only_count=len(expected_names.keys() - actual_names.keys()),
+                  omni_only_count=len(actual_names.keys() - expected_names.keys()))
+    if counts["git_only_count"] or counts["omni_only_count"]:
+        raise CandidateVerificationError("file_inventory_mismatch", **counts)
+    # Compare by authored identity, but retain original Git keys and entries for
+    # independent immutable blob verification, report locations and proof digests.
+    corresponding = {path: actual_names[identity] for identity, path in expected_names.items()}
 
     digest = hashlib.sha256()
     for path, entry in sorted(expected.items()):
@@ -103,8 +119,8 @@ def _verify_snapshot(client: Any, context: Any, *, revision_side: str) -> dict[s
         blob = algorithm(b"blob " + str(len(raw)).encode("ascii") + b"\0" + raw).hexdigest()  # nosec B324
         if len(raw) != entry["size"] or blob != entry["sha"].lower():
             raise CandidateVerificationError("incomplete_git_snapshot")
-        if raw != actual[path]:
-            raise CandidateVerificationError("content_mismatch")
+        if raw != actual[corresponding[path]]:
+            raise CandidateVerificationError("content_mismatch", **counts)
         name = path.encode("utf-8")
         digest.update(len(name).to_bytes(8, "big") + name + len(raw).to_bytes(8, "big") + raw)
     return {
