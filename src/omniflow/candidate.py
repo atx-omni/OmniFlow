@@ -11,13 +11,12 @@ from typing import Any
 
 from .exceptions import ConfigError, OmniFlowError
 from .git import git_executable
-from .model_paths import AmbiguousModelPath, identity_index
+from .model_paths import AmbiguousModelPath, identity_index, is_semantic_file
 from .revision_data import FULL_SHA, pull_request_revision, read_git_text, read_github_text
 from .yaml_security import MAX_YAML_FILE_BYTES, MAX_YAML_FILES, MAX_YAML_TOTAL_BYTES
 
 MAX_TREE_BYTES = 2 * 1024 * 1024
 MAX_TREE_ENTRIES = 10_000
-SEMANTIC_SUFFIXES = {".view", ".topic", ".composite_topic", ".relationships", ".yaml", ".yml"}
 CANDIDATE_COUNT_FIELDS = frozenset({"git_file_count", "omni_file_count", "git_only_count", "omni_only_count"})
 
 
@@ -142,8 +141,7 @@ def _safe_path(value: Any) -> str:
 
 
 def _semantic_path(path: str) -> bool:
-    value = PurePosixPath(path)
-    return value.name in {"model", "relationships"} or value.suffix in SEMANTIC_SUFFIXES
+    return is_semantic_file(path)
 
 
 def _utf8(text: str) -> bytes:

@@ -44,6 +44,46 @@ def test_supported_api_file_content_forms_still_normalize(tmp_path, wrapper):
     assert set(load_yaml_graph(tmp_path / "snapshot", require_view_names=True).views) == {"orders"}
 
 
+@pytest.mark.parametrize("contents", ["dimensions: {}\n", "dimensions: {id: {}}\n", None])
+def test_snapshot_content_aliases_must_agree(tmp_path, contents):
+    class Client:
+        def get_model_yaml(self, *args, **kwargs):
+            return {"files": {"orders.view": {"content": "dimensions: {}\n", "contents": contents}},
+                    "viewNames": {"orders": "orders.view"}}
+
+    root = tmp_path / "snapshot"
+    if contents == "dimensions: {}\n":
+        pull_yaml(client=Client(), model_id="model", branch_id=None, output_dir=root)
+        assert set(load_yaml_graph(root).files) == {"orders.view"}
+    else:
+        with pytest.raises(OmniAPIError, match="conflicting content"):
+            pull_yaml(client=Client(), model_id="model", branch_id=None, output_dir=root)
+        assert not root.exists()
+
+
+def test_snapshot_does_not_silently_omit_an_unsupported_manifest_entry(tmp_path):
+    import hashlib
+
+    root = tmp_path / "snapshot"
+    root.mkdir()
+    text = "synthetic unsupported input"
+    (root / "unknown.format").write_text(text)
+    (root / "manifest.json").write_text(json.dumps({
+        "files": {"unknown.format": {"sha256": hashlib.sha256(text.encode()).hexdigest()}}, "view_names": {},
+    }))
+    with pytest.raises(ConfigError, match="unsupported authored file"):
+        load_yaml_graph(root)
+
+
+def test_competing_file_inventories_are_not_selected_by_truthiness(tmp_path):
+    class Client:
+        def get_model_yaml(self, *args, **kwargs):
+            return {"files": {}, "fileMap": {"model": "connection: synthetic\n"}}
+
+    with pytest.raises(OmniAPIError, match="competing file inventories"):
+        pull_yaml(client=Client(), model_id="model", branch_id=None, output_dir=tmp_path / "snapshot")
+
+
 @pytest.mark.parametrize("operation", ["delete", "modified", "missing", "unsafe", "symlink"])
 def test_snapshot_inventory_and_hashes_prevent_stale_or_corrupt_evidence(tmp_path, operation):
     class Client:

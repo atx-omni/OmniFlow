@@ -106,6 +106,7 @@ def history(current):
     return {
         "schema_version": HISTORY_SCHEMA_VERSION, "model_id": "model", "branch_id": None,
         "user_id": "user-1", "include_personal_folders": False, "labels": [],
+        "requested_validation_depth": "api_default",
         "issues": normalize_issues(extract_issues(current)),
     }
 

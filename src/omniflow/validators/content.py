@@ -19,8 +19,10 @@ from .content_identity import (
     resolve_documents,
 )
 
-HISTORY_SCHEMA_VERSION = 2
+HISTORY_SCHEMA_VERSION = 3
 QUERY_IDENTITY_KEYS = ("query_presentation_id", "query_id_map_key", "query_id")
+ISSUE_ENVELOPE_KEYS = ("content", "issues", "validation_issues", "errors", "documents", "items", "results")
+NESTED_ERROR_KEYS = frozenset({"issues", "validation_issues", "errors"})
 CONTENT_EVIDENCE_REASON_CODES = frozenset({
     "invalid_issue_container", "invalid_issue_entry", "missing_issue_message",
     "invalid_issue_message", "unsupported_issue_shape",
@@ -89,6 +91,7 @@ class ContentEvidenceError(OmniAPIError):
         self.issue_type = issue_type if issue_type in {"dashboard_filter", "query"} else "content"
         self.validation_scope: str | None = None
         self.comparison_mode = "unknown"
+        self.requested_validation_depth = "api_default"
         self.context: dict[str, str] = {}
         for source, mapping in (
             (document or {}, {"document_id": "document_id", "identifier": "document_identifier", "name": "document_name"}),
@@ -113,6 +116,7 @@ class ContentEvidenceError(OmniAPIError):
             "reason_code": self.reason_code,
             "validation_scope": self.validation_scope,
             "comparison_mode": self.comparison_mode,
+            "requested_validation_depth": self.requested_validation_depth,
             "comparison_status": "unavailable",
             "content_health": "unknown",
             "regression_status": "unknown",
@@ -147,6 +151,12 @@ def _issue_list(
         if not isinstance(message, str) or not message.strip():
             raise ContentEvidenceError(
                 issue_type=issue_type, document=document, query=query, reason_code=reason_code,
+            )
+        if isinstance(item, dict) and NESTED_ERROR_KEYS.intersection(item):
+            # A readable message cannot make competing nested evidence safe to
+            # discard. Ordinary metadata remains supported; do not recurse into it.
+            raise ContentEvidenceError(
+                issue_type=issue_type, document=document, query=query, reason_code="unsupported_issue_shape",
             )
     return value
 
@@ -223,6 +233,10 @@ def content_documents(payload: Any) -> list[dict[str, Any]]:
             if not isinstance(queries, list) or any(not isinstance(query, dict) for query in queries):
                 raise OmniAPIError("Content Validator response contains an invalid query list")
             for query in queries:
+                if {"errors", "validation_issues"}.intersection(query):
+                    raise ContentEvidenceError(
+                        issue_type="query", document=document, query=query, reason_code="unsupported_issue_shape",
+                    )
                 for key in ("query_presentation_id", "query_id", "query_id_map_key"):
                     if key in query and (not isinstance(query[key], str) or not query[key].strip()):
                         raise OmniAPIError("Content Validator response contains an invalid query identity")
@@ -288,10 +302,14 @@ def extract_issues(payload: Any) -> list[Any]:
         return _issue_list(payload)
     if not isinstance(payload, dict):
         raise OmniAPIError("Content Validator response has an unexpected envelope")
+    if sum(key in payload for key in ISSUE_ENVELOPE_KEYS) > 1:
+        # Never choose an empty preferred container while ignoring another
+        # recognized source of errors. Unrelated response metadata is allowed.
+        raise ContentEvidenceError(reason_code="unsupported_issue_shape")
     if "content" in payload:
         return collect_content_issues(payload)
     # Retain explicitly supported legacy issue envelopes, including valid empty lists.
-    for key in ("issues", "validation_issues", "errors", "documents", "items", "results"):
+    for key in ISSUE_ENVELOPE_KEYS[1:]:
         if key in payload:
             return _issue_list(payload[key])
     raise OmniAPIError("Content Validator response has an unexpected envelope")
@@ -489,7 +507,14 @@ def compare_history(
         return [], "invalidated_legacy"
     if type(payload["schema_version"]) is not int:
         raise OmniAPIError("Content validation history has an invalid schema version")
-    if payload["schema_version"] != HISTORY_SCHEMA_VERSION:
+    if payload["schema_version"] == 2:
+        # Version 2 predates depth selection and used the API default. Read it
+        # only in that scope; new version-3 history cannot be reused by old code
+        # that has no depth check. Do not modify the caller's history object.
+        if payload.get("requested_validation_depth", "api_default") != "api_default":
+            return [], "invalidated_version"
+        payload = {**payload, "requested_validation_depth": "api_default"}
+    elif payload["schema_version"] != HISTORY_SCHEMA_VERSION:
         return [], "invalidated_version"
     if any(key not in payload for key in context):
         raise OmniAPIError("Content validation history is missing comparison context")
@@ -500,6 +525,8 @@ def compare_history(
         or type(payload["include_personal_folders"]) is not bool
         or not isinstance(payload["labels"], list)
         or any(not isinstance(label, str) or not label.strip() for label in payload["labels"])
+        or not isinstance(payload.get("requested_validation_depth"), str)
+        or payload["requested_validation_depth"] not in {"api_default", "full"}
     ):
         raise OmniAPIError("Content validation history has invalid comparison context")
     issues = payload.get("issues")
@@ -528,16 +555,18 @@ def compare_history(
 
 def _fetch_validator_payload(
     client: OmniClient, model_id: str, *, branch_id: str | None, user_id: str | None,
-    include_personal_folders: bool, comparison_mode: str,
+    include_personal_folders: bool, comparison_mode: str, force_full_validation: bool = False,
 ) -> Any:
     try:
         return client.validate_content(
             model_id, branch_id=branch_id, user_id=user_id,
             include_personal_folders=include_personal_folders,
+            **({"force_full_validation": True} if force_full_validation else {}),
         )
     except OmniResponseError as exc:
         exc.validation_scope = "branch" if branch_id else "base"
         exc.comparison_mode = comparison_mode
+        exc.requested_validation_depth = "full" if force_full_validation else "api_default"
         raise
 
 
@@ -553,20 +582,24 @@ def run_content_validation(
     history_out: str | Path,
     report_out: str | Path,
     fail_on_new_only: bool,
+    force_full_validation: bool = False,
     max_samples: int = 20,
     redact_document_names: bool = False,
     allow_raw_response_output: bool = False,
 ) -> tuple[dict[str, Any], int]:
     comparison_mode = "new_only" if fail_on_new_only else "all_issues"
+    requested_depth = "full" if force_full_validation else "api_default"
     payload = _fetch_validator_payload(
         client, model_id,
         branch_id=branch_id,
         user_id=user_id,
         include_personal_folders=include_personal_folders,
         comparison_mode=comparison_mode,
+        force_full_validation=force_full_validation,
     )
     payload = _prepare_validator_payload(
         payload, [], {}, validation_scope="branch" if branch_id else "base", comparison_mode=comparison_mode,
+        requested_validation_depth=requested_depth,
     )
     records = client.list_content(
         labels=labels,
@@ -585,9 +618,11 @@ def run_content_validation(
         baseline_payload = _fetch_validator_payload(
             client, model_id, branch_id=None, user_id=user_id,
             include_personal_folders=include_personal_folders, comparison_mode=comparison_mode,
+            force_full_validation=force_full_validation,
         )
         baseline_payload = _prepare_validator_payload(
             baseline_payload, [], {}, validation_scope="base", comparison_mode=comparison_mode,
+            requested_validation_depth=requested_depth,
         )
         if (isinstance(payload, dict) and "content" in payload
                 and isinstance(baseline_payload, dict) and "content" in baseline_payload):
@@ -613,10 +648,12 @@ def run_content_validation(
                         after = _fetch_validator_payload(
                             client, model_id, branch_id=scope, user_id=user_id,
                             include_personal_folders=include_personal_folders, comparison_mode=comparison_mode,
+                            force_full_validation=force_full_validation,
                         )
                         after = _prepare_validator_payload(
                             after, [], {}, validation_scope="branch" if scope else "base",
                             comparison_mode=comparison_mode,
+                            requested_validation_depth=requested_depth,
                         )
                         if evidence_signature(before) != evidence_signature(content_documents(after)):
                             raise DocumentIdentityError("document_identity_changed")
@@ -634,15 +671,18 @@ def run_content_validation(
                 error = ContentEvidenceError(reason_code=exc.reason_code)
                 error.validation_scope = "branch"
                 error.comparison_mode = comparison_mode
+                error.requested_validation_depth = requested_depth
                 raise error from None
             except ContentEvidenceError as exc:
                 if exc.validation_scope is None:
                     exc.validation_scope = "branch"
                 exc.comparison_mode = comparison_mode
+                exc.requested_validation_depth = requested_depth
                 raise
     payload = _prepare_validator_payload(
         payload, labels, records_by_identifier, validation_scope="branch" if branch_id else "base",
         comparison_mode=comparison_mode,
+        requested_validation_depth=requested_depth,
     )
 
     safe_issues = _sanitize_issues(
@@ -655,12 +695,14 @@ def run_content_validation(
     history_context = {
         "model_id": model_id, "branch_id": branch_id, "user_id": user_id,
         "include_personal_folders": include_personal_folders, "labels": sorted(set(labels)),
+        "requested_validation_depth": requested_depth,
     }
     history_status = "not_used_live_base"
     if branch_id and fail_on_new_only:
         baseline_payload = _prepare_validator_payload(
             baseline_payload, labels, records_by_identifier, validation_scope="base",
             comparison_mode=comparison_mode,
+            requested_validation_depth=requested_depth,
         )
         previous = normalize_issues(
             _sanitize_issues(
@@ -700,6 +742,7 @@ def run_content_validation(
             "validator": "content", "type": "content_evidence_unavailable",
             "reason_code": "content_comparison_unavailable", "comparison_status": comparison_status,
             "comparison_mode": comparison_mode, "regression_status": "unknown",
+            "requested_validation_depth": requested_depth,
             "severity": "error", "blocking": True, "active": True, "coverage_complete": False,
             "message": "Content comparison evidence is unavailable or ambiguous; no regression conclusion can be made.",
         })
@@ -725,6 +768,7 @@ def run_content_validation(
         "resolved_issues": len(resolved_items),
         "comparison_source": comparison_source,
         "comparison_mode": comparison_mode,
+        "requested_validation_depth": requested_depth,
         "comparison_status": comparison_status,
         "content_health": "issues_in_scope" if normalized else "no_issues_in_scope",
         "regression_status": (
@@ -740,8 +784,9 @@ def run_content_validation(
         "existing_issue_samples": report_existing[:max_samples],
         "resolved_issue_samples": report_resolved[:max_samples],
         "note": (
-            "Omni validates the full model server-side; label filtering is applied locally "
-            "after content metadata lookup."
+            "Omni validates content for the selected model server-side; label filtering is applied locally "
+            "after content metadata lookup. Requested validation depth records the request, not observed "
+            "exhaustive coverage. Validation complete means available evidence was processed."
         ),
     }
     write_json(report_out, redact(report))
@@ -765,12 +810,14 @@ def _prepare_validator_payload(
     *,
     validation_scope: str | None = None,
     comparison_mode: str = "unknown",
+    requested_validation_depth: str = "api_default",
 ) -> Any:
     try:
         extract_issues(payload)
     except ContentEvidenceError as exc:
         exc.validation_scope = validation_scope
         exc.comparison_mode = comparison_mode if comparison_mode in {"all_issues", "new_only"} else "unknown"
+        exc.requested_validation_depth = requested_validation_depth
         raise
     if not isinstance(payload, dict) or not isinstance(payload.get("content"), list):
         return payload

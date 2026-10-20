@@ -74,15 +74,14 @@ class ExactRevisionTests(unittest.TestCase):
         return subprocess.run(["git", *args], check=True, capture_output=True, text=True).stdout.strip()
 
     def test_trusted_base_checkout_routes_dbt_only_and_reads_exact_head_without_omni_secret(self):
-        with mock.patch("omniflow.discovery._github_pull_request_files", return_value=["models/orders.sql"]):
-            captured = io.StringIO()
-            with contextlib.redirect_stdout(captured):
-                self.assertEqual(main(["route", "--auto", "--format", "json"]), 0)
-            route = json.loads(captured.getvalue())
-            self.assertTrue(route["should_run"])
-            self.assertFalse(route["requires_omni"])
-            with capture_private_reports() as private_reports:
-                self.assertEqual(main(["run", "--auto"]), 1)
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            self.assertEqual(main(["route", "--auto", "--format", "json"]), 0)
+        route = json.loads(captured.getvalue())
+        self.assertTrue(route["should_run"])
+        self.assertFalse(route["requires_omni"])
+        with capture_private_reports() as private_reports:
+            self.assertEqual(main(["run", "--auto"]), 1)
         report = json.loads(Path(".omniflow/public/report.json").read_text())
         self.assertEqual(private_reports[-1]["git_sha"], self.head)
         self.assertEqual(private_reports[-1]["issues"][0]["column"], "customer_id")

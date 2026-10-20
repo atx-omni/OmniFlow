@@ -100,6 +100,7 @@ ENUMS = {
     "post_sync_validation_status": {"not_run", "failed", "passed"},
     "coverage_status": {"available", "partial", "unavailable", "unknown"},
     "comparison_mode": {"all_issues", "new_only", "unknown"},
+    "requested_validation_depth": {"api_default", "full"},
     "comparison_status": {"complete", "ambiguous", "baseline_unavailable", "unavailable", "not_applicable"},
     "comparison_source": {"base_model", "history", "none"},
     "content_health": {"no_issues_in_scope", "issues_in_scope", "unknown"},
