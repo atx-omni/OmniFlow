@@ -64,6 +64,12 @@ def _render_minimal_diagnostic(report: dict[str, Any]) -> str:
             title = "Content" if validator == "content" else "Model"
             lines.extend(["", f"### {title} Comparison — {reference}", ""])
             lines.extend([_comparison_outcome(check, validator), ""])
+            if validator == "content" and check.get("requested_validation_depth") in {"api_default", "full"}:
+                lines.extend([
+                    f"- Requested validation depth: `{check['requested_validation_depth']}`",
+                    "- Depth records the API request, not verified exhaustive coverage. "
+                    "Validation complete describes execution and available evidence, not full-depth coverage.",
+                ])
             health_summary = check.get("summary")
             if isinstance(health_summary, dict):
                 lines.append(f"- Current health errors: `{health_summary.get('errors', 0)}`; "
@@ -117,7 +123,7 @@ def _public_finding_lines(findings: list[dict[str, Any]], *, repository_detail: 
                         lines.append(f"   - {key.replace('_', ' ')}: `{_safe_code(finding[key])}`")
             for key in ("context_reference", "validation_scope", "state", "reason_code", "candidate_reason",
                         "comparison_mode", "comparison_status", "content_health", "model_health",
-                        "regression_status", "active"):
+                        "regression_status", "requested_validation_depth", "active"):
                 if key in finding:
                     value = str(finding[key]).lower() if type(finding[key]) is bool else finding[key]
                     lines.append(f"   - {key.replace('_', ' ')}: `{_safe_code(value)}`")

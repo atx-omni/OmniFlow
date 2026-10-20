@@ -107,10 +107,13 @@ An unreferenced breaking change remains visible as risk but does not fail the de
 - `enabled`: defaults to `true`.
 - `fail_on_new_only`: the canonical `.omniflow.yml` explicitly sets `true` to block new issues while reporting unchanged, identity-matched baseline issues. The underlying default for a custom policy that omits this key remains `false` (all current issues block); an explicit `false` remains supported. A passing regression gate is not a clean bill of health for existing content, and malformed/incomplete comparison evidence still blocks.
 - `classify_comment_only`: defaults to `false`. When enabled, classify immutable PR inputs conservatively and report the result. This does not skip content validation or override failures; live content/draft correspondence is not established by Git equality.
+- `force_full_validation`: defaults to `false`. Set `true` to request full-depth API validation for the branch, base, and evidence rereads. Measure runtime before adoption. Existing `omni.timeout` and workflow limits still apply; an error or timeout never triggers a shallower retry.
 - `labels`: optional local filter applied after Omni validates content for the selected model server-side.
 - `OMNI_FAIL_ON_NEW_ONLY` remains an override for content validation only; it never changes model-validation policy.
 
-Omni documents that large documents may receive surface checks unless `force_full_validation` is requested. OmniFlow does not currently expose that parameter; do not add it to policy or interpret a successful response as guaranteed full-depth validation. See the [Content Validator API](https://docs.omni.co/api/content-validator/validate-content).
+Omni documents that large documents may receive surface checks unless `force_full_validation` is requested. Reports expose the safe enum `requested_validation_depth` (`api_default` or `full`), including content failures. This records request intent, not observed exhaustive coverage: `validation_complete` describes execution and available evidence, not full-depth or whole-instance coverage. See the [Content Validator API](https://docs.omni.co/api/content-validator/validate-content).
+
+Standalone content history is scoped to the requested depth. New history uses schema 3 so older clients cannot unknowingly reuse full-depth history. Existing schema-2 history can be reused only at `api_default`; changing depth invalidates the comparison baseline rather than treating it as clean. Live PR comparisons always fetch a fresh base.
 
 ### Model Validation
 
@@ -128,7 +131,7 @@ Known native `.yaml`/`.yml` filename wrappers are matched to their authored API 
 
 Matched existing findings remain visible without blocking that new-only validator; new model errors and new content issues block, while model warnings follow `fail_on_warnings`. Missing, malformed, or ambiguous evidence cannot prove that a finding already existed or that a comparison passed. A pass is not proof of a clean model/content inventory, complete instance health, or causal attribution to the PR. Other configured checks remain independent gates.
 
-Content validation retains the API's default validation depth for both requests. Matching request scope does not guarantee exhaustive content coverage, particularly for large or changing content inventories; record any API coverage limits separately from a passing regression decision.
+Content validation uses the same configured depth for both requests (API default unless opted into full depth). Matching request scope does not guarantee exhaustive content coverage, particularly for large or changing content inventories; record any API coverage limits separately from a passing regression decision.
 
 Orchestrated runs without a branch, post-sync validation, and repair verification enforce strict health for both validators, even when their policy switches are `true`. They must not compare the base against itself or reuse historical issues to obtain a pass. Standalone `content validate` retains its separately selected and scoped history behavior; see [Validation Diagnostics](VALIDATION_DIAGNOSTICS.md).
 

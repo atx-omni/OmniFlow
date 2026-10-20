@@ -21,6 +21,7 @@ from ..diagnostics import safe_exception_message
 from ..discovery import _is_probable_omni_file, _is_under_model_path, discover_contexts, load_flow_metadata
 from ..exceptions import ConfigError, SecurityPolicyError
 from ..git import git_value
+from ..json_evidence import reject_duplicate_keys
 from ..revision_data import FULL_SHA, REPOSITORY, pull_request_changed_files
 
 CHECK_NAME = "OmniFlow deployment readiness"
@@ -54,7 +55,7 @@ class GitHubRepository:
                     value.extend(chunk)
                     if len(value) > max_bytes:
                         raise SecurityPolicyError("GitHub response exceeds its configured size bound")
-                return json.loads(value) if value else None
+                return json.loads(value, object_pairs_hook=reject_duplicate_keys) if value else None
         except (requests.RequestException, ValueError) as exc:
             raise ConfigError("GitHub readiness operation returned unavailable or invalid data") from exc
 

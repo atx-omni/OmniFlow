@@ -415,32 +415,31 @@ class DiscoveryTests(unittest.TestCase):
                 "OMNIFLOW_CHANGED_FILES": "omni/model/views/orders.view",
             }
             with mock.patch.dict(os.environ, env, clear=True):
-                contexts = discover_contexts(auto=True)
+                contexts = discover_contexts(auto=True, changed_files=["omni/model/views/orders.view"])
                 config = load_config(".omniflow.yml")
         self.assertEqual(contexts[0].base_url, "https://trusted.omniapp.co")
         self.assertTrue(config.model_validation.enabled)
 
-    def test_pull_request_target_uses_github_api_file_list(self):
+    def test_pull_request_target_uses_immutable_github_comparison(self):
         with temporary_workdir() as tmp:
             event = {
                 "number": 42,
                 "repository": {"full_name": "acme/analytics"},
                 "pull_request": {
                     "changed_files": 2,
-                    "head": {"ref": "feature/omni", "sha": "a" * 40},
+                    "head": {"ref": "feature/omni", "sha": "a" * 40, "repo": {"full_name": "acme/analytics"}},
+                    "base": {"sha": "b" * 40, "repo": {"full_name": "acme/analytics"}},
                 },
             }
             write_json(tmp / "event.json", event)
-            response = mock.Mock()
-            response.ok = True
-            response.status_code = 200
-            response.json.return_value = [
-                {"filename": "omni/model/views/orders.view"},
+            response = {"files": [
+                {"filename": "omni/model/views/orders.view", "status": "modified"},
                 {
                     "filename": "docs/orders.md",
                     "previous_filename": "omni/model/topics/orders.topic",
+                    "status": "renamed",
                 },
-            ]
+            ]}
             env = {
                 "GITHUB_EVENT_NAME": "pull_request_target",
                 "GITHUB_EVENT_PATH": str(tmp / "event.json"),
@@ -448,18 +447,20 @@ class DiscoveryTests(unittest.TestCase):
                 "OMNIFLOW_GITHUB_TOKEN": "github-token",
             }
             with mock.patch.dict(os.environ, env, clear=True):
-                with mock.patch("omniflow.discovery.requests.get", return_value=response) as request:
+                with mock.patch("omniflow.github.revalidation.GitHubRepository.request", return_value=response) as request:
                     files = get_changed_files()
         self.assertEqual(
             files,
             ["omni/model/views/orders.view", "docs/orders.md", "omni/model/topics/orders.topic"],
         )
-        self.assertFalse(request.call_args.kwargs["allow_redirects"])
-        self.assertEqual(request.call_args.kwargs["headers"]["Authorization"], "Bearer github-token")
+        request.assert_called_once_with("GET", f"/compare/{'b' * 40}...{'a' * 40}")
 
     def test_pull_request_target_without_github_token_fails_closed(self):
         with temporary_workdir() as tmp:
-            event = {"number": 42, "repository": {"full_name": "acme/analytics"}, "pull_request": {}}
+            event = {"number": 42, "repository": {"full_name": "acme/analytics"}, "pull_request": {
+                "head": {"sha": "a" * 40, "repo": {"full_name": "acme/analytics"}},
+                "base": {"sha": "b" * 40, "repo": {"full_name": "acme/analytics"}},
+            }}
             write_json(tmp / "event.json", event)
             env = {
                 "GITHUB_EVENT_NAME": "pull_request_target",
@@ -474,7 +475,10 @@ class DiscoveryTests(unittest.TestCase):
             event = {
                 "number": 42,
                 "repository": {"full_name": "acme/analytics"},
-                "pull_request": {"changed_files": 1},
+                "pull_request": {
+                    "head": {"sha": "a" * 40, "repo": {"full_name": "acme/analytics"}},
+                    "base": {"sha": "b" * 40, "repo": {"full_name": "acme/analytics"}},
+                },
             }
             write_json(tmp / "event.json", event)
             env = {

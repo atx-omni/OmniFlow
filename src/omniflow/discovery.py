@@ -11,10 +11,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-import requests
-
 from .exceptions import ConfigError, SecurityPolicyError
-from .git import current_branch, git_executable, github_event_payload, is_pull_request_event, pr_number
+from .git import current_branch, git_executable, github_event_payload, is_pull_request_event
 from .model_paths import authored_file_identity
 from .security import reject_secret_keys, validate_base_url, validate_branch_name, validate_path_segment
 from .trust import read_trusted_repo_text
@@ -82,10 +80,6 @@ def discover_contexts(
             event_head = (github_event_payload().get("pull_request") or {}).get("head", {}).get("ref")
             if not branch or event_head != branch:
                 raise ConfigError("Version 2 validation requires the exact GitHub PR head branch")
-            if changed_files is None:
-                from .revision_data import pull_request_changed_files
-
-                changed_files = pull_request_changed_files()
         return select_model_contexts(
             flow, changed_files=get_changed_files() if changed_files is None else changed_files,
             marker=load_pr_marker(), branch_name=branch, allow_skip=allow_skip,
@@ -295,9 +289,9 @@ def get_changed_files(base_branch: str | None = None) -> list[str]:
 
     The result is memoized against the environment that determines it, because
     routing, validation, and the breaking-change hold policy all need the same
-    inventory, and the pull_request_target path pays for paginated GitHub API
-    calls to build it. Keying on the environment keeps the cache correct when
-    the surrounding event context changes.
+    inventory. PR comparisons are bound to immutable event revisions, not the
+    current PR file list or checkout. Include those revisions in the cache key
+    even when a caller reuses the same event-file path in one process.
     """
     key = _changed_files_cache_key(base_branch)
     if key in _CHANGED_FILES_CACHE:
@@ -312,16 +306,27 @@ def reset_changed_files_cache() -> None:
 
 
 def _changed_files_cache_key(base_branch: str | None) -> tuple[Any, ...]:
-    return (base_branch, *(os.getenv(name) for name in CHANGED_FILES_CACHE_ENV))
+    key = (base_branch, *(os.getenv(name) for name in CHANGED_FILES_CACHE_ENV))
+    if is_pull_request_event():
+        from .revision_data import pull_request_revision
+
+        return (*key, pull_request_revision("base"), pull_request_revision("head"))
+    return key
 
 
 def _resolve_changed_files(base_branch: str | None = None) -> list[str]:
+    if is_pull_request_event():
+        from .revision_data import pull_request_changed_files
+
+        files = pull_request_changed_files()
+        if files is None:
+            raise ConfigError("Exact pull request changed-file evidence is unavailable")
+        return files
+    # Explicit local inventories are not authority to override an immutable PR.
     explicit = os.getenv("OMNIFLOW_CHANGED_FILES")
     if explicit:
         return [item.strip() for item in explicit.splitlines() if item.strip()]
 
-    if os.getenv("GITHUB_EVENT_NAME") == "pull_request_target":
-        return _github_pull_request_files()
     if os.getenv("GITHUB_EVENT_NAME") == "push":
         return _push_event_files()
 
@@ -590,77 +595,6 @@ def _is_probable_omni_file(path: str) -> bool:
         {"views", "topics", "relationships"}.intersection(parts[:-1])
         and candidate.suffix in {".yaml", ".yml"}
     )
-
-
-def _github_pull_request_files() -> list[str]:
-    token = os.getenv("OMNIFLOW_GITHUB_TOKEN")
-    event = github_event_payload()
-    repository = event.get("repository") if isinstance(event.get("repository"), dict) else {}
-    repo_name = repository.get("full_name") or os.getenv("GITHUB_REPOSITORY")
-    number = pr_number()
-    if not token:
-        raise ConfigError("OMNIFLOW_GITHUB_TOKEN is required to route pull_request_target events safely")
-    if not isinstance(repo_name, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo_name):
-        raise ConfigError("GitHub event payload did not contain a valid repository name")
-    if not number or not number.isdigit():
-        raise ConfigError("GitHub event payload did not contain a valid pull request number")
-
-    api_url = os.getenv("GITHUB_API_URL", "https://api.github.com").rstrip("/")
-    parsed = urlparse(api_url)
-    if (
-        parsed.scheme != "https"
-        or not parsed.hostname
-        or parsed.username
-        or parsed.password
-        or parsed.query
-        or parsed.fragment
-    ):
-        raise SecurityPolicyError("GITHUB_API_URL must be a trusted HTTPS origin")
-
-    files: list[str] = []
-    record_count = 0
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "Authorization": f"Bearer {token}",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-    for page in range(1, 31):
-        try:
-            response = requests.get(
-                f"{api_url}/repos/{repo_name}/pulls/{number}/files",
-                headers=headers,
-                params={"per_page": 100, "page": page},
-                timeout=30,
-                allow_redirects=False,
-            )
-        except requests.RequestException as exc:
-            raise ConfigError("Could not retrieve pull request changed files from GitHub") from exc
-        if not response.ok:
-            raise ConfigError(f"GitHub changed-file lookup failed with HTTP {response.status_code}")
-        try:
-            records = response.json()
-        except ValueError as exc:
-            raise ConfigError("GitHub changed-file lookup returned invalid JSON") from exc
-        if not isinstance(records, list):
-            raise ConfigError("GitHub changed-file lookup returned an unexpected response shape")
-        record_count += len(records)
-        for record in records:
-            if not isinstance(record, dict):
-                continue
-            for key in ("filename", "previous_filename"):
-                value = record.get(key)
-                if isinstance(value, str) and value.strip() and value not in files:
-                    files.append(value.strip())
-        if len(records) < 100:
-            break
-
-    pull_request = event.get("pull_request") if isinstance(event.get("pull_request"), dict) else {}
-    expected_count = pull_request.get("changed_files")
-    if isinstance(expected_count, int) and record_count < expected_count:
-        raise ConfigError(
-            "GitHub returned an incomplete pull request file list; OmniFlow cannot route the change safely"
-        )
-    return files
 
 
 def _push_event_files() -> list[str]:
