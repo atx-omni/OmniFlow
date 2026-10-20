@@ -211,6 +211,89 @@ def test_verified_candidate_proofs_reuse_snapshot_without_extra_omni_reads(repos
     assert Path(".omniflow/repository/report.json").exists()
 
 
+@pytest.mark.parametrize("custom_source", [False, True])
+@pytest.mark.parametrize("use_proofs", [False, True])
+def test_default_filter_and_api_custom_sources_keep_diagnostics_consistent(
+    repository, monkeypatch, custom_source, use_proofs,
+):
+    from omniflow.candidate import verify_candidate
+
+    context, client, policy = repository
+    Path("omni/tooling.yaml").write_text("not: model-source\n")
+    Path("omni/README.md").write_text("Not an Omni source\n")
+    if custom_source:
+        Path("omni/custom.yaml").write_text("dimensions: {}\n")
+    subprocess.run(["git", "add", "omni"], check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "Synthetic scoped sources"], check=True, capture_output=True)
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    policy = RepositoryPolicy(True, "repository_verified", policy.repository, head, policy.base_sha)
+    monkeypatch.setattr("omniflow.repository_diagnostics.resolve_repository_policy", lambda config: policy)
+    original_api = client.get_model_yaml
+
+    def api(*args, **kwargs):
+        payload = original_api(*args, **kwargs)
+        if custom_source and kwargs.get("branch_id"):
+            payload["files"]["custom.yaml"] = "dimensions: {}\n"
+        return payload
+
+    client.get_model_yaml = api
+    proofs = {}
+    if use_proofs:
+        monkeypatch.setattr("omniflow.candidate.pull_request_revision",
+                            lambda side: (policy.head_sha if side == "head" else policy.base_sha, policy.repository))
+        proofs = {f"{side}_proof": verify_candidate(client, context, revision_side=side)
+                  for side in ("head", "base")}
+        assert proofs["head_proof"]["file_count"] == (2 if custom_source else 1)
+    with repository_reporting(object(), output_dir=Path(".omniflow")):
+        issues = findings()
+        evidence = start_repository_context(context, client, branch_id="candidate", **proofs)
+        assert evidence is not None and set(evidence.snapshots) == {"head", "base"}
+        assert set(evidence.snapshots["head"].files) == (
+            {"orders.view", "custom.yaml"} if custom_source else {"orders.view"}
+        )
+        finish_repository_context(evidence, context, client, issues, branch_id="candidate", **proofs)
+        write(report(issues))
+    detail = json.loads(Path(".omniflow/repository/report.json").read_text())
+    assert detail["issues"][0]["file"] == "omni/orders.view"
+
+
+@pytest.mark.parametrize("use_proofs", [False, True])
+def test_custom_only_snapshot_can_be_verified_but_drift_withholds_details(repository, monkeypatch, use_proofs):
+    from omniflow.candidate import verify_candidate
+
+    context, client, policy = repository
+    Path("omni/orders.view").rename("omni/custom.yaml")
+    subprocess.run(["git", "add", "omni"], check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "Synthetic custom source"], check=True, capture_output=True)
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    policy = RepositoryPolicy(True, "repository_verified", policy.repository, head, policy.base_sha)
+    monkeypatch.setattr("omniflow.repository_diagnostics.resolve_repository_policy", lambda config: policy)
+    original_api = client.get_model_yaml
+
+    def api(*args, **kwargs):
+        payload = original_api(*args, **kwargs)
+        if kwargs.get("branch_id"):
+            payload["files"]["custom.yaml"] = payload["files"].pop("orders.view")
+        return payload
+
+    client.get_model_yaml = api
+    proofs = {}
+    if use_proofs:
+        monkeypatch.setattr("omniflow.candidate.pull_request_revision",
+                            lambda side: (policy.head_sha if side == "head" else policy.base_sha, policy.repository))
+        proofs = {f"{side}_proof": verify_candidate(client, context, revision_side=side)
+                  for side in ("head", "base")}
+    with repository_reporting(object(), output_dir=Path(".omniflow")):
+        evidence = start_repository_context(context, client, branch_id="candidate", **proofs)
+        assert evidence is not None and set(evidence.snapshots["head"].files) == {"custom.yaml"}
+        client.get_model_yaml = lambda *args, **kwargs: {"files": {"custom.yaml": "changed: source\n"}}
+        # With no fresh final proof, independently changed API bytes cannot
+        # authorize repository-only detail from the earlier snapshot.
+        finish_repository_context(evidence, context, client, findings(), branch_id="candidate")
+        write(report(findings()))
+    assert not Path(".omniflow/repository/report.json").exists()
+
+
 @pytest.mark.parametrize("repository", [".yaml", ".yml"], indirect=True)
 @pytest.mark.parametrize("use_proofs", [False, True])
 def test_serialized_git_paths_keep_head_base_locations_and_public_privacy(repository, monkeypatch, use_proofs):

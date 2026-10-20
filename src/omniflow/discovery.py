@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 
 from .exceptions import ConfigError, SecurityPolicyError
 from .git import current_branch, git_executable, github_event_payload, is_pull_request_event
-from .model_paths import authored_file_identity
+from .model_paths import is_git_model_file, is_repo_control_file
 from .security import reject_secret_keys, validate_base_url, validate_branch_name, validate_path_segment
 from .trust import read_trusted_repo_text
 
@@ -398,7 +398,10 @@ def select_model_contexts(
             _clear_base_branch_context(context)
         return matched
     if allow_skip and changed_files:
-        unmatched_omni_files = [path for path in changed_files if _is_probable_omni_file(path)]
+        unmatched_omni_files = [
+            path for path in changed_files
+            if _is_unregistered_omni_file(path, [context.model_path for context in models])
+        ]
         if unmatched_omni_files:
             sample = ", ".join(unmatched_omni_files[:3])
             raise ConfigError(
@@ -535,12 +538,8 @@ def _select_target_contexts(
             raise SecurityPolicyError("PR marker does not match the trusted target path and PR head branch")
         selected.append(context)
     for path in changed_files:
-        matching = [context for context in models if _is_under_model_path(path, context.model_path) or (
-            context.model_path == "." and Path(path).suffix.lower() in {".yaml", ".yml"}
-        )]
-        if not matching and (_is_probable_omni_file(path) or any(
-            _is_under_model_path(path, context.model_path) for context in registered
-        )):
+        matching = [context for context in models if _is_under_model_path(path, context.model_path)]
+        if not matching and _is_unregistered_omni_file(path, [context.model_path for context in registered]):
             raise ConfigError("Omni files changed outside every model_path in the selected target environment")
         for context in matching:
             if context not in selected:
@@ -566,11 +565,29 @@ def _validate_pull_request_base_branch(contexts: list[ModelContext]) -> None:
 
 
 def _is_under_model_path(path: str, model_path: str) -> bool:
+    relative = _model_relative_path(path, model_path)
+    return relative is not None and is_git_model_file(relative)
+
+
+def _model_relative_path(path: str, model_path: str) -> str | None:
+    """Scope a changed path before recognizing model-root reserved names."""
     normalized_path = path.strip().strip("/")
     normalized_model_path = model_path.strip().strip("/")
+    if is_repo_control_file(normalized_path):
+        return None
     if normalized_model_path == ".":
-        return _is_probable_omni_file(normalized_path)
-    return normalized_path == normalized_model_path or normalized_path.startswith(f"{normalized_model_path}/")
+        return normalized_path
+    prefix = normalized_model_path + "/"
+    return normalized_path[len(prefix):] if normalized_path.startswith(prefix) else None
+
+
+def _is_unregistered_omni_file(path: str, model_paths: list[str]) -> bool:
+    """Do not mistake ancillary files in a known scope for unregistered models."""
+    relatives = [_model_relative_path(path, scope) for scope in model_paths]
+    contained = [relative for relative in relatives if relative is not None]
+    if contained:
+        return any(is_git_model_file(relative) for relative in contained)
+    return _is_probable_omni_file(path)
 
 
 def _clear_base_branch_context(context: ModelContext) -> None:
@@ -581,20 +598,12 @@ def _clear_base_branch_context(context: ModelContext) -> None:
 
 
 def _is_probable_omni_file(path: str) -> bool:
-    normalized = path.strip().strip("/").lower()
-    if authored_file_identity(normalized) != normalized:
-        return True
-    candidate = Path(normalized)
-    name = candidate.name
-    if name in {"model", "model.yaml", "model.yml", "relationships", "relationships.yaml", "relationships.yml"}:
-        return True
-    if any(name.endswith(suffix) for suffix in (".view", ".topic", ".composite_topic", ".relationships")):
-        return True
-    parts = candidate.parts
-    return bool(
-        {"views", "topics", "relationships"}.intersection(parts[:-1])
-        and candidate.suffix in {".yaml", ".yml"}
-    )
+    normalized = path.strip().strip("/")
+    if is_repo_control_file(normalized):
+        return False
+    # Without a registration, any containing directory could be a model root.
+    # Inside registered paths callers instead classify relative to that scope.
+    return is_git_model_file(normalized) or is_git_model_file(Path(normalized).name)
 
 
 def _push_event_files() -> list[str]:

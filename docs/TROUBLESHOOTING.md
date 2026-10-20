@@ -47,7 +47,7 @@ for reviewed ancillary files. No mismatch paths or rule text are made public.
 
 | Reason | What to check |
 | --- | --- |
-| `file_inventory_mismatch` | Check the exact trusted `model_path`, initial model export, and Git/Omni synchronization for that scope. Unknown YAML remains included; reviewed Git-only ancillary files may use narrow trusted `files.non_omni` rules. |
+| `file_inventory_mismatch` | Check the exact trusted `model_path`, initial model export, and Git/Omni synchronization for that scope. Git-only generic YAML is ignored automatically; recognized Omni sources and generic YAML returned by Omni still require matching Git counterparts. |
 | `ambiguous_file_identity` | Resolve duplicate exports such as both `orders.view` and `orders.view.yaml`, or both `.yaml` and `.yml`. Even identical duplicate contents are ambiguous. |
 | `content_mismatch` | File identities match, but bytes differ. Save/synchronize the intended Omni branch or base and its corresponding PR Git revision. Comments and whitespace still count as byte differences. |
 | `changed_during_validation` | The snapshot changed during the checks. Let synchronization finish, then rerun against the current PR revision. |
@@ -59,8 +59,9 @@ for reviewed ancillary files. No mismatch paths or rule text are made public.
 or `.yml` on known Omni names: root `model`, root `relationships`, and typed
 `.view`, `.query.view`, `.topic`, `.composite_topic`, `.relationships` files.
 For example, Git `SCHEMA/orders.view.yaml` can match API `SCHEMA/orders.view`.
-Directories, capitalization and spaces stay significant; all file contents must
-still match exactly. Unknown YAML names and repeated suffixes are not guessed away.
+Directories, capitalization and spaces stay significant; all authored source contents
+must still match exactly. Generic API-authored filenames require exact counterparts;
+unknown names and repeated suffixes do not acquire guessed aliases.
 
 Older Action pins can report `file_inventory_mismatch` even when native exported
 files and API files have identical contents. Upgrade **every** applicable OmniFlow
@@ -100,11 +101,17 @@ Checks marked `not_run`, including contracts or lint, have not passed.
 ### Ancillary YAML Is Not An Omni Model File
 
 Do not move `.omni/flow.json`, rename real source files, or use a blanket exclusion.
-An authorized maintainer can add a narrow `files.non_omni` rule to the trusted
-root policy for a Git-only ancillary file, with `tag`, repository-relative
-`pattern`, and a short `reason`. Both base and candidate are checked against
-Omni's authored inventory; a matching Omni source or conflicting rule still
-blocks. See the [supported pattern grammar](CONFIGURATION.md#trusted-non-omni-file-classification).
+Current revisions automatically ignore ordinary Git-only generic YAML during
+candidate verification and do not route it as Omni source solely because it is
+inside a model folder. No `files.non_omni` rule is needed for that default.
+If Omni's authored API returns the file, however, it is retained as source and
+must match its Git counterpart exactly.
+
+Optional reviewed rules still require `tag`, repository-relative `pattern`, and
+`reason`; they cannot hide known or API-returned Omni sources on either side.
+Custom API-authored generic YAML-only PRs are not automatically routed: use
+standard native export names or explicit registered-model selection. See
+[source families and pattern grammar](CONFIGURATION.md#trusted-non-omni-file-classification).
 
 ### Existing Lint Debt Still Appears In The Report
 

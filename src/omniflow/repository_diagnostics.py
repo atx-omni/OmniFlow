@@ -23,6 +23,7 @@ from .candidate import (
     _remote_tree,
     _safe_path,
     _semantic_inventory,
+    _source_inventory,
 )
 from .exceptions import ConfigError, SecurityPolicyError
 from .file_scope import excluded_semantic_paths
@@ -154,15 +155,20 @@ def _verified_text(policy: RepositoryPolicy, sha: str, entry: dict, *, max_bytes
     return text
 
 
-def _load_snapshot(policy: RepositoryPolicy, model_path: str, side: str, *, non_omni_rules=()) -> Snapshot:
+def _load_snapshot(
+    policy: RepositoryPolicy, model_path: str, side: str, *, non_omni_rules=(), api_files: dict | None = None,
+    allow_empty: bool = False,
+) -> Snapshot:
     sha = policy.head_sha if side == "head" else policy.base_sha
     model_path = "." if model_path == "." else _safe_path(model_path)
     entries = _tree(policy, sha)
-    inventory = _semantic_inventory(entries, model_path)
+    inventory = _semantic_inventory(entries, model_path, include_unrecognized=True)
+    identity_index(inventory)
     if non_omni_rules:
-        excluded = excluded_semantic_paths(inventory, {}, model_path=model_path, rules=non_omni_rules)
+        excluded = excluded_semantic_paths(inventory, api_files or {}, model_path=model_path, rules=non_omni_rules)
         inventory = {path: entry for path, entry in inventory.items() if path not in excluded}
-    if not inventory:
+    inventory = _source_inventory(inventory, api_files or {})
+    if not inventory and not allow_empty:
         raise ConfigError("Repository diagnostic snapshot is empty")
     # Snapshot keys and digests remain exact Git paths. Independently reject
     # ambiguous serialization aliases even when a candidate proof is supplied.
@@ -179,14 +185,14 @@ def _load_snapshot(policy: RepositoryPolicy, model_path: str, side: str, *, non_
 
 
 def _matches(snapshot: Snapshot, *, proof: dict | None, side: str, client: Any,
-             context: Any, branch_id: str | None) -> bool:
+             context: Any, branch_id: str | None, api_files: dict | None = None) -> bool:
     if proof:
         return (proof.get("status") in {"verified", "pending_recheck"}
                 and proof.get("method") == "authored_yaml_snapshot"
                 and proof.get(f"{side}_sha") == snapshot.sha
                 and proof.get("snapshot_digest") == snapshot.digest
                 and proof.get("file_count") == len(snapshot.files))
-    actual = _api_files(client.get_model_yaml(
+    actual = api_files if api_files is not None else _api_files(client.get_model_yaml(
         context.model_id, branch_id=branch_id if side == "head" else None,
         mode="combined", include_checksums=False, fully_resolved=False,
     ))
@@ -213,8 +219,25 @@ def start_repository_context(context: Any, client: Any, *, branch_id: str | None
             # candidate proof; an unverified rule cannot authorize disclosure.
             if non_omni_rules and not proof:
                 continue
-            snapshot = _load_snapshot(state.policy, context.model_path, side, non_omni_rules=non_omni_rules)
-            if _matches(snapshot, proof=proof, side=side, client=client, context=context, branch_id=branch_id):
+            # The common recognized-source case can reuse the live candidate
+            # proof without another API call. Custom API filenames need the
+            # same API-aware selection used by candidate verification.
+            if proof:
+                snapshot = _load_snapshot(
+                    state.policy, context.model_path, side, non_omni_rules=non_omni_rules, allow_empty=True,
+                )
+                if _matches(snapshot, proof=proof, side=side, client=client, context=context, branch_id=branch_id):
+                    evidence.snapshots[side] = snapshot
+                    continue
+            actual = _api_files(client.get_model_yaml(
+                context.model_id, branch_id=branch_id if side == "head" else None,
+                mode="combined", include_checksums=False, fully_resolved=False,
+            ))
+            snapshot = _load_snapshot(
+                state.policy, context.model_path, side, non_omni_rules=non_omni_rules, api_files=actual,
+            )
+            if _matches(snapshot, proof=proof, side=side, client=client, context=context,
+                        branch_id=branch_id, api_files=actual):
                 evidence.snapshots[side] = snapshot
     except Exception:
         # Detail unavailable is never a new validation error or an excuse to

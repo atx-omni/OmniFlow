@@ -88,10 +88,34 @@ The file must contain a non-empty YAML mapping; a blank file or comments alone d
 
 ## Trusted Non-Omni File Classification
 
-Use `files.non_omni` only for reviewed ancillary Git files that are not authored
-Omni sources. It is not a validator ignore list and does not disable routing or
-other checks. Unknown YAML inside a model directory remains included unless a
-trusted rule safely classifies it.
+Automatic Git routing recognizes these Omni families, case-sensitively:
+
+- `model` and `relationships` at the root of the registered `model_path`.
+- `*.view`, including `*.query.view`, and `*.topic` at any depth.
+- Existing `*.composite_topic` and typed `*.relationships` compatibility at any depth.
+- Each native name above may have one `.yaml` or `.yml` export suffix.
+
+Generic YAML such as `metadata/config.yaml`, and unrelated regular files such as Markdown or scripts, do not
+trigger model validation solely by being inside a model directory. Workflow,
+policy and model-registry files remain separate trusted controls. Candidate/base
+verification also ignores Git-only generic YAML automatically, so no ancillary
+rule is needed for ordinary tooling files.
+
+The API is not filtered by that Git routing rule. When Omni returns a generic
+YAML file in its authored inventory, the corresponding Git file is retained and
+verified exactly, including its content. Unsupported API formats, missing source
+counterparts, ambiguous aliases, unsafe paths and real byte mismatches still
+cannot produce a verified pass.
+
+**Limitation:** filename-only routing cannot discover a custom generic API-authored
+file when that file is the PR's only change. Prefer standard native export names
+or explicitly select the registered model through the supported
+[context marker](../README.md#trust-and-routing) or explicit validation flow.
+Standalone health validation is not a substitute for verified PR provenance.
+
+`files.non_omni` remains an optional, reviewed classification of ancillary Git
+files—not a validator ignore list or a way to bypass other checks. Explicit
+rules cannot hide any known or API-returned Omni source.
 
 ```yaml
 files:
@@ -201,7 +225,7 @@ In PR branch validation, each enabled new-only validator fetches the live-base r
 
 New-only PR validation requires immutable Git base/head revisions and verifies live authored model YAML against those revisions before and after the checks: the Omni candidate must match the PR head, and the live base must match the trusted Git base. Unavailable, unverifiable, or out-of-sync snapshots block in strict mode; the narrow onboarding advisory exception above still reports incomplete evidence, never a verified pass. A missing repository or identity override cannot replace this evidence. These before/after observations are sampled consistency checks, not an atomic lock over live models, content, or drafts.
 
-Known native `.yaml`/`.yml` filename wrappers are matched to their authored API identities without changing paths or content. Reviewed `files.non_omni` rules can classify Git-only ancillary files as described above; they cannot hide Omni sources. Duplicate aliases remain hard failures. Other extra/missing files and byte differences prevent a verified comparison. See [candidate verification troubleshooting](TROUBLESHOOTING.md#candidate-verification-git-and-omni-snapshots-differ) for safe counts, reason categories and upgrade guidance.
+Known native `.yaml`/`.yml` filename wrappers are matched to their authored API identities without changing paths or content. Git-only generic YAML is ignored automatically; generic YAML present in Omni's authored API inventory remains included and must match exactly. Reviewed `files.non_omni` rules cannot hide those API sources or recognized Omni families. Duplicate aliases remain hard failures. Extra/missing authored source files and byte differences prevent a verified comparison. See [candidate verification troubleshooting](TROUBLESHOOTING.md#candidate-verification-git-and-omni-snapshots-differ) for safe counts, reason categories and upgrade guidance.
 
 Matched existing findings remain visible without blocking that new-only validator; new model errors and new content issues block, while model warnings follow `fail_on_warnings`. Missing, malformed, or ambiguous evidence cannot prove that a finding already existed or that a comparison passed. A pass is not proof of a clean model/content inventory, complete instance health, or causal attribution to the PR. Other configured checks remain independent gates.
 

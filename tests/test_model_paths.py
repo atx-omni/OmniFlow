@@ -1,7 +1,13 @@
 import pytest
 
 from omniflow.discovery import _is_probable_omni_file, _is_under_model_path
-from omniflow.model_paths import AmbiguousModelPath, authored_file_identity, identity_index, is_semantic_file
+from omniflow.model_paths import (
+    AmbiguousModelPath,
+    authored_file_identity,
+    identity_index,
+    is_git_model_file,
+    is_semantic_file,
+)
 
 
 @pytest.mark.parametrize("path,expected", [
@@ -59,3 +65,21 @@ def test_candidate_and_analysis_use_the_same_file_classifier(path):
 
     assert is_semantic_file(path)
     assert _semantic_path(path) == _is_yaml_model_file(Path(path))
+
+
+@pytest.mark.parametrize("path", [
+    "model", "model.yaml", "model.yml", "relationships", "relationships.yaml", "relationships.yml",
+    "SCHEMA/orders.view", "SCHEMA/orders.view.yaml", "A Space/orders.query.view.yml",
+    "sales.topic", "sales.topic.yaml", "sales.composite_topic.yml", "joins.relationships.yaml",
+])
+def test_git_defaults_only_recognize_omni_families(path):
+    assert is_git_model_file(path)
+
+
+@pytest.mark.parametrize("path", [
+    "README.md", "query.sql", "data.csv", "metadata.json", ".DS_Store", "settings.yaml", "schema.yml",
+    "views/orders.yaml", "topics/tooling.yml", "nested/model.yaml", "nested/relationships",
+    "Model.yaml", "orders.VIEW.yaml", "orders.view.yaml.yaml",
+])
+def test_unrelated_git_files_are_not_model_sources(path):
+    assert not is_git_model_file(path)

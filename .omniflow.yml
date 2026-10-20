@@ -12,7 +12,10 @@ validation:
   # an enabled breaking-change hold prevents advisory downgrade.
   mode: strict
 
-# Optional trusted classification of Git-only ancillary files inside model paths.
+# Optional reviewed ancillary classification; NOT required for ordinary tooling
+# YAML. Automatic routing uses recognized Omni source families, and candidate
+# verification ignores Git-only generic YAML. Generic YAML returned by Omni's
+# authored API is still a source and must match its Git counterpart exactly.
 # Patterns are repository-relative, not relative to model_path. A rule cannot
 # exclude a known Omni source, an API-returned source, or a control/policy file.
 # Matching files must be absent from the corresponding Omni snapshot on each side.

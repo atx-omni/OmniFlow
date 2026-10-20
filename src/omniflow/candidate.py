@@ -14,7 +14,14 @@ from typing import Any
 from .exceptions import ConfigError, OmniFlowError
 from .file_scope import FileScopeError, NonOmniRule, excluded_semantic_paths
 from .git import git_executable
-from .model_paths import AmbiguousModelPath, identity_index, is_semantic_file
+from .model_paths import (
+    AmbiguousModelPath,
+    authored_file_identity,
+    identity_index,
+    is_git_model_file,
+    is_repo_control_file,
+    is_semantic_file,
+)
 from .revision_data import FULL_SHA, pull_request_revision, read_git_text, read_github_text
 from .yaml_security import MAX_YAML_FILE_BYTES, MAX_YAML_FILES, MAX_YAML_TOTAL_BYTES
 
@@ -85,7 +92,7 @@ def _verify_snapshot(
     except _GitUnavailable:
         entries = _remote_tree(repository, sha)
         remote = True
-    expected = _semantic_inventory(entries, model_path)
+    expected = _semantic_inventory(entries, model_path, include_unrecognized=True)
     if not expected:
         raise CandidateVerificationError("empty_git_snapshot")
 
@@ -110,8 +117,9 @@ def _verify_snapshot(
         raise CandidateVerificationError(exc.file_scope_reason, **counts) from None
     if excluded:
         expected = {path: entry for path, entry in expected.items() if path not in excluded}
-        expected_names = identity_index(expected)
-        counts["git_file_count"] = len(expected)
+    expected = _source_inventory(expected, actual)
+    expected_names = identity_index(expected)
+    counts["git_file_count"] = len(expected)
     if not expected:
         raise CandidateVerificationError("empty_git_snapshot", **counts)
     counts.update(git_only_count=len(expected_names.keys() - actual_names.keys()),
@@ -235,12 +243,31 @@ def _api_files(payload: Any) -> dict[str, bytes]:
     return result
 
 
-def _semantic_inventory(entries: list[dict], model_path: str) -> dict[str, dict]:
+def _source_inventory(inventory: dict[str, dict], api_files: dict) -> dict[str, dict]:
+    """Keep recognized Git sources and exact API-confirmed custom YAML names.
+
+    Unrelated Git-only YAML is ignored without reading its contents. API source
+    evidence is never discarded merely because its name is not a default.
+    """
+    api_names = identity_index(api_files)
+    selected = {
+        path: entry for path, entry in inventory.items()
+        if is_git_model_file(path) or authored_file_identity(path) in api_names
+    }
+    if (len(selected) > MAX_YAML_FILES
+            or any(entry["size"] > MAX_YAML_FILE_BYTES for entry in selected.values())
+            or sum(entry["size"] for entry in selected.values()) > MAX_YAML_TOTAL_BYTES):
+        raise CandidateVerificationError("snapshot_limit_exceeded")
+    return selected
+
+
+def _semantic_inventory(
+    entries: list[dict], model_path: str, *, include_unrecognized: bool = False,
+) -> dict[str, dict]:
     if len(entries) > MAX_TREE_ENTRIES:
         raise CandidateVerificationError("snapshot_limit_exceeded")
     seen: set[str] = set()
     selected: dict[str, dict] = {}
-    total = 0
     prefix = "" if model_path == "." else model_path + "/"
     ancestors = {str(parent) for parent in PurePosixPath(model_path).parents if str(parent) != "."}
     for entry in entries:
@@ -252,7 +279,7 @@ def _semantic_inventory(entries: list[dict], model_path: str) -> dict[str, dict]
         seen.add(path)
         # These repository-control files are not Omni authored model files,
         # including when the registered model lives at the repository root.
-        if path in {".omniflow.yml", ".omniflow.example.yml"} or path.startswith((".omni/", ".github/", ".omniflow/")):
+        if is_repo_control_file(path):
             continue
         if path == model_path or path in ancestors:
             if entry.get("type") != "tree" or entry.get("mode") != "040000":
@@ -265,16 +292,15 @@ def _semantic_inventory(entries: list[dict], model_path: str) -> dict[str, dict]
         if entry.get("type") != "blob" or entry.get("mode") not in {"100644", "100755"}:
             raise CandidateVerificationError("unsafe_git_entry")
         relative = path[len(prefix):]
-        if not _semantic_path(relative):
+        if not (is_semantic_file(relative) if include_unrecognized else is_git_model_file(relative)):
             continue
         size, blob_sha = entry.get("size"), entry.get("sha")
         if type(size) is not int or size < 0 or not isinstance(blob_sha, str) or not FULL_SHA.fullmatch(blob_sha):
             raise CandidateVerificationError("invalid_git_inventory")
-        total += size
-        if size > MAX_YAML_FILE_BYTES or total > MAX_YAML_TOTAL_BYTES or len(selected) >= MAX_YAML_FILES:
-            raise CandidateVerificationError("snapshot_limit_exceeded")
         selected[relative] = entry
-    return selected
+    # A broad inventory is bounded by tree limits. Source byte/count limits
+    # apply after API correspondence so unrelated YAML cannot exhaust them.
+    return selected if include_unrecognized else _source_inventory(selected, {})
 
 
 def _bounded_git(args: list[str], *, root: Path, limit: int) -> bytes:

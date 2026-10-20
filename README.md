@@ -345,6 +345,28 @@ The example uses GitHub's `pull_request_target` event but never checks out or ex
 
 Do not add steps that check out and execute pull-request code in this privileged workflow. Keep ordinary dbt tests and application builds in separate `pull_request` workflows without the Omni secret.
 
+Automatic routing recognizes Omni source families within each registered model
+directory: root `model` and `relationships`, plus `*.view` (including
+`*.query.view`), `*.topic`, `*.composite_topic`, and `*.relationships` at any depth.
+Each accepts its native name or one `.yaml`/`.yml` export suffix. Here “root”
+means the root of `model_path`, not necessarily the repository root.
+Unrelated generic YAML and other regular files, such as Markdown or scripts, do not trigger model validation
+merely because they share that directory. Workflow, policy and registry files
+remain separate trusted controls.
+
+During a selected model's candidate/base verification, Git-only generic YAML is
+ignored automatically; no `files.non_omni` rule is required for ordinary tooling
+YAML. A generic YAML file **returned by Omni's authored API**, however, remains
+authoritative: its exact Git counterpart and bytes must match, and an exclusion
+rule cannot hide it. Unsupported API files fail closed rather than disappearing
+from evidence. Paths, capitalization, source aliases and safety checks are unchanged.
+
+**Custom-name limitation:** a PR changing only an API-authored file with an
+unrecognized generic YAML name is not automatically routed from its filename.
+Use standard native export names or explicitly select the registered model for
+validation, such as the context marker below. Filename-only routing does not
+discover every possible API-authored custom name.
+
 An optional marker can select a model for a content-only or otherwise ambiguous pull request:
 
 ```html

@@ -15,13 +15,27 @@ SEMANTIC_SUFFIXES = frozenset((*_AUTHORED_SUFFIXES, ".yaml", ".yml"))
 
 
 def is_semantic_file(path: str) -> bool:
-    """Classify an already-scoped path without changing its case or identity.
-
-    Candidate verification and snapshot analysis must accept the same authored
-    formats. Repository routing still applies its own model-scope boundaries.
-    """
+    """Accept authored API/snapshot formats, including API-confirmed custom YAML."""
     value = PurePosixPath(path)
     return value.name in {"model", "relationships"} or value.suffix in SEMANTIC_SUFFIXES
+
+
+def is_git_model_file(path: str) -> bool:
+    """Recognize model-relative Omni sources, not arbitrary repository YAML.
+
+    Keep native API names and supported Git serialization wrappers equivalent.
+    Reserved model/relationships names belong at the registered model root.
+    Custom YAML names require API evidence once a model is explicitly selected.
+    """
+    identity = authored_file_identity(path)
+    return identity in {"model", "relationships"} or identity.endswith(_AUTHORED_SUFFIXES)
+
+
+def is_repo_control_file(path: str) -> bool:
+    """Repository-relative control files have their own validation, not model checks."""
+    return path in {".omniflow.yml", ".omniflow.example.yml"} or path.startswith(
+        (".omni/", ".github/", ".omniflow/")
+    )
 
 
 class AmbiguousModelPath(ValueError):
