@@ -161,9 +161,15 @@ def test_pr_policy_cannot_classify_itself_using_head_changes(tmp_path, monkeypat
     Path(".omniflow.yml").write_text("checks: {}\n")
     git("add", ".omniflow.yml")
     git("commit", "-m", "Trusted policy")
-    git("update-ref", "refs/remotes/origin/main", git("rev-parse", "HEAD"))
+    base_sha = git("rev-parse", "HEAD")
+    git("update-ref", "refs/remotes/origin/main", base_sha)
     git("switch", "-c", "candidate")
     Path(".omniflow.yml").write_text(json.dumps({"files": {"non_omni": [rule()]}}))
     monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request_target")
     monkeypatch.setenv("GITHUB_BASE_REF", "main")
+    event_path = tmp_path / "event.json"
+    event_path.write_text(json.dumps({"pull_request": {
+        "base": {"sha": base_sha, "repo": {"full_name": "test/models"}},
+    }}))
+    monkeypatch.setenv("GITHUB_EVENT_PATH", str(event_path))
     assert load_config(".omniflow.yml").files.non_omni == []
