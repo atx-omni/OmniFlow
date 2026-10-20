@@ -8,6 +8,7 @@ API prose never do. Conservative omissions are intentional, not DLP guarantees.
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -16,11 +17,12 @@ from yaml.events import AliasEvent, MappingEndEvent, MappingStartEvent, Sequence
 from yaml.nodes import MappingNode, ScalarNode, SequenceNode
 
 from .diagnostic_catalog import CHANGE_MESSAGES, LINT_MESSAGES
-from .model_paths import AmbiguousModelPath, authored_file_identity, identity_index
+from .model_paths import AmbiguousModelPath, authored_file_identity, filename_identity, identity_index
 from .security import redact
 from .semantic_files import infer_file_kind
 
-MAX_FILES = 1_000
+MAX_FILES = 10_000
+MAX_INVENTORY_FILES = 100_000
 MAX_FILE_BYTES = 512 * 1024
 MAX_TOTAL_BYTES = 5 * 1024 * 1024
 MAX_DEPTH = 32
@@ -68,11 +70,16 @@ def _identifier(value: Any) -> bool:
 
 
 def _path(value: Any) -> bool:
-    return (_safe_text(value) and len(value) <= 240 and ".." not in value
-            and all(_SEGMENT.fullmatch(part) for part in value.split("/")))
+    # Paths are metadata in an independently authorized repository artifact,
+    # not public output. Spaces/Unicode are legitimate; control characters,
+    # traversal and URL/shell-like delimiters are not acceptable display paths.
+    return (_safe_text(value) and len(value) <= 512
+            and all(char.isalnum() or unicodedata.category(char)[0] == "M" or char in " /._-" for char in value)
+            and all(unicodedata.category(char)[0] != "C" for char in value)
+            and all(part not in {"", ".", ".."} and part == part.strip() for part in value.split("/")))
 
 
-def _parse(text: str) -> MappingNode | None:
+def _parse(text: str) -> MappingNode | SequenceNode | None:
     """Bound before composition; reject aliases, tags and ambiguous mapping keys."""
     try:
         if len(text.encode("utf-8")) > MAX_FILE_BYTES:
@@ -90,7 +97,7 @@ def _parse(text: str) -> MappingNode | None:
             elif isinstance(event, (MappingEndEvent, SequenceEndEvent)):
                 depth -= 1
         root = yaml.compose(text, Loader=yaml.SafeLoader)
-        if not isinstance(root, MappingNode) or not _unambiguous(root):
+        if not isinstance(root, (MappingNode, SequenceNode)) or not _unambiguous(root):
             return None
         return root
     except (yaml.YAMLError, UnicodeError, RecursionError):
@@ -165,51 +172,114 @@ class _File:
 
 
 class SnapshotIndex:
-    def __init__(self, model_path: str, files: dict[str, str]):
+    def __init__(self, model_path: str, files: dict[str, str], *,
+                 api_aliases: dict[str, str] | None = None,
+                 canonical_view_names: dict[str, str] | None = None):
         self._files: dict[str, _File] = {}
         self._references: dict[str, set[str]] = {}
+        self._filename_references: dict[str, set[str]] = {}
         self._identities: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        self._canonical_views: dict[str, str] = {}
         self._model_path = model_path
-        if (model_path != "." and not _path(model_path)) or not isinstance(files, dict) or len(files) > MAX_FILES:
+        self._pending: dict[str, str] = {}
+        self._parsed: set[str] = set()
+        self._parse_success: set[str] = set()
+        self._parsed_bytes = 0
+        self._identity_complete = False
+        self.unavailable_reason = "source_location_unmapped"
+        if model_path != "." and not _path(model_path):
+            self.unavailable_reason = "unsupported_source_path"
+            return
+        if not isinstance(files, dict) or len(files) > MAX_INVENTORY_FILES:
+            self.unavailable_reason = "source_inventory_limit"
             return
         try:
             identity_index(path for path in files if _path(path))
         except AmbiguousModelPath:
+            self.unavailable_reason = "ambiguous_source_location"
             return
-        total = 0
         for path, text in files.items():
             if not _path(path) or not isinstance(text, str):
                 continue
             if (path.rsplit("/", 1)[-1] not in {"model", "relationships"}
                     and not path.endswith((".view", ".topic", ".composite_topic", ".relationships", ".yaml", ".yml"))):
                 continue
-            try:
-                total += len(text.encode("utf-8"))
-            except UnicodeError:
-                continue
-            if total > MAX_TOTAL_BYTES:
-                self._files.clear()
-                self._references.clear()
-                self._identities.clear()
-                return
-            root = _parse(text)
-            if root is None:
-                continue
             repo_path = path if model_path == "." else f"{model_path}/{path}"
             if not _path(repo_path):
                 continue
             item = _File(repo_path)
             self._files[path] = item
+            self._pending[path] = text
             identity = authored_file_identity(path)
             identity_repo_path = identity if model_path == "." else f"{model_path}/{identity}"
             # Aliases only identify this already verified Git file; source
             # coordinates always retain its original serialization suffix.
             for reference in {path, repo_path, identity, identity_repo_path}:
                 self._references.setdefault(reference, set()).add(path)
-            self._index_paths(item, root)
-            # A nested basename cannot establish a scoped canonical view name.
-            default_name = _stem(path) if "/" not in path else None
-            self._index_identities(item, root, _authored_kind(path, root), default_name)
+            self._filename_references.setdefault(filename_identity(path), set()).add(path)
+        # Callers supply these only after independent scope, inventory and byte
+        # verification. API directory labels must not choose between duplicates.
+        for reference, path in (api_aliases or {}).items():
+            if path not in self._files or not _path(reference):
+                continue
+            identity = authored_file_identity(reference)
+            for alias in {reference, identity}:
+                self._references.setdefault(alias, set()).add(path)
+                if model_path != ".":
+                    self._references.setdefault(f"{model_path}/{alias}", set()).add(path)
+        names_by_path: dict[str, list[str]] = {}
+        for name, path in (canonical_view_names or {}).items():
+            if path in self._files and isinstance(name, str):
+                names_by_path.setdefault(path, []).append(name)
+        self._canonical_views = {path: names[0] for path, names in names_by_path.items() if len(names) == 1}
+
+    def _parse_file(self, path: str) -> bool:
+        if path in self._parsed:
+            return path in self._parse_success
+        text = self._pending[path]
+        try:
+            size = len(text.encode("utf-8"))
+        except UnicodeError:
+            self.unavailable_reason = "unsupported_source_yaml"
+            return False
+        if len(self._parsed) >= MAX_FILES or self._parsed_bytes + size > MAX_TOTAL_BYTES:
+            self.unavailable_reason = "source_index_budget"
+            return False
+        self._parsed.add(path)
+        self._parsed_bytes += size
+        root = _parse(text)
+        # Relationships are valid as a root sequence, but cannot define a view
+        # identity. They must not invalidate identity coverage of other files.
+        if isinstance(root, SequenceNode):
+            identity = filename_identity(path)
+            if identity == "relationships" or identity.endswith(".relationships"):
+                self._parse_success.add(path)
+                return True
+            root = None
+        if root is None:
+            self.unavailable_reason = "unsupported_source_yaml"
+            return False
+        item = self._files[path]
+        self._index_paths(item, root)
+        default_name = _stem(path) if "/" not in path else None
+        self._index_identities(item, root, _authored_kind(path, root), default_name,
+                               canonical_name=self._canonical_views.get(path))
+        self._parse_success.add(path)
+        return True
+
+    def _ensure_identities(self) -> bool:
+        if self._identity_complete:
+            return True
+        # Identity-only lookup must inspect the full scope to rule out duplicates.
+        # Exact file/key lookups remain useful even when this budget is exceeded.
+        if len(self._pending) > MAX_FILES:
+            self.unavailable_reason = "source_index_budget"
+            return False
+        for path in self._pending:
+            if not self._parse_file(path):
+                return False
+        self._identity_complete = True
+        return True
 
     def _index_paths(self, item: _File, node: MappingNode, prefix: tuple[str, ...] = ()) -> None:
         for key, value in node.value:
@@ -227,7 +297,8 @@ class SnapshotIndex:
         item.identities[path] = location
         self._identities.setdefault((kind, name), []).append(location)
 
-    def _index_identities(self, item: _File, root: MappingNode, kind: str | None, default_name: str | None) -> None:
+    def _index_identities(self, item: _File, root: MappingNode, kind: str | None, default_name: str | None,
+                          *, canonical_name: str | None = None) -> None:
         members = _members(root)
         if kind == "model":
             topics = members.get("topics", (None, None))[1]
@@ -243,8 +314,10 @@ class SnapshotIndex:
             return
         name_values = [value.value for key in ("name", kind) if key in members
                        for value in [members[key][1]] if isinstance(value, ScalarNode)]
-        name = name_values[0] if name_values else default_name
-        if len(set(name_values)) > 1 or not _identifier(name):
+        name = canonical_name if kind == "view" and canonical_name is not None else (
+            name_values[0] if name_values else default_name
+        )
+        if (canonical_name is None and len(set(name_values)) > 1) or not _identifier(name):
             return
         line = next((members[key][0].start_mark.line + 1 for key in ("name", kind) if key in members),
                     root.start_mark.line + 1)
@@ -261,15 +334,23 @@ class SnapshotIndex:
     def _file(self, reference: Any) -> _File | None:
         if not _path(reference):
             return None
+        # Prefer exact Git/verified API aliases. A filename-only fallback is
+        # permitted only when unique across the complete model snapshot.
         references = {reference, authored_file_identity(reference)}
         prefix = f"{self._model_path}/"
         if self._model_path != "." and reference.startswith(prefix):
             references.add(prefix + authored_file_identity(reference[len(prefix):]))
         matches = set().union(*(self._references.get(path, set()) for path in references))
-        return self._files[next(iter(matches))] if len(matches) == 1 else None
+        if not matches:
+            matches = self._filename_references.get(filename_identity(reference), set())
+        if len(matches) != 1:
+            self.unavailable_reason = "ambiguous_source_location" if matches else "source_location_unmapped"
+            return None
+        path = next(iter(matches))
+        return self._files[path] if self._parse_file(path) else None
 
     def _identity(self, kind: str, name: Any) -> dict[str, Any] | None:
-        if not _identifier(name):
+        if not _identifier(name) or not self._ensure_identities():
             return None
         matches = self._identities.get((kind, name), [])
         if kind == "field" and len(matches) == 1 and len(self._identities.get(("view", matches[0]["view"]), [])) != 1:
@@ -280,6 +361,8 @@ class SnapshotIndex:
         """Return only independently mapped authored metadata and fixed wording."""
         if not isinstance(issue, dict):
             return {}
+        if self._files:
+            self.unavailable_reason = "source_location_unmapped"
         selected = None
         if issue.get("file") is not None:
             selected = self._file(issue["file"])

@@ -97,8 +97,11 @@ def test_pr_requires_trusted_base_policy_and_ignores_head_policy(tmp_path, monke
             load_config()
     # Even a valid local file cannot substitute for an unfetched trusted base ref.
     monkeypatch.setenv("GITHUB_BASE_REF", "unfetched-base")
-    with pytest.raises(MissingPolicyError):
+    with pytest.raises(ConfigError) as caught:
         load_config()
+    assert not isinstance(caught.value, MissingPolicyError)
+    assert caught.value.reason_code == "policy_inaccessible"
+    assert caught.value.diagnostic_context == {"source_kind": "policy"}
 
 
 @pytest.mark.parametrize("command", [["route", "--auto"], ["run", "--auto"]])

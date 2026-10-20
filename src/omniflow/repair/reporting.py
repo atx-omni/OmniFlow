@@ -41,6 +41,8 @@ def write_repair_artifacts(
             "policy_decision",
             "exit_code",
             "exit_code_reason",
+            "reason_code",
+            "cause_code",
         )
     }
     write_public_json(root / "evidence.json", evidence, redaction_level=redaction_level)
@@ -62,6 +64,17 @@ def render_repair_markdown(report: dict[str, Any]) -> str:
         message,
         "",
     ]
+    findings = report.get("issues", [])
+    if findings:
+        lines.extend(["## Failure and Recovery", ""])
+        for issue in findings[:20]:
+            code = _safe_text(issue.get("diagnostic_code") or "OF-AI-REPAIR")
+            lines.append(f"- **{code}**: {_safe_text(issue.get('message') or 'Repair did not establish success.')}")
+            if issue.get("next_action"):
+                lines.append(f"  - Next: {_safe_text(issue['next_action'])}")
+            for key in ("reason_code", "cause_code", "operation_phase", "api_operation", "http_status"):
+                if key in issue:
+                    lines.append(f"  - {key}: `{_safe_text(issue[key])}`")
     change = report.get("change_summary") if isinstance(report.get("change_summary"), dict) else {}
     modified = change.get("modified_files") if isinstance(change.get("modified_files"), list) else []
     lines.extend(["## Reviewed Changes", ""])
@@ -73,6 +86,17 @@ def render_repair_markdown(report: dict[str, Any]) -> str:
         lines.append(f"- Changed lines: `{int(change.get('changed_lines') or 0)}`")
     else:
         lines.append("No authored-YAML change was accepted.")
+    validation = report.get("full_validation")
+    if isinstance(validation, dict) and validation.get("failed_finding_count"):
+        lines.extend(["", "## Failed Validation", ""])
+        lines.append(f"- Failed findings: `{int(validation['failed_finding_count'])}`")
+        for issue in validation.get("issues", [])[:20]:
+            if not isinstance(issue, dict):
+                continue
+            validator = _safe_text(issue.get("validator") or "validation")
+            reason = _safe_text(issue.get("diagnostic_code") or issue.get("reason_code") or issue.get("rule_id") or "unknown")
+            action = _safe_text(issue.get("next_action") or "Inspect the matching validation report before retrying repair.")
+            lines.append(f"- `{validator}` / `{reason}`: {action}")
     lines.extend(["", "## Safety", ""])
     lines.append("- Raw query results stored by OmniFlow: `false`")
     lines.append(f"- Rollback verified: `{bool((report.get('rollback') or {}).get('verified'))}`")

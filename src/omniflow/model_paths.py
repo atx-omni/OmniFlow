@@ -24,10 +24,10 @@ def is_git_model_file(path: str) -> bool:
     """Recognize model-relative Omni sources, not arbitrary repository YAML.
 
     Keep native API names and supported Git serialization wrappers equivalent.
-    Reserved model/relationships names belong at the registered model root.
+    Directories organize files; identity is scoped to the registered model.
     Custom YAML names require API evidence once a model is explicitly selected.
     """
-    identity = authored_file_identity(path)
+    identity = filename_identity(path)
     return identity in {"model", "relationships"} or identity.endswith(_AUTHORED_SUFFIXES)
 
 
@@ -60,5 +60,25 @@ def identity_index(paths: Iterable[str]) -> dict[str, str]:
         if identity in result:
             # Do not include potentially sensitive source paths in exceptions.
             raise AmbiguousModelPath("Ambiguous authored file identity")
+        result[identity] = path
+    return result
+
+
+def filename_identity(path: str) -> str:
+    """Case-sensitive model-local filename, with one supported export wrapper.
+
+    Callers must first enforce the registered model scope and validate paths.
+    This is not a repository-wide lookup or permission to ignore file contents.
+    """
+    return authored_file_identity(PurePosixPath(path).name)
+
+
+def filename_index(paths: Iterable[str]) -> dict[str, str]:
+    """Map unique model-local filenames to their original, unmodified paths."""
+    result: dict[str, str] = {}
+    for path in paths:
+        identity = filename_identity(path)
+        if identity in result:
+            raise AmbiguousModelPath("Ambiguous authored filename identity")
         result[identity] = path
     return result

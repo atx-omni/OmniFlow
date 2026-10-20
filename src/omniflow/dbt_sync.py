@@ -5,7 +5,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from .exceptions import ConfigError, ExitCodes, OmniAPIError, SecurityPolicyError
+from .exceptions import ConfigError, ExitCodes, OmniAPIError, OmniFlowError, SecurityPolicyError, exception_diagnostic
 from .git import current_branch, event_name, is_pull_request_event
 from .timestamps import utc_now_iso
 
@@ -89,12 +89,39 @@ def run_dbt_sync(
                 started_at=started_at,
                 elapsed_seconds=timeout_seconds,
                 message=f"Schema refresh did not finish within {timeout_seconds} seconds",
+                reason_code="dbt_refresh_timeout",
             ), ExitCodes.OMNI_API_ERROR
         sleep(min(float(poll_interval_seconds), remaining))
-        job = client.get_schema_refresh_job_status(job_id)
         polls += 1
-        if job.get("model_id") not in {None, model_id}:
-            raise OmniAPIError("Schema refresh job status returned a mismatched model ID")
+        try:
+            job = client.get_schema_refresh_job_status(job_id)
+            if job.get("model_id") not in {None, model_id}:
+                raise OmniAPIError(
+                    "Schema refresh job status returned a mismatched model ID",
+                    reason_code="dbt_refresh_identity_mismatch",
+                )
+            if job.get("status") not in {"RUNNING", "COMPLETED", "FAILED"}:
+                raise OmniAPIError(
+                    "Schema refresh finished with an unsupported status",
+                    reason_code="dbt_refresh_invalid_status",
+                )
+        except OmniFlowError as exc:
+            # The POST was confirmed; failure to observe it is not proof that
+            # the refresh failed or stopped. Retain the job for reconciliation.
+            cause = exception_diagnostic(exc)
+            return _sync_report(
+                model_id=model_id, branch_id=branch_id, job_id=job_id,
+                refresh_mode=refresh_mode, status="status_unknown", omni_status=status,
+                polls=polls, started_at=started_at,
+                elapsed_seconds=max(0, round(monotonic() - started, 3)),
+                message="Schema refresh started, but its final status could not be confirmed. "
+                        "Inspect the existing job before starting another refresh.",
+                reason_code="dbt_refresh_status_unknown",
+                diagnostic={
+                    **{key: value for key, value in cause.items() if key != "reason_code"},
+                    "cause_code": cause.get("reason_code", "unknown_failure"),
+                },
+            ), exc.exit_code
         status = job["status"]
 
     elapsed_seconds = max(0, round(monotonic() - started, 3))
@@ -110,6 +137,7 @@ def run_dbt_sync(
             started_at=started_at,
             elapsed_seconds=elapsed_seconds,
             message="Omni schema refresh job failed",
+            reason_code="dbt_refresh_failed",
         ), ExitCodes.OMNI_API_ERROR
     if status != "COMPLETED":
         raise OmniAPIError("Schema refresh finished with an unsupported status")
@@ -138,10 +166,18 @@ def _sync_report(
     started_at: str,
     elapsed_seconds: float | int,
     message: str | None = None,
+    reason_code: str | None = None,
+    diagnostic: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    complete = status in {"completed", "failed"}
+    phase = "poll" if polls else "start"
     issues = []
     if message:
-        issues.append({"validator": "dbt_sync", "severity": "error", "message": message})
+        issues.append({
+            **(diagnostic or {}), "validator": "dbt_sync", "severity": "error", "message": message,
+            "reason_code": reason_code, "operation_phase": phase, "coverage_complete": complete,
+            "operational_failure": True, "blocking": True,
+        })
     return {
         "tool": "omniflow",
         "operation": "dbt_sync",
@@ -152,6 +188,10 @@ def _sync_report(
         "job_id": job_id,
         "refresh_mode": refresh_mode,
         "status": status,
+        "execution_status": "completed" if complete else "unavailable",
+        "validation_complete": complete,
+        "operation_phase": phase,
+        "last_observed_status": omni_status,
         "omni_status": omni_status,
         "polls": polls,
         "elapsed_seconds": elapsed_seconds,

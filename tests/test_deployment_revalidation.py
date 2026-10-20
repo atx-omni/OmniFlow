@@ -107,7 +107,9 @@ class RevalidationTests(unittest.TestCase):
             self.run_check(inventory_error=ConfigError(marker))
         summary = self.api.request.call_args.args[2]["output"]["summary"]
         self.assertNotIn(marker, summary)
-        self.assertIn("details withheld", summary)
+        self.assertTrue(summary.startswith("OF-SETUP:"))
+        self.assertIn("configuration error", summary)
+        self.assertIn("Next:", summary)
 
     def test_stale_or_forged_public_report_cannot_authorize_without_current_private_receipt(self):
         forged = {"policy_decision": "pass", "models": [{"model_id": "m1"}],

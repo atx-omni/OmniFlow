@@ -1,5 +1,20 @@
 # Validation Diagnostics and Upgrading
 
+## Read the cause before changing the model
+
+Start with **Primary blocker** and **Next action** in `report.md`. Each finding has a stable `diagnostic_code`, fixed explanation and next action. Structured facts can include the check/phase, base or branch scope, API operation, HTTP status, retry attempts, built-in configuration key, expected type and parser line/column. Unknown API prose is never used as an explanation. The catalog is versioned separately as `diagnostic_catalog_version: 1`; public schema version remains `2`.
+
+| Example | Meaning | What to do |
+| --- | --- | --- |
+| `OF-OMNI-FORBIDDEN`, `model_yaml`, HTTP `403`, scope `base` | Access to that operation was denied; no model defect has been established. | Verify credential access to the selected target/endpoint. A 403 alone does not identify a missing permission. |
+| `OF-CANDIDATE-FILES`, 38 Git-only and 38 Omni-only files, `not_compared` | File inventories differ; equal totals do not prove equal paths or contents. | Inspect up to five observations in the separately authorized repository artifact. Do not blindly rename or overwrite files. |
+| `OF-CONFIG-INVALID-TYPE`, `checks.model_validation.fail_on_new_only`, expected `boolean` | The policy setting has the wrong type. | Correct the named setting on the trusted target branch; use `true`, not a quoted string. |
+| `OF-DBT-REFRESH-STATUS-UNKNOWN`, phase `poll` | A job started, but its final outcome is unknown. | Reconcile that job in Omni before starting another refresh. |
+
+These are synthetic illustrations, not diagnoses of a particular customer run. Check execution now records elapsed time and why later stages were blocked. `partial`, `unavailable`, `skipped` and `not_run` are not completed validation. Optional policy may permit a zero exit despite incomplete coverage; `validation_complete: false` remains explicit, including in JUnit. AI repair will not commit when its post-repair validation explicitly reports incomplete coverage.
+
+Public artifacts retain safe causes but no customer paths. Their `repository_diagnostics` status explains whether richer detail is available, or why it was withheld. In a verified private repository, download `omniflow-repository-diagnostics`; otherwise follow the public code's recovery steps and obtain source evidence through an approved private channel. A report-publication failure is not a model defect. A bootstrap/install failure happens before validators start and may have no report; the failed Action step carries a fixed `OF-BOOTSTRAP-*` explanation.
+
 ## First distinguish the failure
 
 | Report finding | Meaning | Safe next step |
@@ -102,7 +117,7 @@ These codes describe structure only. They do not expose the invalid value, asser
 
 For an affected user, request:
 
-- A schema-version-2 public report, initially limited to finding type, structural reason, validation scope (branch or base), and comparison status. Obtain the failing run/PR and exact Action reference through an authorized channel separately; those references are no longer copied into shareable reports.
+- A schema-version-2 public report, initially limited to finding type, structural reason, validation scope (branch or base), comparison status and tool build. Obtain the customer run/PR reference through an authorized channel separately; it is not copied into shareable reports.
 - The original shape of one failing issue, not the already-normalized `message: null` report. Obtain it through an approved private support channel; replace customer names, identifiers, URLs, field values and sensitive text with placeholders while retaining keys and value types. Never share credentials or a whole raw response.
 - What Content Validator shows for the same model and branch: document/query identity, whether an actual dashboard filter is identified, and its readable error if present.
 
@@ -228,7 +243,7 @@ a no-impact classification nor a released optimization.
 - Content evidence gaps and dependency coverage gaps remain explicit. Detailed object attribution belongs in authorized private investigation, not a shareable artifact.
 - **Input/PR Git SHA** and **OmniFlow Action revision** are separate provenance facts. Obtain them from authorized workflow/private evidence; public JSON and evidence deliberately omit both. A floating Action tag is not independently attested by an environment-supplied reference.
 - The aggregate exit reason preserves operational API failures rather than mislabeling them ordinary validation failures.
-- Candidate inventory failures expose only safe counters: Git/API totals and unmatched counts, plus uniquely paired case/directory/suffix mismatch hints. These are not automatic normalization rules, source locations or proof of a particular root cause. Trusted ancillary classifications cannot remove an API source. See [candidate troubleshooting](TROUBLESHOOTING.md#candidate-verification-git-and-omni-snapshots-differ).
+- Candidate matching uses type-specific identity within each registered model and still compares contents. Topics have unique names; model/global relationships definitions are singletons; views retain canonical and catalog/schema qualification, allowing repeated table filenames. Organizational folders need not match when identity is unambiguous. Inventory failures expose safe Git/API totals, unmatched counts and case/suffix hints. Hints are not source locations or proof of equality. Trusted ancillary classifications cannot remove an API source. See [candidate troubleshooting](TROUBLESHOOTING.md#candidate-verification-git-and-omni-snapshots-differ).
 - **Check Execution** records completed, failed operationally, not run, and disabled checks for each model/branch. “Completed” means execution finished, not that the check passed its configured policy. JSON records these as `completed`, `failed`, `not_run`, and `disabled`; `validation_complete` describes execution completeness separately from the pass/fail decision.
 - When one check fails, completed findings remain visible. Unfinished analysis is explicitly incomplete; zero recorded impacts or gaps is not proof of no impact. Older failed reports without execution metadata remain unknown rather than being treated as complete.
 - Identical findings in different model/branch contexts retain separate generated context references and coverage counts within a report, without publishing direct identity. Unknown or object-like diagnostic text is omitted; guidance uses fixed vocabulary.

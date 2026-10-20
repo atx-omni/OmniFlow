@@ -227,7 +227,7 @@ def test_metadata_failure_keeps_environment_and_incomplete_candidate_evidence(pr
     with capture_private_reports() as receipts, \
          mock.patch("omniflow.cli.OmniClient", return_value=client), \
          mock.patch("omniflow.cli.load_config", return_value=config):
-        assert cmd_run(run_args(), changed_files=["omni/shared/orders.view"]) != 0
+        assert cmd_run(run_args(), changed_files=["omni/shared/orders.view"]) == 2
     report_text = (root / ".omniflow/public/report.json").read_text()
     report = json.loads(report_text)
     context = report["model_reports"][0]
@@ -236,12 +236,17 @@ def test_metadata_failure_keeps_environment_and_incomplete_candidate_evidence(pr
     assert private_context["environment"] == "production"
     assert "environment" not in context
     assert context["validation_complete"] is False
-    assert context["candidate_verification"]["status"] == "pending_recheck"
+    assert context["candidate_verification"]["status"] == "unverified"
     issue = next(item for item in context["issues"] if item.get("metadata_stage") == "view_names")
     assert issue["metadata_reason"] == "unsupported_orientation"
-    assert issue["validator"] == "semantic_diff"
+    assert issue["validator"] == "candidate"
+    assert issue["type"] == "candidate_verification_failed"
+    assert issue["candidate_reason"] == "verification_unavailable"
+    assert issue["blocking"] is True and issue["coverage_complete"] is False
     states = {item["validator"]: item["status"] for item in context["check_states"]}
-    assert states["semantic_diff"] == "failed" and states["contracts"] == "not_run"
+    assert states["candidate"] == "failed"
+    assert all(states[check] == "not_run" for check in ("model", "content", "semantic_diff", "contracts"))
+    assert not any(kind in {"model", "content"} for kind, _ in client.calls)
     markdown = (root / ".omniflow/public/report.md").read_text()
     assert "Candidate coverage is incomplete" in render_markdown_report(receipts[0])
     assert "Validation complete: `false`" in markdown

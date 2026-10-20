@@ -37,6 +37,30 @@ CHANGED_FILES_CACHE_ENV = (
     "GITHUB_REF",
 )
 _CHANGED_FILES_CACHE: dict[tuple[Any, ...], list[str]] = {}
+METADATA_DIAGNOSTIC_KEYS = frozenset({"version", "models"}) | frozenset(
+    f"models.{key}" for key in TARGET_MODEL_KEYS
+)
+
+
+def _metadata_error(message: str, key: str = "models", expected_type: str = "mapping", *,
+                    reason: str = "model_metadata_invalid_value", entry_index: int | None = None) -> ConfigError:
+    context: dict[str, Any] = {"source_kind": "model_metadata", "expected_type": expected_type}
+    if key in METADATA_DIAGNOSTIC_KEYS:
+        context["config_key"] = key
+    if entry_index is not None:
+        context["entry_index"] = entry_index
+    return ConfigError(message, reason_code=reason, diagnostic_context=context)
+
+
+def _checked_metadata(value: str, key: str, validator, *, expected_type: str = "string"):
+    try:
+        return validator(value)
+    except (ConfigError, SecurityPolicyError) as exc:
+        exc.reason_code = "model_metadata_invalid_value"
+        exc.diagnostic_context = {
+            "source_kind": "model_metadata", "config_key": f"models.{key}", "expected_type": expected_type,
+        }
+        raise
 
 
 @dataclass
@@ -109,7 +133,8 @@ def discover_contexts(
         if any(_is_probable_omni_file(path) for path in changed_files):
             raise ConfigError(
                 "Omni semantic files changed, but trusted .omni/flow.json metadata is missing. "
-                "Commit model identity metadata to the base branch before merging Omni changes."
+                "Commit model identity metadata to the base branch before merging Omni changes.",
+                reason_code="model_metadata_missing", diagnostic_context={"source_kind": "model_metadata"},
             )
         return []
     contexts = select_model_contexts(
@@ -210,39 +235,66 @@ def discover_branch_name() -> str | None:
 
 def load_flow_metadata(path: str | Path = FLOW_PATH, *, missing_ok: bool = False) -> dict[str, Any] | None:
     candidate = Path(path)
-    text = read_trusted_repo_text(candidate)
+    try:
+        text = read_trusted_repo_text(candidate)
+    except ConfigError as exc:
+        if getattr(exc, "reason_code", None) in {
+            "trusted_file_unsafe", "trusted_file_too_large", "trusted_file_invalid_encoding",
+        }:
+            exc.diagnostic_context = {"source_kind": "model_metadata"}
+            raise
+        raise ConfigError("Could not access trusted model metadata", reason_code="model_metadata_inaccessible",
+                          diagnostic_context={"source_kind": "model_metadata"}) from exc
     if text is None and missing_ok:
         return None
     if text is None:
-        raise ConfigError(f"Missing OmniFlow metadata file: {candidate}")
+        raise ConfigError("Missing trusted OmniFlow model metadata", reason_code="model_metadata_missing",
+                          diagnostic_context={"source_kind": "model_metadata"})
     try:
         payload = json.loads(text)
     except json.JSONDecodeError as exc:
-        raise ConfigError(f"Could not parse metadata file '{candidate}': {exc.msg}") from exc
+        raise ConfigError("Could not parse model metadata JSON", reason_code="model_metadata_parse_error",
+                          diagnostic_context={"source_kind": "model_metadata", "source_line": exc.lineno,
+                                              "source_column": exc.colno}) from exc
     if not isinstance(payload, dict):
-        raise ConfigError(f"Metadata file {candidate} must contain a JSON object")
+        raise _metadata_error("Model metadata must contain a JSON object", expected_type="mapping",
+                              reason="model_metadata_invalid_type")
     reject_secret_keys(payload, source=str(candidate))
     _reject_unknown_keys(payload, FLOW_KEYS, f"Metadata file {candidate}")
     models = payload.get("models")
     if not isinstance(models, list) or not models:
-        raise ConfigError(f"Metadata file {candidate} must include a non-empty models list")
+        raise _metadata_error("Model metadata must include a non-empty models list", expected_type="non_empty_list",
+                              reason="model_metadata_invalid_type")
     version = payload.get("version")
     if type(version) is not int or version not in {1, 2}:
-        raise ConfigError(f"Metadata file {candidate} must use version 1 or 2")
-    if any(not isinstance(item, dict) for item in models):
-        raise ConfigError(f"Metadata file {candidate} models must all be JSON objects")
+        raise _metadata_error("Model metadata must use version 1 or 2", "version", "integer")
     if len(models) > MAX_FLOW_MODELS:
         raise SecurityPolicyError(f"Metadata file {candidate} contains more than 500 models")
-    contexts = [_model_from_payload(item, branch_name=None, version=version) for item in models]
+    contexts = []
+    for index, item in enumerate(models, start=1):
+        if not isinstance(item, dict):
+            raise _metadata_error("Model metadata entries must be JSON objects", expected_type="mapping",
+                                  reason="model_metadata_invalid_type", entry_index=index)
+        try:
+            contexts.append(_model_from_payload(item, branch_name=None, version=version))
+        except (ConfigError, SecurityPolicyError) as exc:
+            exc.diagnostic_context = {
+                **getattr(exc, "diagnostic_context", {}), "source_kind": "model_metadata", "entry_index": index,
+            }
+            raise
     if version == 2:
         _validate_target_registry(contexts)
         return payload
     model_ids = [context.model_id for context in contexts]
     model_paths = [context.model_path for context in contexts]
     if len(model_ids) != len(set(model_ids)):
-        raise ConfigError(f"Metadata file {candidate} contains duplicate model_id values")
+        index = next(i for i, value in enumerate(model_ids) if value in model_ids[:i])
+        raise _metadata_error("Model metadata contains duplicate model identities", "models.model_id", "string",
+                              entry_index=index + 1)
     if len(model_paths) != len(set(model_paths)):
-        raise ConfigError(f"Metadata file {candidate} contains duplicate model_path values")
+        index = next(i for i, value in enumerate(model_paths) if value in model_paths[:i])
+        raise _metadata_error("Model metadata contains duplicate model paths", "models.model_path", "repository_path",
+                              entry_index=index + 1)
     return payload
 
 
@@ -306,7 +358,7 @@ def reset_changed_files_cache() -> None:
 
 
 def _changed_files_cache_key(base_branch: str | None) -> tuple[Any, ...]:
-    key = (base_branch, *(os.getenv(name) for name in CHANGED_FILES_CACHE_ENV))
+    key = (str(Path.cwd()), base_branch, *(os.getenv(name) for name in CHANGED_FILES_CACHE_ENV))
     if is_pull_request_event():
         from .revision_data import pull_request_revision
 
@@ -337,6 +389,7 @@ def _resolve_changed_files(base_branch: str | None = None) -> list[str]:
         candidates.append(f"origin/{base_branch}...HEAD")
     candidates.extend(["HEAD~1...HEAD", "--cached"])
 
+    readable_inventory = False
     for candidate in candidates:
         try:
             cmd = [git_executable(), "diff", "--name-only", "--no-renames", candidate]
@@ -346,13 +399,18 @@ def _resolve_changed_files(base_branch: str | None = None) -> list[str]:
                 check=True,
                 capture_output=True,
                 text=True,
+                timeout=15,
             )
-        except (OSError, subprocess.CalledProcessError):
+        except (OSError, subprocess.SubprocessError):
             continue
+        readable_inventory = True
         files = [line.strip() for line in result.stdout.splitlines() if line.strip()]
         if files:
             return files
-    return []
+    if readable_inventory:
+        return []
+    raise ConfigError("No Git changed-file comparison was available; cannot establish a safe skip",
+                      reason_code="changed_files_unavailable")
 
 
 def select_model_contexts(
@@ -424,9 +482,11 @@ def _model_from_payload(
     keys = ("base_url", "model_id", "model_path") if require_model_path else ("base_url", "model_id")
     for key in keys:
         if not isinstance(payload.get(key), str) or not payload[key].strip():
-            raise ConfigError(f"OmniFlow model context must include {key}")
-    base_url = validate_base_url(payload["base_url"].strip())
-    model_id = validate_path_segment(payload["model_id"].strip(), name="model_id")
+            raise _metadata_error(f"OmniFlow model context must include {key}", f"models.{key}", "non_empty_string",
+                                  reason="model_metadata_invalid_type")
+    base_url = _checked_metadata(payload["base_url"].strip(), "base_url", validate_base_url, expected_type="https_url")
+    model_id = _checked_metadata(payload["model_id"].strip(), "model_id",
+                                 lambda value: validate_path_segment(value, name="model_id"))
     normalized_model_path = str(payload.get("model_path") or "").strip().strip("/")
     if normalized_model_path and (
         Path(normalized_model_path).is_absolute()
@@ -434,15 +494,17 @@ def _model_from_payload(
         or len(normalized_model_path) > 1_024
         or any(character in normalized_model_path for character in ("\x00", "\r", "\n", "\\"))
     ):
-        raise ConfigError("OmniFlow model_path must stay inside the repository")
+        raise _metadata_error("OmniFlow model_path must stay inside the repository",
+                              "models.model_path", "repository_path")
     base_branch = payload.get("base_branch")
     if base_branch is not None:
         if not isinstance(base_branch, str) or not base_branch.strip():
-            raise ConfigError("OmniFlow base_branch must be a non-empty string when provided")
-        base_branch = validate_branch_name(base_branch.strip())
+            raise _metadata_error("OmniFlow base_branch must be a non-empty string when provided",
+                                  "models.base_branch", "non_empty_string", reason="model_metadata_invalid_type")
+        base_branch = _checked_metadata(base_branch.strip(), "base_branch", validate_branch_name)
     git_provider = _optional_metadata_string(payload.get("git_provider"), "git_provider")
     if git_provider and git_provider.lower() != "github":
-        raise ConfigError("OmniFlow git_provider must be 'github'")
+        raise _metadata_error("OmniFlow git_provider must be 'github'", "models.git_provider", "enum")
     web_url = _optional_metadata_string(payload.get("web_url"), "web_url", maximum=2_048)
     if web_url:
         parsed_web_url = urlparse(web_url)
@@ -454,21 +516,26 @@ def _model_from_payload(
             or parsed_web_url.query
             or parsed_web_url.fragment
         ):
-            raise ConfigError("OmniFlow web_url must be a trusted HTTPS repository URL")
+            raise _metadata_error("OmniFlow web_url must be a trusted HTTPS repository URL", "models.web_url", "https_url")
     environment = None
     follower = None
     if version == 2:
         environment = payload.get("environment")
         if not isinstance(environment, str) or not re.fullmatch(r"[a-z][a-z0-9-]{0,62}", environment):
-            raise ConfigError("Version 2 environment must be a lowercase name using letters, digits, and hyphens")
+            raise _metadata_error("Version 2 environment must be a lowercase name using letters, digits, and hyphens",
+                                  "models.environment", "string")
         follower = payload.get("git_follower")
-        if not base_branch or type(follower) is not bool or not web_url:
-            raise ConfigError("Version 2 targets require base_branch, web_url, and boolean git_follower")
+        for key, value, expected in (("base_branch", base_branch, "non_empty_string"),
+                                     ("web_url", web_url, "https_url"), ("git_follower", follower, "boolean")):
+            if (key == "git_follower" and type(value) is not bool) or (key != "git_follower" and not value):
+                raise _metadata_error("Version 2 targets require base_branch, web_url, and boolean git_follower",
+                                      f"models.{key}", expected, reason="model_metadata_invalid_type")
         raw_path = payload["model_path"]
         if raw_path != normalized_model_path or (raw_path != "." and any(
             part in {"", ".", ".."} for part in raw_path.split("/")
         )):
-            raise ConfigError("Version 2 model_path must be a canonical repository-relative path")
+            raise _metadata_error("Version 2 model_path must be a canonical repository-relative path",
+                                  "models.model_path", "repository_path")
         git_provider = "github"
     return ModelContext(
         base_url=base_url,
@@ -489,18 +556,22 @@ def _validate_target_registry(contexts: list[ModelContext]) -> None:
             if context.environment == other.environment and (
                 context.base_branch != other.base_branch or context.base_url != other.base_url
             ):
-                raise ConfigError("Each version 2 environment must identify exactly one base branch and Omni host")
+                raise _metadata_error("Each version 2 environment must identify exactly one base branch and Omni host",
+                                      "models.environment", "string", entry_index=index + 1)
             if context.base_branch != other.base_branch:
                 continue
             if context.environment != other.environment or context.base_url != other.base_url:
-                raise ConfigError("A version 2 base branch must select exactly one environment and Omni host")
+                raise _metadata_error("A version 2 base branch must select exactly one environment and Omni host",
+                                      "models.base_branch", "string", entry_index=index + 1)
             if context.model_id == other.model_id:
-                raise ConfigError("Version 2 target contains duplicate model_id values")
+                raise _metadata_error("Version 2 target contains duplicate model_id values",
+                                      "models.model_id", "string", entry_index=index + 1)
             paths = (context.model_path, other.model_path)
             if "." in paths or paths[0] == paths[1] or any(
                 left.startswith(right + "/") for left, right in (paths, paths[::-1])
             ):
-                raise ConfigError("Version 2 target contains overlapping or duplicate model_path values")
+                raise _metadata_error("Version 2 target contains overlapping or duplicate model_path values",
+                                      "models.model_path", "repository_path", entry_index=index + 1)
 
 
 def validation_target_branch() -> str:
@@ -636,12 +707,13 @@ def _push_event_files() -> list[str]:
 def _reject_unknown_keys(payload: dict[str, Any], allowed: set[str], source: str) -> None:
     unknown = sorted(str(key) for key in payload if key not in allowed)
     if unknown:
-        raise ConfigError(f"{source} contains unsupported key(s): {', '.join(unknown)}")
+        raise _metadata_error("Model metadata contains unsupported keys", reason="model_metadata_unknown_key")
 
 
 def _optional_metadata_string(value: Any, name: str, *, maximum: int = 255) -> str | None:
     if value is None:
         return None
     if not isinstance(value, str) or not value.strip() or len(value.strip()) > maximum:
-        raise ConfigError(f"OmniFlow {name} must be a non-empty string no longer than {maximum} characters")
+        raise _metadata_error(f"OmniFlow {name} must be a non-empty string no longer than {maximum} characters",
+                              f"models.{name}", "non_empty_string", reason="model_metadata_invalid_type")
     return value.strip()

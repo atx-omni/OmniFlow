@@ -11,8 +11,56 @@ from omniflow.diff.semantic_graph import build_graph, load_yaml_graph
 from omniflow.discovery import ModelContext
 from omniflow.downstream import generate_downstream_dependencies
 from omniflow.exceptions import ConfigError, SecurityPolicyError
-from omniflow.view_identity import validate_view_names
+from omniflow.view_identity import normalize_api_view_names, validate_view_names
 from omniflow.yaml_pull import pull_yaml
+
+
+@pytest.mark.parametrize("orientation", ["name_to_path", "path_to_name"])
+def test_identity_only_mode_accepts_typed_yaml_syntax_errors_without_claiming_model_health(orientation):
+    files = dict.fromkeys([
+        "model", "Nested/relationships.yaml", "orders.view", "Query/orders.query.view.yml",
+        "sales.topic", "sales.composite_topic", "legacy.relationships",
+    ], "invalid: [")
+    names = {"schema__orders": "orders.view", "saved_query": "Query/orders.query.view.yml"}
+    mapping = names if orientation == "name_to_path" else {path: name for name, path in names.items()}
+    if orientation == "path_to_name":
+        mapping.update({path: "" for path in files if path not in names.values()})
+    assert normalize_api_view_names(mapping, files, parse_contents=False) == names
+    # Default snapshot/graph normalization remains strict, unlike identity-only.
+    with pytest.raises(ConfigError) as caught:
+        normalize_api_view_names(mapping, files)
+    assert caught.value.reason_code == "yaml_parse_error"
+
+
+@pytest.mark.parametrize("mapping,reason", [
+    ({}, "incomplete_identity"),
+    ({"orders": "orders.view"}, "incomplete_identity"),
+    ({"orders.view": "orders", "archive.view": "orders"}, "duplicate_name"),
+    ({"orders": "orders.view", "alias": "orders.view"}, "duplicate_path"),
+    ({"orders": "ORDERS.view"}, "unsupported_orientation"),
+    ({"orders": "orders.view", "archive": "archive.view", "bad": "model"}, "non_view_identity"),
+])
+def test_identity_only_mode_still_requires_safe_unique_complete_view_metadata(mapping, reason):
+    files = {"orders.view": "invalid: [", "archive.view": "invalid: [", "model": "invalid: ["}
+    with pytest.raises(ConfigError) as caught:
+        normalize_api_view_names(mapping, files, parse_contents=False)
+    assert caught.value.metadata_reason == reason
+
+
+def test_identity_only_mode_cannot_classify_malformed_generic_yaml_without_parsing():
+    with pytest.raises(ConfigError) as caught:
+        normalize_api_view_names({"orders": "settings.yaml"}, {"settings.yaml": "invalid: ["}, parse_contents=False)
+    assert caught.value.reason_code == "yaml_parse_error"
+
+
+def test_identity_only_mode_preserves_generic_payload_hints_and_mapping_definition_requirement():
+    assert normalize_api_view_names(
+        {"settings.yaml": "", "orders.yaml": "orders"},
+        {"settings.yaml": "type: model", "orders.yaml": "dimensions: {}"}, parse_contents=False,
+    ) == {"orders": "orders.yaml"}
+    with pytest.raises(ConfigError) as caught:
+        normalize_api_view_names({"orders": "orders.yaml"}, {"orders.yaml": "plain scalar"}, parse_contents=False)
+    assert caught.value.metadata_reason == "incomplete_identity"
 
 
 class SnapshotClient:

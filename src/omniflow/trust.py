@@ -2,13 +2,10 @@ from __future__ import annotations
 
 import os
 import re
-
-# Git is invoked without a shell and with validated inputs.
-import subprocess  # nosec B404
 from pathlib import Path
 
 from .exceptions import ConfigError
-from .git import git_executable, github_event_payload, is_pull_request_event
+from .git import github_event_payload, is_pull_request_event
 
 SAFE_GIT_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 MAX_TRUSTED_FILE_BYTES = 1024 * 1024
@@ -22,20 +19,21 @@ def read_trusted_repo_text(path: str | Path, *, max_bytes: int = MAX_TRUSTED_FIL
     candidate = Path(path)
     if candidate.is_absolute() or not is_github_pull_request():
         if candidate.is_symlink():
-            raise ConfigError(f"Trusted repository file '{candidate}' must not be a symbolic link")
+            raise ConfigError("Trusted repository file must not be a symbolic link", reason_code="trusted_file_unsafe")
         try:
             with candidate.open("rb") as stream:
                 value = stream.read(max_bytes + 1)
         except FileNotFoundError:
             return None
         except OSError as exc:
-            raise ConfigError(f"Could not read trusted repository file '{candidate}'") from exc
+            raise ConfigError("Could not read trusted repository file", reason_code="trusted_file_unavailable") from exc
         if len(value) > max_bytes:
-            raise ConfigError(f"Trusted repository file '{candidate}' exceeds the 1 MiB safety limit")
+            raise ConfigError("Trusted repository file exceeds the safety limit", reason_code="trusted_file_too_large")
         try:
             return value.decode("utf-8")
         except UnicodeDecodeError as exc:
-            raise ConfigError(f"Trusted repository file '{candidate}' is not valid UTF-8") from exc
+            raise ConfigError("Trusted repository file is not valid UTF-8",
+                              reason_code="trusted_file_invalid_encoding") from exc
 
     repo_path = _safe_repo_path(candidate)
     event = github_event_payload()
@@ -57,47 +55,28 @@ def read_trusted_repo_text(path: str | Path, *, max_bytes: int = MAX_TRUSTED_FIL
             # the checked-out PR policy or a mutable branch reference.
             return read_github_text(revision[1], revision[0], repo_path, max_bytes=max_bytes)
     base_ref = _safe_base_ref(os.environ["GITHUB_BASE_REF"])
+    from .revision_data import read_git_text
+
     for ref in (f"refs/remotes/origin/{base_ref}", f"refs/heads/{base_ref}"):
-        object_name = f"{ref}:{repo_path}"
         try:
-            size_result = subprocess.run(  # nosec B603
-                [git_executable(), "cat-file", "-s", object_name],
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            if int(size_result.stdout.strip()) > max_bytes:
-                raise ConfigError(f"Trusted repository file '{candidate}' exceeds the 1 MiB safety limit")
-            result = subprocess.run(  # nosec B603
-                [git_executable(), "show", object_name],
-                check=True,
-                capture_output=True,
-                timeout=10,
-            )
-        except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
-            raise ConfigError(f"Could not read trusted base revision for '{candidate}'") from exc
-        except subprocess.CalledProcessError:
+            # None means the revision was readable and the file was absent.
+            # A missing/unreadable revision is not evidence of a missing file.
+            return read_git_text(ref, repo_path, root=Path("."), max_bytes=max_bytes)
+        except ConfigError:
             continue
-        if len(result.stdout) > max_bytes:
-            raise ConfigError(f"Trusted repository file '{candidate}' exceeds the 1 MiB safety limit")
-        try:
-            return result.stdout.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise ConfigError(f"Trusted repository file '{candidate}' is not valid UTF-8") from exc
-    return None
+    raise ConfigError("Trusted base revision is unavailable", reason_code="trusted_file_unavailable")
 
 
 def _safe_repo_path(path: Path) -> str:
     if path.is_absolute() or ".." in path.parts:
-        raise ConfigError(f"Trusted repository path must stay inside the checkout: {path}")
+        raise ConfigError("Trusted repository path must stay inside the checkout", reason_code="trusted_file_unsafe")
     value = path.as_posix()
     while value.startswith("./"):
         value = value[2:]
     if not value:
-        raise ConfigError("Trusted repository path cannot be empty")
+        raise ConfigError("Trusted repository path cannot be empty", reason_code="trusted_file_unsafe")
     if len(value) > 1_024 or any(character in value for character in ("\x00", "\r", "\n", "\\", ":")):
-        raise ConfigError("Trusted repository path contains unsafe characters")
+        raise ConfigError("Trusted repository path contains unsafe characters", reason_code="trusted_file_unsafe")
     return value
 
 
@@ -109,5 +88,5 @@ def _safe_base_ref(value: str) -> str:
         or "@{" in value
         or value.endswith("/")
     ):
-        raise ConfigError("GITHUB_BASE_REF contains an unsafe Git reference")
+        raise ConfigError("GITHUB_BASE_REF contains an unsafe Git reference", reason_code="trusted_file_unsafe")
     return value

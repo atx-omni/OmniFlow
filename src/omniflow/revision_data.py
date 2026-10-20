@@ -10,7 +10,7 @@ import subprocess  # nosec B404
 from functools import lru_cache
 from pathlib import Path
 
-from .exceptions import ConfigError, SecurityPolicyError
+from .exceptions import ConfigError, OmniFlowError, SecurityPolicyError
 from .git import git_executable, github_event_payload, is_pull_request_event
 from .trust import SAFE_GIT_REF_RE, _safe_repo_path
 
@@ -33,12 +33,16 @@ def pull_request_changed_files(*, root: Path = Path(".")) -> list[str] | None:
         if len(result.stdout) > 1024 * 1024:
             raise SecurityPolicyError("Immutable PR changed-file inventory exceeds 1 MiB")
         files = [item for item in result.stdout.decode("utf-8").split("\x00") if item]
-    except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError) as local_error:
         # Share the bounded GitHub transport; lazy import avoids a module cycle.
         from .github.revalidation import GitHubRepository
 
         api = GitHubRepository(base[1], os.getenv("OMNIFLOW_GITHUB_TOKEN", ""))
-        result = api.request("GET", f"/compare/{base[0]}...{head[0]}")
+        try:
+            result = api.request("GET", f"/compare/{base[0]}...{head[0]}")
+        except OmniFlowError as exc:
+            exc.diagnostic_context["local_git_reason"] = _git_failure_reason(local_error)
+            raise
         records = result.get("files") if isinstance(result, dict) else None
         # The compare API returns at most 300 files. No remaining-file pagination
         # contract exists, so reaching the limit is conservatively incomplete.
@@ -86,13 +90,19 @@ def read_git_text(ref: str, path: str, *, root: Path, max_bytes: int) -> str | N
     path = _safe_repo_path(Path(path))
     if not SAFE_GIT_REF_RE.fullmatch(ref) or ".." in ref or "@{" in ref:
         raise SecurityPolicyError("Unsafe data revision")
+    context = {"service": "git", "api_operation": "git_revision_read", "retryable": False}
+    try:
+        executable = git_executable()
+    except OSError as exc:
+        raise ConfigError("Git executable was not found on PATH", reason_code="git_missing_executable",
+                          diagnostic_context=context) from exc
     try:
         subprocess.run(  # nosec B603
-            [git_executable(), "rev-parse", "--verify", f"{ref}^{{commit}}"],
+            [executable, "rev-parse", "--verify", f"{ref}^{{commit}}"],
             cwd=root, check=True, capture_output=True, timeout=10,
         )
         entry = subprocess.run(  # nosec B603
-            [git_executable(), "ls-tree", ref, "--", path],
+            [executable, "ls-tree", ref, "--", path],
             cwd=root, check=True, capture_output=True, text=True, timeout=10,
         ).stdout.strip()
         if not entry:
@@ -101,20 +111,29 @@ def read_git_text(ref: str, path: str, *, root: Path, max_bytes: int) -> str | N
             raise SecurityPolicyError("Revision data must be a regular file, not a symlink or tree")
         object_id = entry.split()[2]
         size = subprocess.run(  # nosec B603
-            [git_executable(), "cat-file", "-s", object_id],
+            [executable, "cat-file", "-s", object_id],
             cwd=root, check=True, capture_output=True, text=True, timeout=10,
         )
         if int(size.stdout) > max_bytes:
             raise SecurityPolicyError("Revision data exceeds its file size limit")
         value = subprocess.run(  # nosec B603
-            [git_executable(), "cat-file", "blob", object_id],
+            [executable, "cat-file", "blob", object_id],
             cwd=root, check=True, capture_output=True, timeout=10,
         ).stdout
         if len(value) > max_bytes:
             raise SecurityPolicyError("Revision data exceeds its file size limit")
         return value.decode("utf-8")
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
-        raise ConfigError("Could not read the required Git data revision") from exc
+        raise ConfigError("Could not read the required Git data revision", reason_code=_git_failure_reason(exc),
+                          diagnostic_context=context) from exc
+
+
+def _git_failure_reason(exc: BaseException) -> str:
+    if isinstance(exc, subprocess.TimeoutExpired):
+        return "git_timeout"
+    if isinstance(exc, UnicodeError):
+        return "git_invalid_encoding"
+    return "git_revision_unavailable"
 
 
 def read_head_text(path: str, *, root: Path, max_bytes: int) -> str | None:
@@ -151,7 +170,10 @@ def read_github_text(repository: str, sha: str, path: str, *, max_bytes: int) ->
         raise SecurityPolicyError("GitHub data read requires a repository and exact SHA")
     token = os.getenv("OMNIFLOW_GITHUB_TOKEN")
     if not token:
-        raise ConfigError("OMNIFLOW_GITHUB_TOKEN is required to read exact pull request data")
+        raise ConfigError(
+            "OMNIFLOW_GITHUB_TOKEN is required to read exact pull request data", reason_code="github_missing_token",
+            diagnostic_context={"service": "github", "api_operation": "github_blob", "retryable": False},
+        )
     from .github.revalidation import GitHubRepository
 
     api = GitHubRepository(repository, token)

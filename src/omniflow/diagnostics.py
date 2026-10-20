@@ -6,6 +6,7 @@ Never add a free-form string field here merely to make a renderer more helpful.
 """
 from __future__ import annotations
 
+import re
 from contextlib import contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
@@ -13,7 +14,9 @@ from typing import Any
 from uuid import uuid4
 
 from .diagnostic_catalog import CHANGE_MESSAGES, CHECK_GUIDANCE, LINT_MESSAGES
-from .exceptions import MissingPolicyError
+from .diagnostic_contract import CATALOG_VERSION, REASON_DETAILS, diagnostic_descriptor
+from .exceptions import API_OPERATIONS, TRANSPORT_REASON_CODES, MissingPolicyError, exception_diagnostic
+from .repository_policy import POLICY_REASONS
 from .validators.content_identity import IDENTITY_MESSAGES
 
 _receipt: ContextVar[list | None] = ContextVar("omniflow_private_receipt", default=None)
@@ -76,6 +79,7 @@ REASONS = frozenset({
     "empty_yaml_document", "external_dependency_unverified", "invalid_or_unsupported_yaml",
     "unsupported_yaml_construct", "missing_policy_config",
     "model_comparison_unavailable", "ambiguous_model_identity", "content_comparison_unavailable", *IDENTITY_MESSAGES,
+    *REASON_DETAILS, *TRANSPORT_REASON_CODES,
 })
 CANDIDATE_REASONS = frozenset({
     "api_snapshot_unavailable", "content_mismatch", "duplicate_git_path", "empty_git_snapshot",
@@ -105,7 +109,22 @@ ENUMS = {
     "status": {"completed", "failed", "not_run", "disabled", "skipped", "passed", "unknown",
                "verified", "unverified", "pending_recheck", "not_applicable", "success", "refused",
                "proposed", "rolled_back", "manual_review_required", "available", "unavailable", "committed",
-               "not_needed", "rollback_failed"},
+               "not_needed", "rollback_failed", "partial", "status_unknown", "timed_out", "running"},
+    "execution_status": {"completed", "skipped", "partial", "unavailable", "failed", "not_applicable"},
+    "service": {"omni", "github", "git"},
+    "api_operation": API_OPERATIONS,
+    "cause_code": REASONS,
+    "local_git_reason": TRANSPORT_REASON_CODES,
+    "expected_type": {"mapping", "non_empty_mapping", "list", "non_empty_list", "string", "non_empty_string",
+                      "boolean", "integer", "enum", "repository_path", "https_url"},
+    "source_kind": {"policy", "model_metadata", "model_yaml"},
+    "operation_phase": {"start", "poll", "validation", "cleanup", "rollback", "commit",
+                        "prompt_set_preflight", "run_creation", "run_polling", "run_cleanup"},
+    "last_observed_status": {"RUNNING", "COMPLETED", "FAILED", "UNKNOWN"},
+    "skipped_reason": {"no_branch", "no_matching_prompt_set"},
+    "contents_comparison": {"not_compared", "different", "equal", "partial"},
+    "blocked_by": VALIDATORS,
+    "diagnostics_reason": POLICY_REASONS | {"no_trusted_run_context", "snapshot_evidence_unavailable", "repository_report_unavailable"},
     "validation_status": {"passed", "failed", "skipped", "incomplete"},
     "post_sync_validation_status": {"not_run", "failed", "passed"},
     "coverage_status": {"available", "partial", "unavailable", "unknown"},
@@ -137,20 +156,25 @@ COUNTS = frozenset({
     "content_selector_count",
     "modified_file_count", "regressed_count", "improved_count", "unchanged_count", "prompt_set_count",
     "refreshes_completed", "refreshes_failed", "post_sync_validations_failed", "refreshed_models", "models_requested",
+    "http_status", "attempt_count", "max_attempts", "elapsed_ms", "source_line", "source_column", "entry_index",
+    "compared_file_count", "candidate_sample_count", "candidate_sample_omitted_count",
+    "failed_finding_count", "failed_check_count",
 })
 FLAGS = frozenset({
     "validation_complete", "coverage_complete", "blocking", "active", "content_validation_required",
     "manual_review_required", "verified", "raw_query_results_stored", "query_execution_acknowledged",
     "operational_failure", "cleanup_required",
-    "health_only",
+    "health_only", "retryable",
 })
 OBJECTS = frozenset({
     "summary", "change_classification", "candidate_verification", "refresh", "post_sync_validation",
     "full_validation", "rollback", "commit", "change_summary",
+    "repository_diagnostics",
 })
 LISTS = frozenset({
     "issues", "models", "model_reports", "check_reports", "check_states",
     "new_issue_samples", "existing_issue_samples", "resolved_issue_samples", "improved_issue_samples",
+    "failed_checks",
 })
 EXIT_REASONS = {
     0: "success", 1: "validation failed", 2: "configuration error", 3: "authorization error",
@@ -182,7 +206,9 @@ def public_diagnostic(payload: dict[str, Any]) -> dict[str, Any]:
                     result[key] = item
             elif key in ENUMS and isinstance(item, str) and item in ENUMS[key]:
                 result[key] = item
-            elif key in COUNTS and type(item) is int and 0 <= item <= 2**31 - 1:
+            elif key == "http_status" and type(item) is int and 100 <= item <= 599:
+                result[key] = item
+            elif key in COUNTS - {"http_status"} and type(item) is int and 0 <= item <= 2**31 - 1:
                 result[key] = item
             elif key == "baseline_issues" and item is None:
                 result[key] = None
@@ -194,20 +220,37 @@ def public_diagnostic(payload: dict[str, Any]) -> dict[str, Any]:
                 result[key] = [project(child, depth + 1) for child in item if isinstance(child, dict)]
             elif key == "modified_files" and isinstance(item, list):
                 result["modified_file_count"] = len(item)
+            elif key == "config_key" and isinstance(item, str):
+                # Values and user-defined mapping keys must never pass through.
+                from .config import CONFIG_DIAGNOSTIC_KEYS
+                if item in CONFIG_DIAGNOSTIC_KEYS:
+                    result[key] = item
+            elif key == "tool_version" and isinstance(item, str) and re.fullmatch(r"\d+\.\d+\.\d+(?:(?:a|b|rc)\d+)?(?:\.(?:post|dev)\d+)?", item):
+                result[key] = item
+            elif key == "tool_revision" and isinstance(item, dict):
+                commit = item.get("commit")
+                if item.get("source") == "github_action_ref" and isinstance(commit, str) and re.fullmatch(r"[a-fA-F0-9]{40}", commit):
+                    result[key] = {"commit": commit.lower(), "source": "github_action_ref"}
         if "exit_code" in result:
             result["exit_code_reason"] = EXIT_REASONS.get(result["exit_code"], "unknown failure")
         if "severity" in value or "type" in value and "validator" in value:
             result.setdefault("type", "omniflow_finding")
             result["message"] = _finding_message(result)
+            result.update(diagnostic_descriptor(result))
         return result
 
     safe = project(payload)
-    safe.update(tool="omniflow", diagnostic_schema_version=2, run_reference=_run_reference.get() or uuid4().hex)
+    safe.update(tool="omniflow", diagnostic_schema_version=2, diagnostic_catalog_version=CATALOG_VERSION,
+                run_reference=_run_reference.get() or uuid4().hex)
     return safe
 
 
 def _finding_message(issue: dict[str, Any]) -> str:
     noun = "model" if issue.get("validator") == "model" else "content"
+    reason = (issue.get("reason_code") if issue.get("reason_code") in {"dbt_refresh_status_unknown", "ai_repair_timeout"}
+              else issue.get("cause_code") or issue.get("reason_code"))
+    if reason in REASON_DETAILS and reason not in {"empty_api_response", "invalid_json_response"}:
+        return REASON_DETAILS[reason][1]
     if issue.get("validator") == "semantic_lint" and issue.get("rule_id") in LINT_MESSAGES:
         return LINT_MESSAGES[issue["rule_id"]]
     if isinstance(issue.get("reason_code"), str) and issue["reason_code"] in IDENTITY_MESSAGES:
@@ -229,12 +272,15 @@ def _finding_message(issue: dict[str, Any]) -> str:
                 "unambiguous, then rerun."
             ),
             "file_inventory_mismatch": (
-                "Git and Omni authored file inventories differ after matching supported YAML filename wrappers. "
-                "Check the trusted model_path and synchronize the selected Omni branch/base with its PR Git revision."
+                "Git and Omni have unmatched authored artifacts within the selected model. Check missing/extra "
+                "files, view database/catalog and schema qualification, topic names, capitalization and the "
+                "trusted model_path, then synchronize the intended Omni branch/base and PR Git revision."
             ),
             "ambiguous_file_identity": (
-                "Multiple files map to the same Omni authored identity. Check for both wrapped and unwrapped names "
-                "or duplicate .yaml/.yml exports; resolve the duplicate mapping before rerunning."
+                "Authored artifacts cannot be matched unambiguously. Repeated view filenames across databases or "
+                "schemas are valid; preserve canonical Omni identity or catalog/schema/table qualification. "
+                "Check duplicate topic names, model/global relationships definitions and export copies. "
+                "Inspect repository-only path examples; do not rename valid schema-scoped views."
             ),
             "content_mismatch": (
                 "Git and Omni file inventories match, but authored file contents differ. "
@@ -327,4 +373,8 @@ def safe_exception_message(exc: Exception) -> str:
     suffix = f" ({reason})" if isinstance(reason, str) and reason in REASONS else ""
     if isinstance(reason, str) and reason in {"empty_api_response", "invalid_json_response", "missing_policy_config"}:
         return f"{_finding_message({'reason_code': reason})} Reason: {reason}."
-    return f"OmniFlow {category}{suffix}. Review the sanitized report and trusted configuration; details withheld."
+    issue = public_diagnostic({"issues": [{"validator": "setup" if code == 2 else "execution",
+                                          "severity": "error", "type": "validation_execution_failed",
+                                          **exception_diagnostic(exc)}]})["issues"][0]
+    return (f"{issue['diagnostic_code']}: OmniFlow {category}{suffix}. {issue['message']} "
+            f"Next: {issue['next_action']}")

@@ -58,13 +58,14 @@ runs:
         PIP_NO_INPUT: "1"
       run: |
         set -euo pipefail
+        trap 'echo "::error::OF-BOOTSTRAP-INSTALL: OmniFlow could not finish installation. Validation has not run. Check the failed install step, supported runtime and package/network availability; no validation report is expected yet."' ERR
         python - <<'PY'
         import platform
         import sys
 
         supported = sys.version_info[:2] == (3, 11) and platform.system() == "Linux" and platform.machine() == "x86_64"
         if not supported:
-            raise SystemExit("OmniFlow's locked action runtime requires Linux x86_64 with Python 3.11")
+            raise SystemExit("OF-BOOTSTRAP-RUNTIME: OmniFlow's locked action runtime requires Linux x86_64 with Python 3.11; validation has not run.")
         PY
         python -m pip install --require-hashes --only-binary=:all: \
           --requirement "$GITHUB_ACTION_PATH/requirements/action-py311-linux-x86_64.txt"
@@ -83,18 +84,18 @@ runs:
             ;;
           repair)
             if [ -n "$OMNIFLOW_INPUT_SKIP_REASON" ]; then
-              echo "skip-reason is supported only in validate mode" >&2
+              echo "OF-SETUP-ACTION-MODE: skip-reason is supported only in validate mode; remove it from this operation." >&2
               exit 2
             fi
             ;;
           dbt-sync)
             if [ -n "$OMNIFLOW_INPUT_SKIP_REASON" ]; then
-              echo "skip-reason is supported only in validate mode" >&2
+              echo "OF-SETUP-ACTION-MODE: skip-reason is supported only in validate mode; remove it from this operation." >&2
               exit 2
             fi
             ;;
           *)
-            echo "mode must be validate, repair, or dbt-sync" >&2
+            echo "OF-SETUP-ACTION-MODE: mode must be validate, repair, or dbt-sync. Validation has not run." >&2
             exit 2
             ;;
         esac

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+import time
 from typing import Any
 
 from .exceptions import ExitCodes, OmniFlowError
@@ -31,19 +33,39 @@ class ValidationProgress:
         self.branch_id = branch_id
         self.issues: list[dict[str, Any]] = []
         self.reports: list[dict[str, Any]] = []
+        self._started = {"context": time.monotonic()}
 
     def begin(self, name: str) -> None:
         self.current = name
+        self.states.setdefault(name, {"validator": name})["status"] = "running"
+        self._started[name] = time.monotonic()
+        print(f"OmniFlow: starting {name} check.", file=sys.stderr, flush=True)
 
-    def complete(self, name: str, exit_code: int = 0) -> None:
+    def complete(self, name: str, exit_code: int = 0, *, execution_status: str | None = None,
+                 skipped_reason: str | None = None) -> None:
+        status = "completed" if exit_code in {0, 1} else "failed"
+        if execution_status in {"partial", "unavailable", "skipped"}:
+            status = execution_status
         self.states[name].update(
-            status="completed" if exit_code in {0, 1} else "failed", exit_code=exit_code,
+            status=status, exit_code=exit_code, elapsed_ms=self._elapsed(name),
         )
+        self.states[name].pop("blocked_by", None)
+        if skipped_reason in {"no_branch", "no_matching_prompt_set"}:
+            self.states[name]["skipped_reason"] = skipped_reason
+        print(f"OmniFlow: {name} check {status} ({self.states[name]['elapsed_ms']} ms).",
+              file=sys.stderr, flush=True)
+
+    def _elapsed(self, name: str) -> int:
+        return max(0, int((time.monotonic() - self._started.get(name, time.monotonic())) * 1000))
 
     def fail(self, exc: Exception) -> None:
         self.states[self.current].update(
             status="failed", exit_code=exc.exit_code if isinstance(exc, OmniFlowError) else ExitCodes.INTERNAL_ERROR,
+            elapsed_ms=self._elapsed(self.current),
         )
+        for state in self.states.values():
+            if state["status"] == "not_run":
+                state["blocked_by"] = self.current
 
     def evidence(self) -> dict[str, Any]:
         return {

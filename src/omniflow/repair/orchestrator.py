@@ -9,7 +9,7 @@ from urllib.parse import urlparse
 from .. import __version__
 from ..config import OmniFlowConfig
 from ..discovery import ModelContext
-from ..exceptions import ExitCodes, OmniAPIError, OmniFlowError, SecurityPolicyError
+from ..exceptions import ExitCodes, OmniAPIError, OmniFlowError, SecurityPolicyError, exception_diagnostic
 from ..github.repair_attempt import GitHubRepairAttemptGuard, RepairEventContext
 from ..omni_client import OmniClient
 from ..security import redact
@@ -38,6 +38,7 @@ class _RepairState:
     after: ModelSnapshot | None = None
     difference: SnapshotDiff | None = None
     validation_summary: dict[str, Any] | None = None
+    failure_diagnostic: dict[str, Any] | None = None
     commit_started: bool = False
 
 
@@ -107,7 +108,9 @@ def run_ai_repair(
         )
         state.job_terminal = state.job_state in TERMINAL_AI_STATES
         if state.job_state != "COMPLETE":
-            raise OmniAPIError(f"Omni AI job ended in terminal state {state.job_state}")
+            raise OmniAPIError(
+                f"Omni AI job ended in terminal state {state.job_state}", reason_code="ai_repair_job_failed",
+            )
 
         state.after = fetch_authored_snapshot(client=client, model_id=context.model_id, branch_id=branch_id)
         state.difference = inspect_repair_change(
@@ -119,21 +122,30 @@ def run_ai_repair(
 
         post_issues = client.validate_model(context.model_id, branch_id=branch_id)
         if any(not bool(issue.get("is_warning")) for issue in post_issues):
+            state.validation_summary = _validation_summary({
+                "policy_decision": "fail",
+                "issues": [dict(issue, validator="model", reason_code="model_validation_issue", severity="error")
+                           for issue in post_issues if not bool(issue.get("is_warning"))],
+            }, ExitCodes.VALIDATION_FAILED)
             raise OmniFlowError(
                 "AI repair did not clear every Omni model validation error",
                 exit_code=ExitCodes.VALIDATION_FAILED,
+                reason_code="ai_repair_model_errors_remain",
             )
 
         validation_report, validation_exit = validation_runner()
-        state.validation_summary = {
-            "exit_code": validation_exit,
-            "summary": validation_report.get("summary", {}),
-            "policy_decision": validation_report.get("policy_decision"),
-        }
+        state.validation_summary = _validation_summary(validation_report, validation_exit)
         if validation_exit:
             raise OmniFlowError(
                 "AI repair failed the complete configured OmniFlow validation gate",
                 exit_code=ExitCodes.VALIDATION_FAILED,
+                reason_code="ai_repair_validation_failed",
+            )
+        if validation_report.get("validation_complete") is False or validation_report.get("policy_decision") != "pass":
+            raise OmniFlowError(
+                "AI repair did not establish complete, passing validation; commit was stopped",
+                exit_code=ExitCodes.OMNI_API_ERROR,
+                reason_code="ai_repair_validation_incomplete",
             )
 
         latest = fetch_authored_snapshot(client=client, model_id=context.model_id, branch_id=branch_id)
@@ -173,6 +185,26 @@ def run_ai_repair(
     return RepairOutcome(report=report, exit_code=ExitCodes.SUCCESS)
 
 
+def _validation_summary(report: dict[str, Any], exit_code: int) -> dict[str, Any]:
+    """Keep bounded typed failed-check evidence, never arbitrary API messages."""
+    failures = [issue for issue in report.get("issues", []) if isinstance(issue, dict)
+                and issue.get("active", True) and issue.get("blocking", issue.get("severity") == "error")]
+    keys = (
+        "validator", "type", "severity", "reason_code", "cause_code", "rule_id", "rule", "validation_scope",
+        "file", "yaml_path", "field", "view", "topic", "context_reference",
+    )
+    return {
+        "exit_code": exit_code,
+        "summary": report.get("summary", {}),
+        "policy_decision": report.get("policy_decision"),
+        "validation_complete": report.get("validation_complete"),
+        "failed_check_count": len({issue.get("validator") for issue in failures}),
+        "failed_finding_count": len(failures),
+        "issues": [{key: issue[key] for key in keys if isinstance(issue.get(key), str)}
+                   for issue in failures[:20]],
+    }
+
+
 def wait_for_ai_job(
     *,
     client: OmniClient,
@@ -189,7 +221,7 @@ def wait_for_ai_job(
             return state
         remaining = deadline - monotonic()
         if remaining <= 0:
-            raise OmniAPIError("Omni AI job exceeded the configured polling timeout")
+            raise OmniAPIError("Omni AI job exceeded the configured polling timeout", reason_code="ai_repair_timeout")
         sleeper(min(2.0, remaining))
 
 
@@ -231,8 +263,10 @@ def _recover_repair_failure(
     failure = exc if isinstance(exc, OmniFlowError) else OmniFlowError(
         "AI repair encountered an internal error",
         exit_code=ExitCodes.INTERNAL_ERROR,
+        reason_code="ai_repair_internal_error",
     )
     message = str(failure)
+    state.failure_diagnostic = exception_diagnostic(failure)
     if state.commit_started:
         comment_updated = _try_complete_guard(
             guard, event, comment_id=state.comment_id, status="manual_review_required"
@@ -371,6 +405,7 @@ def _repair_report(
         "generated_at": utc_now_iso(),
         "status": status,
         "message": message,
+        **(state.failure_diagnostic or {} if state else {}),
         "model_id": context.model_id,
         "model_path": context.model_path,
         "branch_id": context.branch_id,
@@ -398,7 +433,10 @@ def _repair_report(
         "exit_code_reason": _exit_code_reason(exit_code),
         "issues": []
         if exit_code == 0
-        else [{"validator": "ai_repair", "severity": "error", "message": message}],
+        else [{
+            **(state.failure_diagnostic or {} if state else {}),
+            "validator": "ai_repair", "severity": "error", "message": message,
+        }],
     }
 
 

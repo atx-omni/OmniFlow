@@ -346,10 +346,10 @@ The example uses GitHub's `pull_request_target` event but never checks out or ex
 Do not add steps that check out and execute pull-request code in this privileged workflow. Keep ordinary dbt tests and application builds in separate `pull_request` workflows without the Omni secret.
 
 Automatic routing recognizes Omni source families within each registered model
-directory: root `model` and `relationships`, plus `*.view` (including
+directory: `model` and `relationships`, plus `*.view` (including
 `*.query.view`), `*.topic`, `*.composite_topic`, and `*.relationships` at any depth.
-Each accepts its native name or one `.yaml`/`.yml` export suffix. Here “root”
-means the root of `model_path`, not necessarily the repository root.
+Each accepts its native name or one `.yaml`/`.yml` export suffix at any depth
+inside `model_path`.
 Unrelated generic YAML and other regular files, such as Markdown or scripts, do not trigger model validation
 merely because they share that directory. Workflow, policy and registry files
 remain separate trusted controls.
@@ -357,9 +357,30 @@ remain separate trusted controls.
 During a selected model's candidate/base verification, Git-only generic YAML is
 ignored automatically; no `files.non_omni` rule is required for ordinary tooling
 YAML. A generic YAML file **returned by Omni's authored API**, however, remains
-authoritative: its exact Git counterpart and bytes must match, and an exclusion
+authoritative: its exact filename counterpart and bytes must match, and an exclusion
 rule cannot hide it. Unsupported API files fail closed rather than disappearing
-from evidence. Paths, capitalization, source aliases and safety checks are unchanged.
+from evidence.
+
+**Artifact identity is type-specific, not a folder-layout policy.** Within each
+registered `model_path`, candidate/base verification first recognizes exact authored
+paths with one supported export wrapper. Topics match by unique case-sensitive name;
+the model and global relationships definitions are singletons. Views may repeat the
+same filename across databases/schemas. Their canonical Omni names and authored
+`catalog`, `schema`, and `table_name` qualification distinguish them. Default-catalog
+omission is retained rather than guessed from an organizational folder. Query views
+do not need a physical table identity.
+
+Organizational folder differences can match through a unique filename, a canonical
+view filename, or an unambiguous qualified view counterpart. Matching uses both
+complete inventories: an already matched file never makes a remaining duplicate
+safe to guess. Distinct semantic views are not collapsed just because they point
+to the same table or have identical contents. Unknown/ambiguous identities require
+correction, not a bypass or renaming valid schema-scoped views. No connection naming
+setting changes are required.
+
+All paired contents still match exactly. New/deleted files must match the respective
+Omni candidate/base, not each other. Files never match across registered models.
+Original Git paths remain in authorized source locations and immutable blob reads.
 
 **Custom-name limitation:** a PR changing only an API-authored file with an
 unrecognized generic YAML name is not automatically routed from its filename.
@@ -407,7 +428,11 @@ Each run writes root and minimal public summaries (diagnostic schema version 2):
 
 Public outputs are constructed from fixed diagnostic codes, statuses, bounded counts, booleans, anonymous context references and a random run reference. They do not copy customer messages, names, resource IDs, paths, URLs, Git identities, raw responses or runner details. Both legacy `standard` and `strict` settings use this minimal public schema; neither re-enables detailed public output. Automation consuming the old identity-rich schema must migrate. Deployment readiness uses private, in-memory evidence instead of public artifacts. See [Diagnostic Privacy](docs/DIAGNOSTIC_PRIVACY.md).
 
+Start with the report's **Primary blocker** and **Next action**. Safe diagnostics preserve the API operation/status, reason code, scope, retry count, parser location or configuration key when known. The tool version and full OmniFlow Action pin identify the build; they are not customer Git revisions. Check execution distinguishes completed, skipped, partial, unavailable and not-run checks, with elapsed time and blocking-stage context. See [worked diagnostic examples](docs/VALIDATION_DIAGNOSTICS.md#read-the-cause-before-changing-the-model).
+
 **Private-repository default:** `omniflow run` now generates a separate repository-only report when GitHub.com confirms a private same-repository run and the authored Omni snapshots match the immutable Git revisions. It adds verified source files, line numbers and supported field/view/topic identifiers with corrective guidance. No source excerpts, data values, raw API messages or Omni-only dashboard identities are copied. Unsupported findings remain unmapped rather than receiving guessed locations. Public/fork/unverifiable runs and standalone report commands remain minimal; PR comments, logs, annotations and Code Security uploads stay minimal in all modes.
+
+A mismatch can also produce up to five **observed path examples** after the private-repository, trusted model and immutable revision checks succeed. These observations explain the mismatch; they do not establish correspondence, weaken the gate, or claim contents were compared when they were not. The public report explicitly explains when this separate artifact is unavailable.
 
 To opt out, merge this setting into the required root `.omniflow.yml` on the trusted target branch (usually `main`):
 

@@ -5,6 +5,13 @@ from typing import Any
 from .exceptions import OmniAPIError
 
 
+def _invalid_response(message: str) -> OmniAPIError:
+    return OmniAPIError(
+        message, reason_code="invalid_model_validation_response",
+        diagnostic_context={"service": "omni", "api_operation": "model_validation", "retryable": False},
+    )
+
+
 def normalize_model_response(payload: Any) -> list[dict[str, Any]]:
     """Validate evidence before severity classification and discard unknown metadata.
 
@@ -13,29 +20,29 @@ def normalize_model_response(payload: Any) -> list[dict[str, Any]]:
     conservative error for compatibility; present values are never coerced.
     """
     if not isinstance(payload, list):
-        raise OmniAPIError("Model validation returned an unexpected response shape")
+        raise _invalid_response("Model validation returned an unexpected response shape")
     normalized = []
     for item in payload:
         if not isinstance(item, dict):
-            raise OmniAPIError("Model validation returned an invalid issue row")
+            raise _invalid_response("Model validation returned an invalid issue row")
         message = item.get("message")
         if not isinstance(message, str):
-            raise OmniAPIError("Model validation returned an invalid issue message")
+            raise _invalid_response("Model validation returned an invalid issue message")
         is_warning = item.get("is_warning", False)
         if not isinstance(is_warning, bool):
-            raise OmniAPIError("Model validation returned an invalid warning flag")
+            raise _invalid_response("Model validation returned an invalid warning flag")
         yaml_path = item.get("yaml_path")
         if yaml_path is not None and not isinstance(yaml_path, str):
-            raise OmniAPIError("Model validation returned an invalid YAML path")
+            raise _invalid_response("Model validation returned an invalid YAML path")
         auto_fix = item.get("auto_fix")
         if auto_fix is not None:
             if not isinstance(auto_fix, dict):
-                raise OmniAPIError("Model validation returned invalid auto-fix metadata")
+                raise _invalid_response("Model validation returned invalid auto-fix metadata")
             allowed_fix = {}
             for key in ("description_short", "description_unique"):
                 if key in auto_fix:
                     if not isinstance(auto_fix[key], str):
-                        raise OmniAPIError("Model validation returned an invalid auto-fix description")
+                        raise _invalid_response("Model validation returned an invalid auto-fix description")
                     allowed_fix[key] = auto_fix[key]
             auto_fix = allowed_fix
         normalized.append(

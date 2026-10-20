@@ -50,6 +50,7 @@ def test_native_source_families_route_in_root_and_nested_models(version, model_p
         "SCHEMA/orders.view", "SCHEMA/orders.view.yaml", "SCHEMA/orders.query.view.yml",
         "Sales.topic", "Sales.topic.yaml", "Sales.composite_topic.yml",
         "SCHEMA/joins.relationships.yaml", "雪/Order Details.view.yaml",
+        "nested/model.yaml", "nested/relationships",
     ):
         contexts = select(version, model_path, [prefix + name])
         assert [context.model_id for context in contexts] == ["model"], name
@@ -62,7 +63,7 @@ def test_ancillary_changes_inside_model_do_not_select_a_model(version, model_pat
     for name in (
         "README.md", "script.py", "query.sql", "data.csv", ".DS_Store",
         "settings.json", "config.yaml", "views/settings.yaml", "topics/settings.yml",
-        "nested/model.yaml", "nested/relationships", "orders.view.yaml.yaml",
+        "orders.view.yaml.yaml",
         "orders.VIEW", "orders.YAML", "Model.yaml",
     ):
         assert select(version, model_path, [prefix + name]) == [], name
@@ -141,9 +142,11 @@ def test_readiness_uses_the_same_scoped_classifier_and_keeps_dbt_checks(monkeypa
     monkeypatch.setattr("omniflow.discovery.load_flow_metadata", lambda *a, **kw: flow)
     monkeypatch.setattr("omniflow.github.revalidation.load_flow_metadata", lambda *a, **kw: flow)
     monkeypatch.setattr("omniflow.discovery.load_pr_marker", lambda: {})
-    ancillary = ["omni/config.yaml", "omni/nested/model.yaml", "omni/README.md"]
+    ancillary = ["omni/config.yaml", "omni/nested/settings.yaml", "omni/README.md"]
     assert _readiness_route(config, ancillary) == ("not_applicable", set(), 0)
     assert _readiness_route(config, [*ancillary, "models/orders.sql"]) == ("dbt_impact", set(), 1)
-    assert _readiness_route(config, [*ancillary, "omni/model.yaml"]) == ("models", {"model"}, 0)
-    with pytest.raises(ConfigError, match="outside registered"):
-        _readiness_route(config, ["elsewhere/model.yaml"])
+    for native in ("omni/model.yaml", "omni/nested/model.yaml", "omni/nested/relationships"):
+        assert _readiness_route(config, [*ancillary, native]) == ("models", {"model"}, 0)
+    for outside in ("elsewhere/model.yaml", "elsewhere/nested/model.yaml", "elsewhere/nested/relationships"):
+        with pytest.raises(ConfigError, match="outside registered"):
+            _readiness_route(config, [outside])

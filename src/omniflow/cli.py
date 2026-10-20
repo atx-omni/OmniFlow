@@ -44,7 +44,15 @@ from .discovery import (
     load_flow_metadata,
 )
 from .downstream import generate_downstream_dependencies
-from .exceptions import ConfigError, ExitCodes, OmniAuthError, OmniFlowError, OmniResponseError, SecurityPolicyError
+from .exceptions import (
+    ConfigError,
+    ExitCodes,
+    OmniAuthError,
+    OmniFlowError,
+    OmniResponseError,
+    SecurityPolicyError,
+    exception_diagnostic,
+)
 from .execution import ValidationProgress, scope_findings
 from .exposures import run_dbt_exposure_enrichment
 from .git import current_branch, current_sha, event_name, git_executable, git_value, is_pull_request_event, pr_number
@@ -64,6 +72,7 @@ from .repository_diagnostics import (
     clear_repository_reports,
     finish_repository_context,
     publish_repository_output,
+    record_candidate_diagnostics,
     repository_reporting,
     start_repository_context,
 )
@@ -421,6 +430,7 @@ def _write_setup_failure_artifacts(*, config, output_dir: Path, exc: OmniFlowErr
         "severity": "error",
         "validator": "setup",
         "message": redact(str(exc)),
+        **exception_diagnostic(exc),
     }
     summary = _summarize([issue])
     report = {
@@ -834,7 +844,7 @@ def _run_context_steps(
         reports.append(content_report)
         all_issues.extend(content_report.get("issues", []))
         exit_code = max(exit_code, content_exit)
-        progress.complete("content", content_exit)
+        progress.complete("content", content_exit, execution_status=content_report.get("execution_status"))
 
     if config.model_validation.enabled:
         progress.begin("model")
@@ -849,7 +859,7 @@ def _run_context_steps(
         reports.append(model_report)
         all_issues.extend(model_report.get("issues", []))
         exit_code = max(exit_code, model_exit)
-        progress.complete("model", model_exit)
+        progress.complete("model", model_exit, execution_status=model_report.get("execution_status"))
 
     if config.ai_eval.enabled and config.ai_eval.prompt_sets:
         progress.begin("ai_eval")
@@ -872,7 +882,8 @@ def _run_context_steps(
         reports.append(ai_eval_report)
         all_issues.extend(ai_eval_report.get("issues", []))
         exit_code = max(exit_code, ai_eval_exit)
-        progress.complete("ai_eval", ai_eval_exit)
+        progress.complete("ai_eval", ai_eval_exit, execution_status=ai_eval_report.get("execution_status"),
+                          skipped_reason=ai_eval_report.get("skipped_reason"))
 
     diff_report = None
     head_graph = None
@@ -948,7 +959,7 @@ def _run_context_steps(
             include_personal_folders=config.omni.include_personal_folders,
         )
         write_json_report(output_dir / "dependencies.json", dependencies)
-        progress.complete("downstream")
+        progress.complete("downstream", execution_status=dependencies.get("execution_status"))
         progress.begin("contracts")
         contract_report, contract_exit = evaluate_contracts(
             diff_result=diff_report,
@@ -960,7 +971,7 @@ def _run_context_steps(
         reports.append(contract_report)
         all_issues.extend(contract_report.get("issues", []))
         exit_code = max(exit_code, contract_exit)
-        progress.complete("contracts", contract_exit)
+        progress.complete("contracts", contract_exit, execution_status=contract_report.get("execution_status"))
 
     if config.dbt_exposures.enabled:
         progress.begin("dbt_exposures")
@@ -974,7 +985,7 @@ def _run_context_steps(
         reports.append(exposure_report)
         all_issues.extend(exposure_report.get("issues", []))
         exit_code = max(exit_code, exposure_exit)
-        progress.complete("dbt_exposures", exposure_exit)
+        progress.complete("dbt_exposures", exposure_exit, execution_status=exposure_report.get("execution_status"))
 
     if enforce_breaking_hold and config.breaking_change_hold.enabled:
         progress.begin("breaking_change_hold")
@@ -1073,7 +1084,7 @@ def _collect_candidate_health(*, config, client, context, branch_id, output_dir,
             mark_health_only(health)
             progress.reports.append(health)
             progress.issues.extend(health.get("issues", []))
-            progress.complete(name, code)
+            progress.complete(name, code, execution_status=health.get("execution_status"))
         except Exception as exc:
             progress.fail(exc)
             issue = {
@@ -1083,6 +1094,7 @@ def _collect_candidate_health(*, config, client, context, branch_id, output_dir,
             }
             if isinstance(exc, OmniResponseError):
                 issue.update(exc.report_issue(validator=name))
+            issue.update(exception_diagnostic(exc))
             progress.issues.append(issue)
             progress.reports.append({"validator": name, "validation_complete": False, "issues": [issue]})
 
@@ -1124,6 +1136,7 @@ def _write_context_failure_artifacts(
         issue = exc.report_issue(redact_document_names=config.security.redact_document_names)
     if isinstance(exc, OmniResponseError):
         issue = exc.report_issue(validator=progress.current)
+    issue.update(exception_diagnostic(exc))
     if issue.get("validator") == "content":
         issue["requested_validation_depth"] = (
             "full" if config.content_validation.force_full_validation else "api_default"
@@ -1138,6 +1151,7 @@ def _write_context_failure_artifacts(
         if isinstance(exc, CandidateVerificationError):
             issue.update({key: value for key, value in exc.candidate_counts.items()
                           if key in CANDIDATE_COUNT_FIELDS and type(value) is int and 0 <= value <= 2**31 - 1})
+            issue["contents_comparison"] = getattr(exc, "contents_comparison", "not_compared")
         if getattr(exc, "validation_scope", None) in {"base", "branch"}:
             issue["validation_scope"] = exc.validation_scope
         context.candidate_verification = {"status": "unverified", "reason": reason}
@@ -1145,6 +1159,8 @@ def _write_context_failure_artifacts(
     issue["blocking"] = not advisory
     issues = [*progress.issues, issue]
     scope_findings(issues, model_id=context.model_id, branch_id=progress.branch_id, branch_name=context.branch_name)
+    if progress.current == "candidate":
+        record_candidate_diagnostics(context, exc, issue)
     summary = _summarize(issues)
     report = _base_report(config, context, progress.branch_id, code, issues, summary)
     report["check_reports"] = [*progress.reports, {
@@ -1217,6 +1233,7 @@ def cmd_content_validate(args: argparse.Namespace) -> int:
             "message": safe_exception_message(exc), "comparison_status": "unavailable",
             "content_health": "unknown", "regression_status": "unknown",
         }
+        issue.update(exception_diagnostic(exc))
         failure = {"validator": "content", "exit_code": exc.exit_code if isinstance(exc, OmniFlowError) else 6,
                               "policy_decision": "fail", "validation_complete": False,
                               "requested_validation_depth": (
@@ -1271,6 +1288,7 @@ def cmd_model_validate(args: argparse.Namespace) -> int:
             "validator": "model", "type": "validation_execution_failed", "severity": "error",
             "message": safe_exception_message(exc),
         }
+        issue.update(exception_diagnostic(exc))
         failure = {"validator": "model", "exit_code": exc.exit_code if isinstance(exc, OmniFlowError) else 6,
                    "policy_decision": "fail", "validation_complete": False, "issues": [issue]}
         if not isinstance(exc, SecurityPolicyError):
@@ -1645,18 +1663,20 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         )
         try:
             git_config = client.get_git_configuration(context.model_id)
-        except OmniAuthError:
-            warnings.append(
-                f"Model {context.model_id}: Git configuration verification was skipped because the token "
-                "does not allow this metadata read. Core model access succeeded."
-            )
+        except OmniAuthError as exc:
+            warnings.append(safe_exception_message(exc))
         else:
             issues.extend(_git_configuration_issues(context, git_config))
     if issues:
-        raise ConfigError("Omni Git configuration mismatch: " + "; ".join(issues))
-    for _ in warnings:
-        print("omniflow doctor warning: Git metadata verification unavailable for one model context.", file=sys.stderr)
-    print(f"omniflow doctor passed: {len(contexts)} model context(s) ready")
+        raise ConfigError("Omni Git configuration mismatch: " + "; ".join(issues),
+                          reason_code="git_configuration_mismatch")
+    for warning in warnings:
+        print(f"omniflow doctor partial: Git metadata verification unavailable. {warning}", file=sys.stderr)
+    if warnings:
+        print(f"omniflow doctor incomplete: model access succeeded for {len(contexts)} context(s); "
+              "Git configuration is not fully verified.")
+    else:
+        print(f"omniflow doctor passed: {len(contexts)} model context(s) ready")
     if any(context.environment for context in contexts):
         print("Target access/settings verified only; run PR validation to establish candidate coverage.")
     return 0
@@ -1781,10 +1801,11 @@ def _client_and_branch_for_context(context: ModelContext, timeout: int, *, api_k
             ) if record.get("modelKind") == "BRANCH" and record.get("baseModelId") == context.model_id
                 and record.get("name") == context.branch_name]
             if len(matching) != 1 or not isinstance(matching[0].get("id"), str):
+                reason = "branch_not_found" if not matching else "branch_ambiguous" if len(matching) > 1 else "branch_identity_invalid"
                 raise ConfigError(
                     "Selected target must have exactly one corresponding Omni candidate branch. "
                     "Enable Always create branches on the follower and rerun after Git synchronization; "
-                    "OmniFlow will not fall back to the production base model."
+                    "OmniFlow will not fall back to the production base model.", reason_code=reason,
                 )
         branch_id = validate_path_segment(matching[0]["id"], name="branch_id") if matching else None
         if context.branch_id and context.branch_id != branch_id:
@@ -1794,7 +1815,7 @@ def _client_and_branch_for_context(context: ModelContext, timeout: int, *, api_k
     if context.branch_name and not branch_id:
         raise ConfigError(
             f"Could not resolve Omni branch '{context.branch_name}' for model {context.model_id}. "
-            "Verify the Omni PR branch exists and the API key can list model branches."
+            "Verify the Omni PR branch exists and the API key can list model branches.", reason_code="branch_not_found",
         )
     context.branch_id = branch_id
     return client, branch_id
@@ -1950,9 +1971,11 @@ def _verify_target_git_configuration(context: ModelContext, git_config: dict[str
         if key == "modelPath" and context.model_path == "." and actual in {None, ""}:
             actual = "."
         if actual != value or (key == "gitFollower" and type(actual) is not bool):
-            raise ConfigError(f"Selected environment's Omni Git configuration does not match trusted {key}")
+            raise ConfigError(f"Selected environment's Omni Git configuration does not match trusted {key}",
+                              reason_code="git_configuration_mismatch")
     if context.git_follower and git_config.get("branchPerPullRequest") is not True:
-        raise ConfigError("Follower validation requires Always create branches (branchPerPullRequest=true)")
+        raise ConfigError("Follower validation requires Always create branches (branchPerPullRequest=true)",
+                          reason_code="follower_branch_creation_disabled")
     expected_url = str(context.web_url).removesuffix(".git").rstrip("/")
     actual_url = git_config.get("webUrl")
     clone_url = git_config.get("cloneUrl")
@@ -1963,12 +1986,14 @@ def _verify_target_git_configuration(context: ModelContext, git_config: dict[str
             host, path = value[4:].split(":", 1)
             urls.append(f"https://{host}/{path}".removesuffix(".git").rstrip("/"))
     if expected_url not in urls:
-        raise ConfigError("Selected environment's Omni Git repository does not match trusted web_url")
+        raise ConfigError("Selected environment's Omni Git repository does not match trusted web_url",
+                          reason_code="git_configuration_mismatch")
     if is_pull_request_event():
         repository = os.getenv("GITHUB_REPOSITORY")
         server = os.getenv("GITHUB_SERVER_URL", "https://github.com").rstrip("/")
         if not repository or expected_url != f"{server}/{repository}":
-            raise ConfigError("Trusted target repository does not match the GitHub PR repository")
+            raise ConfigError("Trusted target repository does not match the GitHub PR repository",
+                              reason_code="git_configuration_mismatch")
 
 
 def _git_configuration_issues(context: ModelContext, git_config: dict[str, Any]) -> list[str]:
@@ -1980,9 +2005,12 @@ def _git_configuration_issues(context: ModelContext, git_config: dict[str, Any])
     ]
     issues = []
     for label, expected, actual in checks:
-        if not expected or actual is None:
+        if not expected:
             continue
-        if _normalize_git_config_value(expected) != _normalize_git_config_value(actual):
+        normalize = (lambda value: str(value).rstrip("/")) if label == "model_path" else (
+            str if label == "base_branch" else _normalize_git_config_value
+        )
+        if normalize(expected) != normalize(actual):
             issues.append(f"{label} expected {expected!r} but Omni reports {actual!r}")
     return issues
 
@@ -2082,7 +2110,7 @@ def _purge_restricted_path(path: Path) -> None:
 def _write_unconfigured_failure_artifacts(*, output_dir: Path, exc: OmniFlowError) -> None:
     _validate_run_output_layout(output_dir)
     _purge_restricted_path(restricted_dir(output_dir))
-    issue = {"severity": "error", "validator": "setup", "message": redact(str(exc))}
+    issue = {"severity": "error", "validator": "setup", "message": redact(str(exc)), **exception_diagnostic(exc)}
     if getattr(exc, "reason_code", None) == "missing_policy_config":
         issue["reason_code"] = "missing_policy_config"
     report = {
@@ -2151,7 +2179,7 @@ def _repair_failure_report(*, config, exc: OmniFlowError) -> dict[str, Any]:
         "policy_decision": "fail",
         "exit_code": exc.exit_code,
         "exit_code_reason": _exit_code_reason(exc.exit_code),
-        "issues": [{"validator": "ai_repair", "severity": "error", "message": redact(str(exc))}],
+        "issues": [{"validator": "ai_repair", "severity": "error", "message": redact(str(exc)), **exception_diagnostic(exc)}],
     }
 
 
@@ -2171,7 +2199,7 @@ def _dbt_sync_failure_report(
         "refresh_mode": refresh_mode,
         "status": "failed",
         "raw_query_results_stored": False,
-        "issues": [{"validator": "dbt_sync", "severity": "error", "message": redact(str(exc))}],
+        "issues": [{"validator": "dbt_sync", "severity": "error", "message": redact(str(exc)), **exception_diagnostic(exc)}],
         "summary": {"total_issues": 1, "errors": 1, "warnings": 0},
         "exit_code": exc.exit_code,
         "exit_code_reason": _exit_code_reason(exc.exit_code),
@@ -2194,7 +2222,7 @@ def _write_repair_setup_failure_artifacts(*, output_dir: Path, exc: OmniFlowErro
         "policy_decision": "fail",
         "exit_code": exc.exit_code,
         "exit_code_reason": _exit_code_reason(exc.exit_code),
-        "issues": [{"validator": "ai_repair", "severity": "error", "message": redact(str(exc))}],
+        "issues": [{"validator": "ai_repair", "severity": "error", "message": redact(str(exc)), **exception_diagnostic(exc)}],
     }
     write_repair_artifacts(report, output_dir=output_dir, redaction_level="standard")
     write_artifact_manifest(

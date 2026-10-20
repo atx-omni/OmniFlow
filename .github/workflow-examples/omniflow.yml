@@ -67,6 +67,7 @@ jobs:
           include-hidden-files: true
 
       - name: Upload SARIF
+        # This publishing step is separate from the OmniFlow validation result.
         # Enable only when GitHub Code Security is available by setting the
         # repository variable OMNIFLOW_UPLOAD_SARIF to true.
         if: always() && vars.OMNIFLOW_UPLOAD_SARIF == 'true' && hashFiles('.omniflow/public/report.sarif') != ''
@@ -74,6 +75,17 @@ jobs:
         uses: github/codeql-action/upload-sarif@dc73d59c2d7bd4f8194098a91219eeee6d8a1719
         with:
           sarif_file: .omniflow/public/report.sarif
+
+      - name: Show public diagnostic summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f .omniflow/public/report.md ]; then
+            cat .omniflow/public/report.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "OmniFlow did not produce a current validation report. Inspect the first failed setup/install/route step; absence of a report is not a pass." >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       # Repository-only metadata, NOT a shareable support artifact. Repository
       # readers can download it. PR comments and Code Security keep public output.

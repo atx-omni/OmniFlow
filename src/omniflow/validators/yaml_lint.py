@@ -155,4 +155,9 @@ def _emit_diff_issue(issues: list[dict[str, Any]], rules: dict[str, str], change
     }
     rule_id = mapping.get(change.get("type"))
     if rule_id:
-        _emit(issues, rules, rule_id, change, change.get("message", "Semantic diff rule triggered."))
+        _emit(
+            issues, rules, rule_id, change, change.get("message", "Semantic diff rule triggered."),
+            **{key: change[key] for key in (
+                "field", "previous_field", "view", "topic", "relationship", "name", "previous_name", "type",
+            ) if isinstance(change.get(key), str)},
+        )

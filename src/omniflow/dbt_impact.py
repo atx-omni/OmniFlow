@@ -103,6 +103,7 @@ def evaluate_dbt_impact(
         issues.append({
             "validator": VALIDATOR,
             "rule": COVERAGE_RULE,
+            "reason_code": "dbt_impact_coverage_incomplete",
             "severity": "error" if settings.fail_on_incomplete_coverage else "warning",
             "message": "dbt impact could not establish complete coverage. Supply complete evidence before gating.",
             "coverage_gaps": gaps[:MAX_SAMPLES],
@@ -122,6 +123,7 @@ def evaluate_dbt_impact(
         "generated_at": utc_now_iso(),
         "analysis_mode": mode,
         "coverage_complete": not gaps,
+        "execution_status": "partial" if gaps else "completed",
         "dbt_files_analyzed": sorted(dbt_files)[:MAX_SAMPLES],
         "dbt_file_count": len(dbt_files),
         "omni_views_indexed": len({reference.identity for bucket in view_refs.values() for reference in bucket}),

@@ -1,5 +1,38 @@
 # Release notes
 
+## Unreleased — type-specific artifact matching
+
+- Replaces the unpublished blanket filename matcher that rejected valid ATX views
+  with repeated table names across schemas. Exact authored paths remain valid;
+  folder-independent matching uses typed unique names, canonical view filenames,
+  or unambiguous authored catalog/schema/table qualification. Supported single
+  `.yaml`/`.yml` wrappers and original Git paths are retained.
+- Topic names and model/global relationships singletons remain unambiguous within
+  the registered model. SQL/query views retain semantic identity without requiring
+  a physical table; multiple semantic views are never collapsed by table or bytes.
+- Candidate verification and private source reporting share the same correspondence.
+  Missing/extra artifacts, differing contents, genuine identity ambiguity and unsafe
+  evidence still block. Unrelated Git-only YAML remains ignored; exclusions cannot
+  hide an Omni source and one model cannot borrow another model's file.
+- This changes artifact identity, not validator policy or content equality. Existing
+  debt remains governed by new-only/all-issues policy; comments and whitespace still
+  count when proving the Git and Omni snapshots contain identical authored text.
+
+Local tests are not customer or hosted ATX acceptance. Publish a reviewed Action pin
+and run fresh validation before describing a customer run as resolved.
+
+## Unreleased — actionable, privacy-bounded diagnostics
+
+- Added a versioned catalog of fixed diagnostic codes and next actions. API/Git authentication, authorization, transport and response-contract failures retain their actual category through candidate checks instead of becoming generic configuration errors.
+- Public reports include safe operation/status/retry/scope/configuration facts, tool version and a validated Action pin, with the primary blocker first. Customer Git revisions, paths, raw messages, SQL and data values remain excluded. Markdown, annotations, SARIF and JUnit preserve the same diagnostic code and do not invent a source line.
+- Authorized private runs can explain candidate mismatches with at most five scoped path observations without requiring the failed correspondence check to pass. These observations are not correspondence proof. Validation gates and new-versus-existing policy are unchanged.
+- Source indexing is lazy, supports ordinary spaces/Unicode and larger inventories, and states why a location is unavailable. Valid relationship lists do not hide unrelated view locations. Unknown/ambiguous identities remain unmapped.
+- Config/metadata/parser failures identify built-in keys, expected types and source coordinates without exposing values. Failed Git discovery is no longer a successful empty change set. Doctor reports partial access truthfully and checks path/branch case.
+- Malformed exposure rows no longer establish available coverage. A refresh whose polling fails remains `status_unknown` with its started-job evidence retained internally; it is not automatically restarted. Repair refuses an explicitly incomplete post-repair validation even if optional policy returned zero.
+- Added stage progress/timing, blocked-stage explanations, truthful skipped/partial/unavailable coverage, repository-artifact availability, bootstrap guidance and a public job-summary example.
+
+Local implementation and regression evidence are not a published release, fresh hosted ATX acceptance or customer acceptance. Review and publish a new Action pin, update the consumer workflow, then run a fresh branch/base validation before claiming the customer is fixed.
+
 ## Unreleased — regression-first validation and explicit incomplete evidence
 
 - Model/content regression checks collect the live base before the candidate.
