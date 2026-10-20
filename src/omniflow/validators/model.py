@@ -7,6 +7,7 @@ from ..exceptions import OmniAPIError, OmniResponseError
 from ..model_response import normalize_model_response
 from ..omni_client import OmniClient
 from ..timestamps import utc_now_iso
+from ..validation_scope import ValidationEvidence
 
 
 def parse_model_issues(payload: Any) -> list[dict[str, Any]]:
@@ -76,9 +77,11 @@ def _compare(current: list[dict], baseline: list[dict]) -> tuple[list[dict], int
     return output, ambiguous
 
 
-def _fetch(client: OmniClient, model_id: str, branch_id: str | None, mode: str) -> list[dict]:
+def _fetch(
+    client: OmniClient, model_id: str, branch_id: str | None, mode: str, evidence: ValidationEvidence,
+) -> list[dict]:
     try:
-        return parse_model_issues(client.validate_model(model_id, branch_id=branch_id))
+        return parse_model_issues(evidence.fetch(client, "validate_model", model_id, branch_id=branch_id))
     except OmniResponseError as exc:
         exc.validation_scope = "branch" if branch_id else "base"
         exc.comparison_mode = mode
@@ -100,23 +103,26 @@ def run_model_validation(
     branch_id: str | None,
     fail_on_warnings: bool = False,
     fail_on_new_only: bool = False,
+    evidence: ValidationEvidence | None = None,
 ) -> tuple[dict[str, Any], int]:
     # Without a distinct branch this is a strict model health check, never a
     # comparison against the model itself (which would forgive every error).
     new_only = fail_on_new_only and bool(branch_id)
     mode = "new_only" if new_only else "all_issues"
-    current = _fetch(client, model_id, branch_id, mode)
+    snapshots = evidence if evidence is not None else ValidationEvidence()
     baseline = None
     ambiguous = 0
     status = "not_applicable"
     evidence = []
     if new_only:
         try:
-            baseline = _fetch(client, model_id, None, mode)
+            baseline = _fetch(client, model_id, None, mode, snapshots)
         except OmniAPIError as exc:
             status = "unavailable"
             reason = exc.reason_code if isinstance(exc, OmniResponseError) else "model_comparison_unavailable"
             evidence = [dict(_evidence_issue(reason), validation_scope="base")]
+    current = _fetch(client, model_id, branch_id, mode, snapshots)
+    if new_only:
         if baseline is not None:
             issues, ambiguous = _compare(current, baseline)
             status = "ambiguous" if ambiguous else "complete"

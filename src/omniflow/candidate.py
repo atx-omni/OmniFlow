@@ -5,11 +5,14 @@ from __future__ import annotations
 import hashlib
 import os
 import subprocess  # nosec B404
+from collections import defaultdict
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .exceptions import ConfigError, OmniFlowError
+from .file_scope import FileScopeError, NonOmniRule, excluded_semantic_paths
 from .git import git_executable
 from .model_paths import AmbiguousModelPath, identity_index, is_semantic_file
 from .revision_data import FULL_SHA, pull_request_revision, read_git_text, read_github_text
@@ -17,7 +20,10 @@ from .yaml_security import MAX_YAML_FILE_BYTES, MAX_YAML_FILES, MAX_YAML_TOTAL_B
 
 MAX_TREE_BYTES = 2 * 1024 * 1024
 MAX_TREE_ENTRIES = 10_000
-CANDIDATE_COUNT_FIELDS = frozenset({"git_file_count", "omni_file_count", "git_only_count", "omni_only_count"})
+CANDIDATE_COUNT_FIELDS = frozenset({
+    "git_file_count", "omni_file_count", "git_only_count", "omni_only_count",
+    "case_only_count", "directory_only_count", "suffix_only_count",
+})
 
 
 class CandidateVerificationError(ConfigError):
@@ -40,20 +46,24 @@ class _GitUnavailable(Exception):
     pass
 
 
-def verify_candidate(client: Any, context: Any, *, revision_side: str = "head") -> dict[str, Any]:
+def verify_candidate(
+    client: Any, context: Any, *, revision_side: str = "head", non_omni_rules: Sequence[NonOmniRule] = (),
+) -> dict[str, Any]:
     """Compare complete authored semantic snapshots without checking out PR code.
 
     Call before and after validation and compare the complete returned proofs.
     This is sampled content equality, not an atomic validation/revision lock.
     """
     try:
-        return _verify_snapshot(client, context, revision_side=revision_side)
+        return _verify_snapshot(client, context, revision_side=revision_side, non_omni_rules=non_omni_rules)
     except CandidateVerificationError as exc:
         exc.validation_scope = "base" if revision_side == "base" else "branch"
         raise
 
 
-def _verify_snapshot(client: Any, context: Any, *, revision_side: str) -> dict[str, Any]:
+def _verify_snapshot(
+    client: Any, context: Any, *, revision_side: str, non_omni_rules: Sequence[NonOmniRule] = (),
+) -> dict[str, Any]:
     if revision_side not in {"head", "base"}:
         raise CandidateVerificationError("invalid_pr_revision")
     branch_id = getattr(context, "branch_id", None) if revision_side == "head" else None
@@ -88,13 +98,26 @@ def _verify_snapshot(client: Any, context: Any, *, revision_side: str) -> dict[s
         raise CandidateVerificationError("api_snapshot_unavailable") from None
     actual = _api_files(payload)
     counts = {"git_file_count": len(expected), "omni_file_count": len(actual)}
+    # Keep the complete inventories through path, type, size and collision
+    # validation. Rules cannot erase malformed evidence or real Omni sources.
     try:
         expected_names, actual_names = identity_index(expected), identity_index(actual)
     except AmbiguousModelPath:
         raise CandidateVerificationError("ambiguous_file_identity", **counts) from None
+    try:
+        excluded = excluded_semantic_paths(expected, actual, model_path=model_path, rules=non_omni_rules)
+    except FileScopeError as exc:
+        raise CandidateVerificationError(exc.file_scope_reason, **counts) from None
+    if excluded:
+        expected = {path: entry for path, entry in expected.items() if path not in excluded}
+        expected_names = identity_index(expected)
+        counts["git_file_count"] = len(expected)
+    if not expected:
+        raise CandidateVerificationError("empty_git_snapshot", **counts)
     counts.update(git_only_count=len(expected_names.keys() - actual_names.keys()),
                   omni_only_count=len(actual_names.keys() - expected_names.keys()))
     if counts["git_only_count"] or counts["omni_only_count"]:
+        counts.update(_mismatch_category_counts(set(expected_names), set(actual_names)))
         raise CandidateVerificationError("file_inventory_mismatch", **counts)
     # Compare by authored identity, but retain original Git keys and entries for
     # independent immutable blob verification, report locations and proof digests.
@@ -122,10 +145,44 @@ def _verify_snapshot(client: Any, context: Any, *, revision_side: str) -> dict[s
             raise CandidateVerificationError("content_mismatch", **counts)
         name = path.encode("utf-8")
         digest.update(len(name).to_bytes(8, "big") + name + len(raw).to_bytes(8, "big") + raw)
-    return {
+    proof = {
         "status": "verified", "method": "authored_yaml_snapshot", f"{revision_side}_sha": sha,
         "file_count": len(expected), "snapshot_digest": digest.hexdigest(),
     }
+    if non_omni_rules:
+        proof["excluded_file_count"] = len(excluded)
+    return proof
+
+
+def _mismatch_category_counts(expected: set[str], actual: set[str]) -> dict[str, int]:
+    """Describe unique unmatched pairs without relaxing equality or exposing names."""
+    git_only, omni_only = expected - actual, actual - expected
+    counts = {}
+    for category, key in (
+        ("case_only_count", str.casefold),
+        ("directory_only_count", lambda path: PurePosixPath(path).name),
+        ("suffix_only_count", _without_yaml_suffixes),
+    ):
+        left: dict[str, list[str]] = defaultdict(list)
+        right: dict[str, list[str]] = defaultdict(list)
+        for path in git_only:
+            left[key(path)].append(path)
+        for path in omni_only:
+            right[key(path)].append(path)
+        pairs = [(paths[0], right[name][0]) for name, paths in left.items()
+                 if len(paths) == 1 and len(right.get(name, [])) == 1]
+        counts[category] = len(pairs)
+        git_only.difference_update(path for path, _ in pairs)
+        omni_only.difference_update(path for _, path in pairs)
+    return counts
+
+
+def _without_yaml_suffixes(path: str) -> str:
+    # Reporting only: unlike authored_file_identity, this can describe generic
+    # or repeated wrappers. It must never determine snapshot correspondence.
+    while path.endswith((".yaml", ".yml")):
+        path = path.rsplit(".", 1)[0]
+    return path
 
 
 def _safe_path(value: Any) -> str:

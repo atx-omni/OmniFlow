@@ -79,7 +79,7 @@ def test_verified_draft_compares_logical_parent_without_waiving_new_errors(tmp_p
     assert all(issue["raw"][CANONICAL_DOCUMENT] == PUBLISHED for issue in report["issues"])
     assert all(issue["document_identifier"] == DRAFT for issue in report["issues"])
     assert [call.args for call in client.list_document_drafts.call_args_list] == [(PUBLISHED,), (PUBLISHED,)]
-    assert [call.kwargs["branch_id"] for call in client.validate_content.call_args_list] == [BRANCH, None, BRANCH, None]
+    assert [call.kwargs["branch_id"] for call in client.validate_content.call_args_list] == [None, BRANCH, None, BRANCH]
 
 
 @pytest.mark.parametrize("healthy_in_validator", [False, True])
@@ -182,11 +182,11 @@ def test_mapping_version_validation_or_label_changes_invalidate_comparison(tmp_p
     elif change == "mapping_removed":
         client.list_document_drafts.side_effect = [[draft()], []]
     elif change in {"branch_evidence", "base_evidence"}:
-        responses = [{"content": [document(DRAFT)]}, {"content": [document(PUBLISHED)]}]
+        responses = [{"content": [document(PUBLISHED)]}, {"content": [document(DRAFT)]}]
         changed = document(DRAFT if change == "branch_evidence" else PUBLISHED, filters=[])
         responses.extend([
-            {"content": [changed if change == "branch_evidence" else document(DRAFT)]},
             {"content": [changed if change == "base_evidence" else document(PUBLISHED)]},
+            {"content": [changed if change == "branch_evidence" else document(DRAFT)]},
         ])
         client.validate_content.side_effect = responses
     else:
@@ -232,8 +232,8 @@ def test_recheck_order_only_changes_preserve_existing_occurrences_and_payload(tm
     rechecked = copy.deepcopy(current if scope == "branch" else baseline)
     recheck_issue_list(rechecked, kind).reverse()
     responses = [{"content": [item]} for item in (
-        current, baseline, rechecked if scope == "branch" else current,
-        rechecked if scope == "base" else baseline,
+        baseline, current, rechecked if scope == "base" else baseline,
+        rechecked if scope == "branch" else current,
     )]
     original = copy.deepcopy(responses)
     client = client_for()
@@ -246,7 +246,7 @@ def test_recheck_order_only_changes_preserve_existing_occurrences_and_payload(tm
     assert report["existing_issues"] == report["current_issues"] == report["baseline_issues"] == expected
     assert report["new_issues"] == report["resolved_issues"] == 0
     assert responses == original
-    assert [call.kwargs["branch_id"] for call in client.validate_content.call_args_list] == [BRANCH, None, BRANCH, None]
+    assert [call.kwargs["branch_id"] for call in client.validate_content.call_args_list] == [None, BRANCH, None, BRANCH]
 
 
 @pytest.mark.parametrize("scope", ["branch", "base"])
@@ -262,8 +262,8 @@ def test_recheck_normalization_does_not_hide_changed_messages_or_duplicate_count
     else:
         issues.append(MESSAGE)
     responses = [{"content": [item]} for item in (
-        current, baseline, rechecked if scope == "branch" else current,
-        rechecked if scope == "base" else baseline,
+        baseline, current, rechecked if scope == "base" else baseline,
+        rechecked if scope == "branch" else current,
     )]
     original = copy.deepcopy(responses)
     client = client_for()
@@ -285,9 +285,9 @@ def test_malformed_recheck_preserves_the_actual_failing_scope(tmp_path, scope):
     malformed = document(DRAFT if scope == "branch" else PUBLISHED, filters=[{"private": MESSAGE}])
     client = client_for()
     client.validate_content.side_effect = [
-        {"content": [current]}, {"content": [baseline]},
-        {"content": [malformed if scope == "branch" else current]},
+        {"content": [baseline]}, {"content": [current]},
         {"content": [malformed if scope == "base" else baseline]},
+        {"content": [malformed if scope == "branch" else current]},
     ]
     with pytest.raises(ContentEvidenceError) as caught:
         validate(tmp_path, client)

@@ -31,7 +31,7 @@ def validate(current, base, **kwargs):
         client=SimpleNamespace(validate_model=fetch), model_id="model", branch_id="branch",
         fail_on_new_only=True, **kwargs,
     )
-    assert calls == [("model", "branch"), ("model", None)]
+    assert calls == [("model", None), ("model", "branch")]
     return report, code
 
 

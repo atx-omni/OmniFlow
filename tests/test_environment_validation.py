@@ -266,8 +266,14 @@ def test_candidate_failures_are_incomplete_not_clean_content(promotion, failure)
     assert "Validation complete: `false`" in (root / ".omniflow/public/report.md").read_text()
     assert "environment" not in report["model_reports"][0]
     assert "model_id" not in report["model_reports"][0]
-    if failure != "changed_during_checks":
+    if failure == "missing":
         assert not any(kind in {"model", "content"} for kind, _ in client.calls)
+    elif failure == "stale":
+        checks = [check for check in report["model_reports"][0]["check_reports"]
+                  if check["validator"] in {"model", "content"}]
+        assert all(check["health_only"] for check in checks)
+        assert all(check["regression_status"] == "unknown" for check in checks)
+        assert any(kind in {"model", "content"} for kind, _ in client.calls)
 
 
 def test_wrong_environment_binding_fails_before_client_construction(monkeypatch):
@@ -276,6 +282,43 @@ def test_wrong_environment_binding_fails_before_client_construction(monkeypatch)
     with mock.patch("omniflow.cli.OmniClient") as client, pytest.raises(SecurityPolicyError):
         _client_and_branch_for_context(context, 60, api_key="not-sent")
     client.assert_not_called()
+
+
+@pytest.mark.parametrize("mode,api_failure,expected", [
+    ("strict", False, 2), ("advisory", False, 0), ("advisory", True, 2),
+])
+def test_sync_gap_reports_health_without_claiming_a_verified_pass(promotion, mode, api_failure, expected):
+    root, _, event, head_text, event_path = promotion
+    policy = {
+        "validation": {"mode": mode}, "contracts": {"enabled": False},
+        "checks": {"semantic_lint": {"enabled": False},
+                   "content_validation": {"fail_on_new_only": True},
+                   "model_validation": {"fail_on_new_only": True}},
+    }
+    # Policy must be on the exact trusted base, never supplied by the PR head.
+    (root / ".omniflow.yml").write_text(json.dumps(policy))
+    subprocess.run(["git", "commit", "-am", "trusted validation policy"], check=True, capture_output=True)
+    event["pull_request"]["base"]["sha"] = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    event_path.write_text(json.dumps(event))
+    client = TargetClient("prod-model", "main", True, head_text)
+    client.stale = True
+    if api_failure:
+        client.validate_model = mock.Mock(side_effect=OmniAuthError("private authentication text"))
+    with mock.patch("omniflow.cli.OmniClient", return_value=client), \
+            mock.patch("omniflow.validation_run.time.sleep"):
+        assert cmd_run(run_args(), changed_files=["omni/shared/orders.view"]) == expected
+    report = json.loads((root / ".omniflow/public/report.json").read_text())
+    markdown = (root / ".omniflow/public/report.md").read_text()
+    assert report["validation_complete"] is False
+    assert report["decision_status"] == "incomplete"
+    assert report["policy_decision"] == ("advisory" if not expected else "fail")
+    assert "Incomplete:" in markdown
+    assert "private authentication text" not in markdown
+    assert ("Health-only observation" in markdown)
+    evidence = json.loads((root / ".omniflow/public/evidence.json").read_text())
+    assert evidence["validation_status"] == "incomplete"
+    if not expected:
+        assert "<skipped " in (root / ".omniflow/public/junit.xml").read_text()
 
 
 def test_wrong_target_credential_never_falls_back_to_another_environment(promotion):

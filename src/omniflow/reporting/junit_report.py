@@ -12,15 +12,22 @@ from .issue_policy import is_blocking
 
 def to_junit(report: dict[str, Any]) -> str:
     issues = report.get("issues", [])
+    advisory = report.get("policy_decision") == "advisory" and report.get("validation_complete") is False
     suite = ElementTree.Element(
         "testsuite",
         {
             "name": "omniflow",
-            "tests": str(max(1, len(issues))),
+            "tests": str(max(1, len(issues) + int(advisory))),
             "failures": str(sum(1 for issue in issues if _is_failure(issue))),
+            **({"skipped": "1"} if advisory else {}),
         },
     )
-    if not issues:
+    if advisory:
+        case = ElementTree.SubElement(suite, "testcase", {"name": "candidate-correspondence"})
+        ElementTree.SubElement(case, "skipped", {
+            "message": "Incomplete: advisory onboarding does not establish deployment safety.",
+        })
+    if not issues and not advisory:
         ElementTree.SubElement(suite, "testcase", {"name": "omniflow"})
     for index, issue in enumerate(issues, start=1):
         case = ElementTree.SubElement(

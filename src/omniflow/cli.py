@@ -70,10 +70,12 @@ from .repository_diagnostics import (
 from .revision_data import pull_request_changed_files, pull_request_revision
 from .security import redact, validate_path_segment, validate_repo_output_path
 from .timestamps import utc_now_iso
+from .validation_run import SYNC_REASONS, mark_health_only, may_advise, verify_with_retry
+from .validation_scope import ValidationEvidence, plan_content_scope
 from .validators.ai_eval import run_ai_eval_validation
 from .validators.content import ContentEvidenceError, run_content_validation
 from .validators.model import run_model_validation
-from .validators.yaml_lint import has_error, lint_graph
+from .validators.yaml_lint import compare_lint_findings, has_error, lint_graph
 from .view_identity import ViewNamesMetadataError
 from .yaml_pull import pull_yaml
 
@@ -329,11 +331,15 @@ def _execute_run(args, *, config, output_dir: Path, changed_files: list[str] | N
         "event_type": event_name(),
         "runner": _runner_metadata(),
         "models": [_context_dict(context) for context in contexts],
-        "validation_status": "failed" if exit_code else "passed",
-        "policy_decision": "fail" if exit_code else "pass",
+        "validation_status": (
+            "incomplete" if not report["validation_complete"] else "failed" if exit_code else "passed"
+        ),
+        "policy_decision": report["policy_decision"],
         "exit_code": exit_code,
         "exit_code_reason": _exit_code_reason(exit_code),
         "validation_complete": report["validation_complete"],
+        "decision_status": report["decision_status"],
+        "enforcement_mode": config.validation.mode,
         "timestamp": utc_now_iso(),
     }
     write_public_json(output_dir / "evidence.json", evidence, redaction_level=config.security.redaction_level)
@@ -728,6 +734,12 @@ def _run_context(
         )
     except Exception as exc:
         progress.fail(exc)
+        if progress.current == "candidate":
+            # Completed observations are still useful health evidence, but a
+            # failed final provenance sample invalidates the PR attribution.
+            for check in progress.reports:
+                if check.get("validator") in {"content", "model"}:
+                    mark_health_only(check)
         exc.omniflow_progress = progress
         raise
 
@@ -749,24 +761,51 @@ def _run_context_steps(
     progress.complete("context")
     all_issues = progress.issues
     reports = progress.reports
+    evidence = ValidationEvidence()
     exit_code = 0
     verify_provenance = bool(context.environment) or regression_pr
     baseline_proof = None
     if verify_provenance:
-        from .candidate import CandidateVerificationError, verify_candidate
+        from .candidate import CandidateVerificationError
 
         progress.begin("candidate")
         context.candidate_verification = {"status": "unverified"}
-        context.candidate_verification = verify_candidate(client, context)
-        # Completion requires the second sample after every enabled check.
-        context.candidate_verification["status"] = "pending_recheck"
-        if regression_pr:
-            baseline_proof = verify_candidate(client, context, revision_side="base")
+        try:
+            proofs, verification_errors = {}, []
+            # Inspect both sides before considering advisory handling. A sync
+            # mismatch on one side must not conceal an exclusion conflict on
+            # the other side.
+            for side in (("base", "head") if regression_pr else ("head",)):
+                try:
+                    proofs[side] = verify_with_retry(
+                        client, context, revision_side=side, non_omni_rules=config.files.non_omni,
+                    )
+                except CandidateVerificationError as exc:
+                    verification_errors.append(exc)
+            if verification_errors:
+                raise next((error for error in verification_errors
+                            if error.candidate_reason not in SYNC_REASONS), verification_errors[0])
+            context.candidate_verification = proofs["head"]
+            # Completion requires the second sample after every enabled check.
+            context.candidate_verification["status"] = "pending_recheck"
+            baseline_proof = proofs.get("base")
+        except CandidateVerificationError as exc:
+            if exc.candidate_reason in SYNC_REASONS:
+                if (config.omni.include_personal_folders and config.semantic_lint.enabled
+                        and config.semantic_lint.rules.get("forbid_personal_folder_validation_scope", "error") == "error"):
+                    raise SecurityPolicyError("Configured validation visibility violates the protected scope policy.") from exc
+                _collect_candidate_health(
+                    config=config, client=client, context=context, branch_id=branch_id,
+                    output_dir=output_dir, progress=progress,
+                )
+            progress.begin("candidate")
+            raise
 
     repository_evidence = start_repository_context(
         context, client, branch_id=branch_id,
         head_proof=context.candidate_verification if verify_provenance else None,
         base_proof=baseline_proof,
+        non_omni_rules=config.files.non_omni,
     )
 
     if config.content_validation.enabled:
@@ -786,6 +825,11 @@ def _run_context_steps(
             max_samples=config.security.max_report_samples,
             redact_document_names=config.security.redact_document_names,
             allow_raw_response_output=config.security.allow_raw_response_output,
+            evidence=evidence,
+            # Git alone cannot prove indirect content dependency coverage or
+            # absence of branch drafts. Keep broad validation until an
+            # independently qualified coverage provider supplies that evidence.
+            scope_plan=plan_content_scope(None, enabled=config.content_validation.targeted),
         )
         reports.append(content_report)
         all_issues.extend(content_report.get("issues", []))
@@ -800,6 +844,7 @@ def _run_context_steps(
             branch_id=branch_id,
             fail_on_warnings=config.model_validation.fail_on_warnings,
             fail_on_new_only=config.model_validation.fail_on_new_only and not strict_health,
+            evidence=evidence,
         )
         reports.append(model_report)
         all_issues.extend(model_report.get("issues", []))
@@ -831,6 +876,7 @@ def _run_context_steps(
 
     diff_report = None
     head_graph = None
+    base_graph = None
     # The breaking-change hold reads the semantic diff, so it must be able to
     # request one even when semantic lint and contracts are both disabled.
     needs_breaking_hold = enforce_breaking_hold and config.breaking_change_hold.enabled
@@ -865,6 +911,14 @@ def _run_context_steps(
             include_personal_folders=config.omni.include_personal_folders,
             diff_result=diff_report,
         )
+        if regression_pr and base_graph is not None:
+            lint_issues = compare_lint_findings(
+                lint_issues,
+                lint_graph(
+                    base_graph, configured_rules=config.semantic_lint.rules,
+                    include_personal_folders=config.omni.include_personal_folders,
+                ),
+            )
         lint_report = {
             "tool": "omniflow",
             "validator": "semantic_lint",
@@ -956,18 +1010,25 @@ def _run_context_steps(
     if verify_provenance:
         progress.begin("candidate")
         before = dict(context.candidate_verification, status="verified")
-        after = verify_candidate(client, context)
-        if before != after:
-            context.candidate_verification = {"status": "unverified", "reason": "changed_during_validation"}
-            error = CandidateVerificationError("changed_during_validation")
-            error.validation_scope = "branch"
-            raise error
-        if baseline_proof is not None and baseline_proof != verify_candidate(client, context, revision_side="base"):
-            context.candidate_verification = {"status": "unverified", "reason": "changed_during_validation"}
-            error = CandidateVerificationError("changed_during_validation")
-            error.validation_scope = "base"
-            raise error
-        context.candidate_verification = after
+        final_proofs, final_errors = {}, []
+        for side, prior in (("head", before), ("base", baseline_proof)):
+            if prior is None:
+                continue
+            try:
+                final_proofs[side] = verify_with_retry(
+                    client, context, revision_side=side, non_omni_rules=config.files.non_omni,
+                    retry=False,  # Observed final drift must never be retried away.
+                )
+                if prior != final_proofs[side]:
+                    error = CandidateVerificationError("changed_during_validation")
+                    error.validation_scope = "branch" if side == "head" else "base"
+                    final_errors.append(error)
+            except CandidateVerificationError as exc:
+                final_errors.append(exc)
+        if final_errors:
+            raise next((error for error in final_errors
+                        if error.candidate_reason not in SYNC_REASONS), final_errors[0])
+        context.candidate_verification = final_proofs["head"]
         progress.complete("candidate")
     finish_repository_context(
         repository_evidence, context, client, all_issues, branch_id=branch_id,
@@ -983,6 +1044,47 @@ def _run_context_steps(
     report.update(progress.evidence())
     write_json_report(output_dir / "report.json", report)
     return report, exit_code
+
+
+def _collect_candidate_health(*, config, client, context, branch_id, output_dir, progress) -> None:
+    """Read-only diagnostics after ordinary sync failure; never PR approval."""
+    checks = []
+    if config.model_validation.enabled:
+        checks.append(("model", lambda: run_model_validation(
+            client=client, model_id=context.model_id, branch_id=branch_id,
+            fail_on_warnings=config.model_validation.fail_on_warnings, fail_on_new_only=False,
+        )))
+    if config.content_validation.enabled:
+        checks.append(("content", lambda: run_content_validation(
+            client=client, model_id=context.model_id, branch_id=branch_id,
+            user_id=config.omni.user_id, include_personal_folders=config.omni.include_personal_folders,
+            labels=config.content_validation.labels, history_in=output_dir / "history.json",
+            history_out=output_dir / "history.json", report_out=output_dir / "content-report.json",
+            fail_on_new_only=False, force_full_validation=config.content_validation.force_full_validation,
+            max_samples=config.security.max_report_samples,
+            redact_document_names=config.security.redact_document_names,
+            allow_raw_response_output=False,
+        )))
+    for name, run_check in checks:
+        progress.begin(name)
+        print(f"OmniFlow: collecting {name} health only; PR impact remains unverified.", flush=True)
+        try:
+            health, code = run_check()
+            mark_health_only(health)
+            progress.reports.append(health)
+            progress.issues.extend(health.get("issues", []))
+            progress.complete(name, code)
+        except Exception as exc:
+            progress.fail(exc)
+            issue = {
+                "validator": name, "severity": "error", "type": "validation_execution_failed",
+                "message": "Health evidence could not be collected.",
+                "operational_failure": True, "coverage_complete": False, "blocking": True,
+            }
+            if isinstance(exc, OmniResponseError):
+                issue.update(exc.report_issue(validator=name))
+            progress.issues.append(issue)
+            progress.reports.append({"validator": name, "validation_complete": False, "issues": [issue]})
 
 
 def _pull_analysis_yaml(*, client, model_id: str, branch_id: str | None, output_dir: Path) -> Path:
@@ -1039,6 +1141,8 @@ def _write_context_failure_artifacts(
         if getattr(exc, "validation_scope", None) in {"base", "branch"}:
             issue["validation_scope"] = exc.validation_scope
         context.candidate_verification = {"status": "unverified", "reason": reason}
+    advisory = may_advise(config, exc, progress.issues)
+    issue["blocking"] = not advisory
     issues = [*progress.issues, issue]
     scope_findings(issues, model_id=context.model_id, branch_id=progress.branch_id, branch_name=context.branch_name)
     summary = _summarize(issues)
@@ -1050,6 +1154,10 @@ def _write_context_failure_artifacts(
     }]
     report.update(progress.evidence())
     report["validation_complete"] = False
+    report["decision_status"] = "incomplete"
+    if advisory:
+        code = 0
+        report.update(policy_decision="advisory", exit_code=0, enforcement_mode="advisory")
     report["exit_code_reason"] = _exit_code_reason(code)
     write_json_report(output_dir / "report.json", report)
     return report, code
@@ -1748,6 +1856,8 @@ def _base_report(
 
 
 def _aggregate_report(config, contexts, exit_code, issues, summary, reports):
+    complete = bool(reports) and all(report.get("validation_complete") is True for report in reports)
+    advisory = not exit_code and any(report.get("policy_decision") == "advisory" for report in reports)
     return {
         "tool": "omniflow",
         "tool_version": __version__,
@@ -1762,8 +1872,10 @@ def _aggregate_report(config, contexts, exit_code, issues, summary, reports):
         "summary": summary,
         "issues": issues,
         "model_reports": reports,
-        "validation_complete": bool(reports) and all(report.get("validation_complete") is True for report in reports),
-        "policy_decision": "fail" if exit_code else "pass",
+        "validation_complete": complete,
+        "decision_status": "complete" if complete else "incomplete",
+        "enforcement_mode": config.validation.mode,
+        "policy_decision": "fail" if exit_code else "advisory" if advisory else "pass",
         "exit_code": exit_code,
         "exit_code_reason": _exit_code_reason(exit_code),
     }

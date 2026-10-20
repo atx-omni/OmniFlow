@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .exceptions import ConfigError, MissingPolicyError, SecurityPolicyError
+from .file_scope import NonOmniRule, parse_non_omni_rules
 from .security import contains_secret_key, reject_secret_keys, validate_repo_output_path
 from .trust import read_trusted_repo_text
 from .yaml_security import parse_secure_yaml
@@ -30,7 +31,9 @@ SEMANTIC_LINT_RULES = {
     "forbid_personal_folder_validation_scope",
 }
 RULE_SEVERITIES = {"off", "info", "warn", "error"}
-CONFIG_KEYS = {"omni", "checks", "reporting", "security", "contracts", "repairs", "deployment"}
+CONFIG_KEYS = {"omni", "checks", "reporting", "security", "contracts", "repairs", "deployment", "files", "validation"}
+FILE_KEYS = {"non_omni"}
+VALIDATION_KEYS = {"mode"}
 OMNI_KEYS = {
     "base_url",
     "model_id",
@@ -41,7 +44,7 @@ OMNI_KEYS = {
     "timeout",
 }
 CHECK_KEYS = {"content_validation", "model_validation", "semantic_lint", "dbt_exposures", "dbt_impact", "ai_eval"}
-CONTENT_KEYS = {"enabled", "fail_on_new_only", "labels", "classify_comment_only", "force_full_validation"}
+CONTENT_KEYS = {"enabled", "fail_on_new_only", "labels", "classify_comment_only", "force_full_validation", "targeted"}
 MODEL_KEYS = {"enabled", "fail_on_warnings", "fail_on_new_only"}
 LINT_KEYS = {"enabled", "rules"}
 EXPOSURE_KEYS = {"enabled", "fail_on_unavailable"}
@@ -202,6 +205,7 @@ class ContentValidationSettings:
     fail_on_new_only: bool = False
     classify_comment_only: bool = False
     force_full_validation: bool = False
+    targeted: bool = False
     labels: list[str] = field(default_factory=list)
 
 
@@ -298,6 +302,16 @@ class BreakingChangeHoldSettings:
 
 
 @dataclass
+class FileSettings:
+    non_omni: list[NonOmniRule] = field(default_factory=list)
+
+
+@dataclass
+class ValidationSettings:
+    mode: str = "strict"
+
+
+@dataclass
 class OmniFlowConfig:
     raw: dict[str, Any]
     source: Path | None
@@ -315,6 +329,8 @@ class OmniFlowConfig:
     dbt_sync: DbtSyncSettings
     breaking_change_hold: BreakingChangeHoldSettings
     hash: str
+    files: FileSettings = field(default_factory=FileSettings)
+    validation: ValidationSettings = field(default_factory=ValidationSettings)
 
 
 def load_config(path: str | Path | None = None) -> OmniFlowConfig:
@@ -324,6 +340,12 @@ def load_config(path: str | Path | None = None) -> OmniFlowConfig:
 
 def _to_config(raw: dict[str, Any], source: Path | None) -> OmniFlowConfig:
     omni_raw = _mapping(raw.get("omni"), "omni")
+    files_raw = _mapping(raw.get("files"), "files")
+    _reject_unknown_keys(files_raw, FILE_KEYS, "files")
+    files = FileSettings(non_omni=parse_non_omni_rules(files_raw.get("non_omni")))
+    validation_raw = _mapping(raw.get("validation"), "validation")
+    _reject_unknown_keys(validation_raw, VALIDATION_KEYS, "validation")
+    validation = ValidationSettings(mode=_validation_mode(validation_raw.get("mode", "strict")))
     checks_raw = _mapping(raw.get("checks"), "checks")
     reporting_raw = _mapping(raw.get("reporting"), "reporting")
     security_raw = _mapping(raw.get("security"), "security")
@@ -382,6 +404,7 @@ def _to_config(raw: dict[str, Any], source: Path | None) -> OmniFlowConfig:
         force_full_validation=parse_bool(
             "content_validation.force_full_validation", content_raw.get("force_full_validation"), False
         ),
+        targeted=parse_bool("content_validation.targeted", content_raw.get("targeted"), False),
         fail_on_new_only=parse_bool(
             "content_validation.fail_on_new_only",
             os.getenv("OMNI_FAIL_ON_NEW_ONLY", content_raw.get("fail_on_new_only")),
@@ -596,6 +619,8 @@ def _to_config(raw: dict[str, Any], source: Path | None) -> OmniFlowConfig:
         dbt_sync=dbt_sync,
         breaking_change_hold=breaking_change_hold,
         hash=config_hash(raw),
+        files=files,
+        validation=validation,
     )
 
 
@@ -607,6 +632,12 @@ def _string_env(env_name: str, configured: Any) -> str | None:
         raise ConfigError(f"Expected {env_name} to resolve to a string")
     stripped = value.strip()
     return stripped or None
+
+
+def _validation_mode(value: Any) -> str:
+    if not isinstance(value, str) or value not in {"strict", "advisory"}:
+        raise ConfigError("validation.mode must be strict or advisory")
+    return value
 
 
 def _redaction_level(value: Any) -> str:
@@ -807,6 +838,14 @@ def _mapping(value: Any, name: str) -> dict[str, Any]:
 
 def _validate_config_schema(raw: dict[str, Any]) -> None:
     _reject_unknown_keys(raw, CONFIG_KEYS, "config")
+    files = _mapping(raw.get("files"), "files")
+    _reject_unknown_keys(files, FILE_KEYS, "files")
+    # Validate before environment expansion: file exclusions may not depend on
+    # mutable workflow variables rather than reviewed repository policy.
+    parse_non_omni_rules(files.get("non_omni"))
+    validation = _mapping(raw.get("validation"), "validation")
+    _reject_unknown_keys(validation, VALIDATION_KEYS, "validation")
+    _validation_mode(validation.get("mode", "strict"))
     omni = _mapping(raw.get("omni"), "omni")
     checks = _mapping(raw.get("checks"), "checks")
     reporting = _mapping(raw.get("reporting"), "reporting")

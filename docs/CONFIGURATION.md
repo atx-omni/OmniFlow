@@ -86,6 +86,79 @@ A missing selected file produces configuration exit code `2` with safe, actionab
 
 The file must contain a non-empty YAML mapping; a blank file or comments alone do not satisfy setup. In customer PR workflows, keep `config` repository-relative so it is read from the trusted base. Absolute paths are intended only for explicitly trusted local files, not for loading proposed PR policy.
 
+## Trusted Non-Omni File Classification
+
+Use `files.non_omni` only for reviewed ancillary Git files that are not authored
+Omni sources. It is not a validator ignore list and does not disable routing or
+other checks. Unknown YAML inside a model directory remains included unless a
+trusted rule safely classifies it.
+
+```yaml
+files:
+  non_omni:
+    - tag: build_metadata
+      pattern: omni/sales_model/metadata/*.yaml
+      reason: Build metadata not authored by Omni
+```
+
+Patterns start at the **repository root**, not at `model_path`. Each rule requires
+exactly `tag`, `pattern`, and `reason`; no other keys are supported.
+
+- At most 100 rules. Tags are unique lowercase identifiers matching `[a-z][a-z0-9_-]{0,63}`.
+- Reasons are trimmed, printable, nonempty single-line text, at most 240 characters.
+- Patterns are case-sensitive relative POSIX paths, at most 1,024 characters.
+  Literal paths and `*` within a path component are supported. One complete `**`
+  component may match zero or more directories, for example
+  `omni/sales_model/metadata/**/*.yaml`.
+- A glob needs a literal first component and a bounded final filename pattern:
+  `*.yaml`, `omni/**`, and `omni/*` are rejected. No absolute paths, `.`/`..`,
+  empty components, trailing slash, backslashes, `?`, bracket/brace patterns,
+  `!`, `$`, or `:`. Spaces in literal directory names remain significant.
+- Duplicate tags/patterns and overlapping matches are errors, not precedence rules.
+  Known Omni names (`model`, `relationships`, typed views/topics/relationships,
+  including supported YAML wrappers) and control files/directories
+  (`.omniflow.yml`, `.omni`, `.github`, `.git`, `.omniflow`) cannot be excluded.
+- Both base and candidate inventories are checked. Any rule matching an API-returned
+  authored source, including a known filename alias, fails closed. A Git-only
+  match is excluded from snapshot correspondence only after these checks.
+
+Merge rules into the trusted base through review before relying on them. Proposed
+PR-head policy cannot hide its own changes. Public diagnostics expose bounded
+counts and fixed conflict reasons, never the rule's free text or matched paths.
+
+## Enforcement Mode
+
+`validation.mode` defaults to `strict`. Normal regression policy already permits
+matched existing debt; changing enforcement mode is not needed for that.
+
+```yaml
+validation:
+  mode: strict  # optional onboarding choice: advisory
+```
+
+`advisory` is an explicit onboarding choice for ordinary candidate synchronization
+gaps only: `file_inventory_mismatch`, `content_mismatch`,
+`missing_candidate_branch`, or `changed_during_validation`. When eligible and no
+other hard blocker exists, the run exits `0` with `policy_decision: advisory`,
+`decision_status: incomplete`, and `validation_complete: false`. Available
+model/content observations are marked `health_only: true`; PR regression status
+is `unknown`, and new/existing/resolved attribution is withheld. This is
+**nonblocking incomplete evidence, not verified merge safety**. Checks marked
+`not_run` remain unverified.
+
+Security violations, invalid/ambiguous sources, non-Omni rule conflicts,
+authentication/API failures, malformed evidence and independent policy blockers
+are not made advisory. An enabled breaking-change hold prevents the downgrade,
+even if the hold could not run; the configured personal-folder security restriction
+is checked before collecting health evidence. The run evidence's
+`validation_status: incomplete` is not `passed`. Do not use this mode as a production readiness signal.
+Keep `strict` for required merge gating; return to it after onboarding.
+
+Initial inventory/content/missing-branch sync failures get one retry after two
+seconds per affected scope. Final verification never retries an observed change
+away. A retry is not a synchronization write, and advisory mode does not repair
+the branch.
+
 ## Contract Gates
 
 `contracts.enabled` defaults to `true`. The following gates also default to `true`:
@@ -108,6 +181,7 @@ An unreferenced breaking change remains visible as risk but does not fail the de
 - `fail_on_new_only`: the canonical `.omniflow.yml` explicitly sets `true` to block new issues while reporting unchanged, identity-matched baseline issues. The underlying default for a custom policy that omits this key remains `false` (all current issues block); an explicit `false` remains supported. A passing regression gate is not a clean bill of health for existing content, and malformed/incomplete comparison evidence still blocks.
 - `classify_comment_only`: defaults to `false`. When enabled, classify immutable PR inputs conservatively and report the result. This does not skip content validation or override failures; live content/draft correspondence is not established by Git equality.
 - `force_full_validation`: defaults to `false`. Set `true` to request full-depth API validation for the branch, base, and evidence rereads. Measure runtime before adoption. Existing `omni.timeout` and workflow limits still apply; an error or timeout never triggers a shallower retry.
+- `targeted`: experimental, defaults to `false`. The current CLI always falls back to broad content validation even when `true`, because it cannot independently prove dependency coverage and absence of branch drafts. The staged targeted implementation additionally requires identical before/after selectors, bounded requests and comparable complete returned identities; unknown/global/relationship changes or incomplete, disappearing or conflicting responses require fresh broad base/candidate validation. This is not an enabled performance optimization or a comment-only/no-impact skip. Targeted partial results cannot become whole-model history.
 - `labels`: optional local filter applied after Omni validates content for the selected model server-side.
 - `OMNI_FAIL_ON_NEW_ONLY` remains an override for content validation only; it never changes model-validation policy.
 
@@ -123,11 +197,11 @@ Standalone content history is scoped to the requested depth. New history uses sc
 
 ### Shared regression and health boundaries
 
-In PR branch validation, each enabled new-only validator fetches its own fresh live-base response for the same model and compares it with the branch response. The client credential and applicable user/visibility scope stay the same. Model matching retains issue identity, severity, and occurrence counts: an additional occurrence or warning-to-error change cannot be hidden as an existing issue. Content matching also preserves occurrence and supported document/query/filter identity.
+In PR branch validation, each enabled new-only validator fetches the live-base response before the candidate response for the same model. The client credential and applicable user/visibility scope stay the same. Identical request evidence can be reused only within the current run; consistency rereads bypass that reuse. Model matching retains issue identity, severity, and occurrence counts: an additional occurrence or warning-to-error change cannot be hidden as an existing issue. Content matching also preserves occurrence and supported document/query/filter identity.
 
-New-only PR validation requires immutable Git base/head revisions and verifies live authored model YAML against those revisions before and after the checks: the Omni candidate must match the PR head, and the live base must match the trusted Git base. Unavailable, unverifiable, or out-of-sync snapshots block; a missing repository or identity override cannot replace this evidence. Synchronize the intended Omni branch/base and rerun rather than weakening the check. These before/after observations are sampled consistency checks, not an atomic lock over live models, content, or drafts.
+New-only PR validation requires immutable Git base/head revisions and verifies live authored model YAML against those revisions before and after the checks: the Omni candidate must match the PR head, and the live base must match the trusted Git base. Unavailable, unverifiable, or out-of-sync snapshots block in strict mode; the narrow onboarding advisory exception above still reports incomplete evidence, never a verified pass. A missing repository or identity override cannot replace this evidence. These before/after observations are sampled consistency checks, not an atomic lock over live models, content, or drafts.
 
-Known native `.yaml`/`.yml` filename wrappers are matched to their authored API identities without changing paths or content. Duplicate aliases, extra/missing files and byte differences still block. See [candidate verification troubleshooting](TROUBLESHOOTING.md#candidate-verification-git-and-omni-snapshots-differ) for safe counts, reason categories and upgrade guidance.
+Known native `.yaml`/`.yml` filename wrappers are matched to their authored API identities without changing paths or content. Reviewed `files.non_omni` rules can classify Git-only ancillary files as described above; they cannot hide Omni sources. Duplicate aliases remain hard failures. Other extra/missing files and byte differences prevent a verified comparison. See [candidate verification troubleshooting](TROUBLESHOOTING.md#candidate-verification-git-and-omni-snapshots-differ) for safe counts, reason categories and upgrade guidance.
 
 Matched existing findings remain visible without blocking that new-only validator; new model errors and new content issues block, while model warnings follow `fail_on_warnings`. Missing, malformed, or ambiguous evidence cannot prove that a finding already existed or that a comparison passed. A pass is not proof of a clean model/content inventory, complete instance health, or causal attribution to the PR. Other configured checks remain independent gates.
 
@@ -138,6 +212,18 @@ Orchestrated runs without a branch, post-sync validation, and repair verificatio
 Without a branch, standalone `content validate` also defaults to strict health, even when the canonical content policy is new-only. Explicit `--history-in` or `--fail-on-new-only` requests history comparison; a missing usable baseline exits `4`, not a successful empty comparison. Inside a GitHub PR, standalone content/model new-only validation is rejected with configuration exit `2`: use `omniflow run --auto`, which verifies both immutable Git revisions and the live snapshots.
 
 Matched existing content issues keep their original error severity with `state: existing` and `blocking: false` under new-only policy. Nonblocking does not mean the underlying issue has become informational or has been fixed.
+
+### Semantic Lint In Regression PRs
+
+When a verified PR uses at least one enabled model/content new-only policy,
+semantic lint also compares the candidate against the base graph. Ordinary
+findings match by rule, source/entity identity, severity and occurrence count.
+Matched debt remains visible with `state: existing`, `blocking: false`; new,
+additional or worsened findings follow their configured rule severity.
+`forbid_personal_folder_validation_scope` is an execution-scope security rule
+and never receives an existing-debt waiver. Downstream contracts and configured
+deployment holds remain independent gates. Non-PR and all-issues health checks
+retain strict lint behavior.
 
 The model `fail_on_new_only` key is a development change requiring a reviewed supporting Action revision, not a released-version promise. Older versions reject unknown policy keys. Use the [trusted-base upgrade sequence](INSTALLATION.md#step-5-merge-the-setup-into-the-base-branch); do not apply the new template blindly to an incompatible old pin.
 

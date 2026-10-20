@@ -8,7 +8,7 @@ import subprocess  # nosec B404
 from pathlib import Path
 
 from .exceptions import ConfigError
-from .git import git_executable, is_pull_request_event
+from .git import git_executable, github_event_payload, is_pull_request_event
 
 SAFE_GIT_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 MAX_TRUSTED_FILE_BYTES = 1024 * 1024
@@ -38,6 +38,18 @@ def read_trusted_repo_text(path: str | Path, *, max_bytes: int = MAX_TRUSTED_FIL
             raise ConfigError(f"Trusted repository file '{candidate}' is not valid UTF-8") from exc
 
     repo_path = _safe_repo_path(candidate)
+    event = github_event_payload()
+    pull_request = event.get("pull_request")
+    base = pull_request.get("base") if isinstance(pull_request, dict) else None
+    if isinstance(base, dict) and "sha" in base:
+        # Bind new exclusions and policy to the event's immutable trusted base,
+        # not whichever commit a mutable main ref has advanced to meanwhile.
+        from .revision_data import pull_request_revision, read_git_text
+
+        revision = pull_request_revision("base")
+        if revision is None:
+            raise ConfigError("Trusted policy requires an immutable base revision")
+        return read_git_text(revision[0], repo_path, root=Path("."), max_bytes=max_bytes)
     base_ref = _safe_base_ref(os.environ["GITHUB_BASE_REF"])
     for ref in (f"refs/remotes/origin/{base_ref}", f"refs/heads/{base_ref}"):
         object_name = f"{ref}:{repo_path}"

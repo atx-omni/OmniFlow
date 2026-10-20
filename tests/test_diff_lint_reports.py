@@ -467,9 +467,9 @@ class DiffLintReportTests(unittest.TestCase):
                 "issues": [],
             }
         )
-        self.assertIn("Skipped: no Omni semantic-layer changes were detected.", markdown)
-        self.assertIn("No reviewer action needed", markdown)
-        self.assertIn("Not evaluated because no Omni semantic-layer changes were detected.", markdown)
+        self.assertIn("Not evaluated: no eligible Omni validation context was selected.", markdown)
+        self.assertIn("Check the routing reason", markdown)
+        self.assertIn("a skipped check is not a verified pass", markdown)
         self.assertNotIn("Model ID: ``", markdown)
         self.assertNotIn("dbt exposure enrichment was not enabled", markdown)
 

@@ -83,20 +83,30 @@ CANDIDATE_REASONS = frozenset({
     "invalid_git_inventory", "invalid_pr_revision", "invalid_snapshot_encoding", "missing_candidate_branch",
     "missing_pr_revision", "snapshot_limit_exceeded", "unsafe_git_entry", "unsafe_snapshot_path",
     "changed_during_validation", "verification_unavailable", "ambiguous_file_identity",
+    "non_omni_source_conflict", "non_omni_rule_conflict",
 })
 ENUMS = {
     "validator": VALIDATORS, "type": TYPES, "issue_type": {"content", "dashboard_filter", "query"},
     "severity": {"error", "warning", "warn", "info"},
     "risk": {"info", "warning", "governance_sensitive", "security_sensitive", "breaking"},
     "risk_level": {"info", "warning", "governance_sensitive", "security_sensitive", "breaking"},
-    "policy_decision": {"pass", "fail", "skipped"},
+    "policy_decision": {"pass", "fail", "skipped", "advisory"},
+    "decision_status": {"complete", "incomplete", "no_impact"},
+    "enforcement_mode": {"strict", "advisory"},
+    "content_scope_mode": {"broad", "targeted"},
+    "content_scope_reason": {
+        "targeted_disabled", "semantic_coverage_unverified", "draft_coverage_unverified",
+        "targeted_request_limit", "unsupported_semantic_change", "empty_semantic_scope",
+        "qualified_semantic_scope", "targeted_inventory_changed",
+        "strict_health_scope", "targeted_inventory_unverified", "targeted_overlap_inconsistent",
+    },
     "operation": {"validation", "dbt_impact", "dbt_sync", "ai_repair", "ai_repair_beta"},
     "validation_scope": {"branch", "base"}, "state": {"new", "existing", "resolved", "improved"},
     "status": {"completed", "failed", "not_run", "disabled", "skipped", "passed", "unknown",
                "verified", "unverified", "pending_recheck", "not_applicable", "success", "refused",
                "proposed", "rolled_back", "manual_review_required", "available", "unavailable", "committed",
                "not_needed", "rollback_failed"},
-    "validation_status": {"passed", "failed", "skipped"},
+    "validation_status": {"passed", "failed", "skipped", "incomplete"},
     "post_sync_validation_status": {"not_run", "failed", "passed"},
     "coverage_status": {"available", "partial", "unavailable", "unknown"},
     "comparison_mode": {"all_issues", "new_only", "unknown"},
@@ -123,6 +133,8 @@ COUNTS = frozenset({
     "total_records", "total_exposures", "unmapped_dashboards", "coverage_gaps", "checks_completed",
     "checks_failed", "checks_not_run", "checks_disabled", "file_count", "changed_lines",
     "git_file_count", "omni_file_count", "git_only_count", "omni_only_count",
+    "excluded_file_count", "case_only_count", "directory_only_count", "suffix_only_count",
+    "content_selector_count",
     "modified_file_count", "regressed_count", "improved_count", "unchanged_count", "prompt_set_count",
     "refreshes_completed", "refreshes_failed", "post_sync_validations_failed", "refreshed_models", "models_requested",
 })
@@ -130,6 +142,7 @@ FLAGS = frozenset({
     "validation_complete", "coverage_complete", "blocking", "active", "content_validation_required",
     "manual_review_required", "verified", "raw_query_results_stored", "query_execution_acknowledged",
     "operational_failure", "cleanup_required",
+    "health_only",
 })
 OBJECTS = frozenset({
     "summary", "change_classification", "candidate_verification", "refresh", "post_sync_validation",
@@ -207,6 +220,14 @@ def _finding_message(issue: dict[str, Any]) -> str:
         return f"Omni API returned invalid JSON; validation could not complete. This is not a {noun} finding."
     if issue.get("type") == "candidate_verification_failed":
         reasons = {
+            "non_omni_source_conflict": (
+                "A non-Omni file rule matches an authored Omni source. Narrow the trusted files.non_omni "
+                "rule; deployed model files and their dependencies cannot be excluded."
+            ),
+            "non_omni_rule_conflict": (
+                "Multiple non-Omni rules match the same source path. Make the trusted classifications "
+                "unambiguous, then rerun."
+            ),
             "file_inventory_mismatch": (
                 "Git and Omni authored file inventories differ after matching supported YAML filename wrappers. "
                 "Check the trusted model_path and synchronize the selected Omni branch/base with its PR Git revision."
@@ -247,6 +268,8 @@ def _finding_message(issue: dict[str, Any]) -> str:
             f"{label}: {issue[key]}" for key, label in (
                 ("git_file_count", "Git files"), ("omni_file_count", "Omni files"),
                 ("git_only_count", "Git-only"), ("omni_only_count", "Omni-only"),
+                ("case_only_count", "case-only pairs"), ("directory_only_count", "directory-only pairs"),
+                ("suffix_only_count", "suffix-only pairs"),
             ) if type(issue.get(key)) is int and 0 <= issue[key] <= 2**31 - 1
         )
         if counts:
