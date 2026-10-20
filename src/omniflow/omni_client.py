@@ -10,6 +10,7 @@ import requests
 
 from . import __version__
 from .exceptions import ConfigError, OmniAPIError, OmniAuthError, OmniResponseError
+from .json_evidence import reject_duplicate_keys
 from .model_response import normalize_model_response
 from .model_yaml import validate_editable_yaml_file_name
 from .security import redact, validate_base_url, validate_path_segment
@@ -83,9 +84,14 @@ class OmniClient:
         include_personal_folders: bool = False,
         find: str | None = None,
         find_type: str | None = None,
+        force_full_validation: bool = False,
     ) -> Any:
         model_id = validate_path_segment(model_id, name="model_id")
+        if type(force_full_validation) is not bool:
+            raise ConfigError("force_full_validation must be a boolean")
         params: dict[str, Any] = {}
+        if force_full_validation:
+            params["force_full_validation"] = "true"
         if user_id:
             params["userId"] = user_id
         if branch_id:
@@ -738,7 +744,7 @@ def _bounded_response_json(response: Any) -> Any:
         if not body:
             raise OmniResponseError("empty_api_response")
         try:
-            return json.loads(body)
+            return json.loads(body, object_pairs_hook=reject_duplicate_keys)
         except (UnicodeDecodeError, ValueError) as exc:
             raise OmniResponseError("invalid_json_response") from exc
 

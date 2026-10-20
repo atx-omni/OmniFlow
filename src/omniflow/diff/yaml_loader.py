@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Any
 
 from ..exceptions import ConfigError, SecurityPolicyError
+from ..json_evidence import reject_duplicate_keys
+from ..model_paths import is_semantic_file
 from ..yaml_security import MAX_YAML_FILE_BYTES, MAX_YAML_FILES, MAX_YAML_TOTAL_BYTES, parse_secure_yaml
 
 
@@ -27,7 +29,7 @@ def load_snapshot_manifest(root: str | Path) -> dict[str, Any] | None:
     if path.stat().st_size > MAX_YAML_FILE_BYTES:
         raise SecurityPolicyError("Omni YAML snapshot manifest exceeds the 5 MiB safety limit")
     try:
-        manifest = json.loads(path.read_text(encoding="utf-8"))
+        manifest = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=reject_duplicate_keys)
     except (ValueError, UnicodeDecodeError) as exc:
         raise ConfigError("Invalid Omni YAML snapshot manifest; refresh the snapshot") from exc
     if not isinstance(manifest, dict) or not isinstance(manifest.get("files"), dict):
@@ -76,8 +78,11 @@ def load_yaml_snapshot(root: str | Path) -> tuple[dict[str, Any], dict[str, Any]
             text = raw.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise ConfigError(f"Omni YAML file '{rel}' is not valid UTF-8") from exc
-        if _is_yaml_model_file(path):
-            files[rel] = _parse_yaml(text, source=rel)
+        if not _is_yaml_model_file(path):
+            # An authoritative inventory cannot claim complete coverage while
+            # silently excluding an unsupported authored file from analysis.
+            raise ConfigError("Omni YAML snapshot contains an unsupported authored file")
+        files[rel] = _parse_yaml(text, source=rel)
     return files, manifest
 
 
@@ -112,13 +117,7 @@ def parse_yaml_file_map(files: dict[str, str]) -> dict[str, Any]:
 
 
 def _is_yaml_model_file(path: Path) -> bool:
-    return path.name in {"model", "relationships"} or path.suffix in {
-        ".yaml",
-        ".yml",
-        ".view",
-        ".topic",
-        ".composite_topic",
-    }
+    return is_semantic_file(path.as_posix())
 
 
 def _parse_yaml(text: str, *, source: str) -> Any:

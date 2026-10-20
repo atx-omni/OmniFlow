@@ -8,8 +8,20 @@ Git names for blob reads, snapshot digests, and source locations.
 from __future__ import annotations
 
 from collections.abc import Iterable
+from pathlib import PurePosixPath
 
 _AUTHORED_SUFFIXES = (".view", ".topic", ".composite_topic", ".relationships")
+SEMANTIC_SUFFIXES = frozenset((*_AUTHORED_SUFFIXES, ".yaml", ".yml"))
+
+
+def is_semantic_file(path: str) -> bool:
+    """Classify an already-scoped path without changing its case or identity.
+
+    Candidate verification and snapshot analysis must accept the same authored
+    formats. Repository routing still applies its own model-scope boundaries.
+    """
+    value = PurePosixPath(path)
+    return value.name in {"model", "relationships"} or value.suffix in SEMANTIC_SUFFIXES
 
 
 class AmbiguousModelPath(ValueError):

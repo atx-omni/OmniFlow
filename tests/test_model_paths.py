@@ -1,7 +1,7 @@
 import pytest
 
 from omniflow.discovery import _is_probable_omni_file, _is_under_model_path
-from omniflow.model_paths import AmbiguousModelPath, authored_file_identity, identity_index
+from omniflow.model_paths import AmbiguousModelPath, authored_file_identity, identity_index, is_semantic_file
 
 
 @pytest.mark.parametrize("path,expected", [
@@ -45,3 +45,17 @@ def test_root_model_routing_recognizes_native_typed_exports(path):
 @pytest.mark.parametrize("path", ["SCHEMA/settings.yaml", "SCHEMA/orders.view.yaml.yaml"])
 def test_root_routing_does_not_guess_unknown_yaml(path):
     assert not _is_probable_omni_file(path)
+
+
+@pytest.mark.parametrize("path", [
+    "model", "relationships", "joins.relationships", "joins.relationships.yaml", "joins.relationships.yml",
+    "SCHEMA/orders.query.view", "A Space/orders.view.yaml", "sales.composite_topic", "nested/model.yaml",
+])
+def test_candidate_and_analysis_use_the_same_file_classifier(path):
+    from pathlib import Path
+
+    from omniflow.candidate import _semantic_path
+    from omniflow.diff.yaml_loader import _is_yaml_model_file
+
+    assert is_semantic_file(path)
+    assert _semantic_path(path) == _is_yaml_model_file(Path(path))

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .exceptions import ConfigError, OmniAPIError, SecurityPolicyError
+from .model_paths import is_semantic_file
 from .omni_client import OmniClient
 from .security import secure_mkdir, secure_write_text
 from .view_identity import normalize_api_view_names
@@ -71,6 +72,8 @@ def _validate_file_map(root: Path, files: dict[str, str]) -> list[tuple[str, str
     total_bytes = 0
     validated: list[tuple[str, str, Path]] = []
     for file_name, text in files.items():
+        if not is_semantic_file(file_name):
+            raise OmniAPIError("Omni YAML file inventory contains an unsupported authored file")
         size = len(text.encode("utf-8"))
         if size > MAX_YAML_FILE_BYTES:
             raise SecurityPolicyError(f"Omni YAML file '{file_name[:240]}' exceeds the 5 MiB safety limit")
@@ -110,7 +113,10 @@ def _safe_yaml_target(root: Path, file_name: str) -> Path:
 
 
 def _extract_file_map(payload: dict[str, Any]) -> dict[str, str]:
-    candidates = payload.get("files") or payload.get("fileMap") or payload.get("yaml")
+    inventories = [payload[key] for key in ("files", "fileMap", "yaml") if key in payload]
+    if len(inventories) > 1:
+        raise OmniAPIError("Omni YAML response contains competing file inventories")
+    candidates = inventories[0] if inventories else None
     files: dict[str, str] = {}
     if isinstance(candidates, dict):
         for key, value in candidates.items():
@@ -118,10 +124,11 @@ def _extract_file_map(payload: dict[str, Any]) -> dict[str, str]:
                 raise OmniAPIError("Omni YAML file inventory contains a non-string file path")
             if isinstance(value, str):
                 files[key] = value
-            elif isinstance(value, dict) and isinstance(value.get("contents"), str):
-                files[key] = value["contents"]
-            elif isinstance(value, dict) and isinstance(value.get("content"), str):
-                files[key] = value["content"]
+            elif isinstance(value, dict):
+                variants = [value[name] for name in ("content", "contents") if name in value]
+                if not variants or any(not isinstance(item, str) for item in variants) or len(set(variants)) != 1:
+                    raise OmniAPIError("Omni YAML file inventory contains unsupported or conflicting content")
+                files[key] = variants[0]
             else:
                 raise OmniAPIError("Omni YAML file inventory contains an entry without supported string content")
     return files

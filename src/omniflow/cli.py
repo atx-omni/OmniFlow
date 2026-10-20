@@ -782,6 +782,7 @@ def _run_context_steps(
             history_out=output_dir / "history.json",
             report_out=output_dir / "content-report.json",
             fail_on_new_only=config.content_validation.fail_on_new_only and bool(branch_id) and not strict_health,
+            force_full_validation=config.content_validation.force_full_validation,
             max_samples=config.security.max_report_samples,
             redact_document_names=config.security.redact_document_names,
             allow_raw_response_output=config.security.allow_raw_response_output,
@@ -1021,6 +1022,10 @@ def _write_context_failure_artifacts(
         issue = exc.report_issue(redact_document_names=config.security.redact_document_names)
     if isinstance(exc, OmniResponseError):
         issue = exc.report_issue(validator=progress.current)
+    if issue.get("validator") == "content":
+        issue["requested_validation_depth"] = (
+            "full" if config.content_validation.force_full_validation else "api_default"
+        )
     if isinstance(exc, ViewNamesMetadataError):
         issue.update(metadata_stage=exc.metadata_stage, metadata_reason=exc.metadata_reason)
     if progress.current == "candidate":
@@ -1040,6 +1045,8 @@ def _write_context_failure_artifacts(
     report = _base_report(config, context, progress.branch_id, code, issues, summary)
     report["check_reports"] = [*progress.reports, {
         "validator": issue["validator"], "coverage_complete": False, "issues": [issue],
+        **({"requested_validation_depth": issue["requested_validation_depth"]}
+           if "requested_validation_depth" in issue else {}),
     }]
     report.update(progress.evidence())
     report["validation_complete"] = False
@@ -1085,6 +1092,7 @@ def cmd_content_validate(args: argparse.Namespace) -> int:
             history_out=history_out,
             report_out=private / "report.json",
             fail_on_new_only=fail_on_new_only,
+            force_full_validation=config.content_validation.force_full_validation,
             max_samples=config.security.max_report_samples,
             redact_document_names=config.security.redact_document_names,
             allow_raw_response_output=args.unsafe_raw_output,
@@ -1103,7 +1111,11 @@ def cmd_content_validate(args: argparse.Namespace) -> int:
         }
         failure = {"validator": "content", "exit_code": exc.exit_code if isinstance(exc, OmniFlowError) else 6,
                               "policy_decision": "fail", "validation_complete": False,
+                              "requested_validation_depth": (
+                                  "full" if config.content_validation.force_full_validation else "api_default"
+                              ),
                               "issues": [issue]}
+        issue["requested_validation_depth"] = failure["requested_validation_depth"]
         # A rejected filesystem target must never be retried by a fallback writer.
         if not isinstance(exc, SecurityPolicyError):
             write_public_reports(failure, output_dir=output_dir, formats=config.reporting.formats,

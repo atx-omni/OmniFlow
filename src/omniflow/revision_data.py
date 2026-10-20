@@ -16,6 +16,7 @@ from .trust import SAFE_GIT_REF_RE, _safe_repo_path
 
 FULL_SHA = re.compile(r"^[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?$")
 REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+COMPARE_FILE_STATUSES = frozenset({"added", "removed", "modified", "renamed", "copied", "changed", "unchanged"})
 
 
 def pull_request_changed_files(*, root: Path = Path(".")) -> list[str] | None:
@@ -30,7 +31,7 @@ def pull_request_changed_files(*, root: Path = Path(".")) -> list[str] | None:
             cwd=root, check=True, capture_output=True, timeout=15,
         )
         if len(result.stdout) > 1024 * 1024:
-            raise SecurityPolicyError("Immutable dbt changed-file inventory exceeds 1 MiB")
+            raise SecurityPolicyError("Immutable PR changed-file inventory exceeds 1 MiB")
         files = [item for item in result.stdout.decode("utf-8").split("\x00") if item]
     except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
         # Share the bounded GitHub transport; lazy import avoids a module cycle.
@@ -42,17 +43,28 @@ def pull_request_changed_files(*, root: Path = Path(".")) -> list[str] | None:
         # The compare API returns at most 300 files. No remaining-file pagination
         # contract exists, so reaching the limit is conservatively incomplete.
         if not isinstance(records, list) or len(records) >= 300:
-            raise ConfigError("Exact dbt comparison is incomplete; make both Git revisions available locally") from None
+            raise ConfigError("Exact PR comparison is incomplete; make both Git revisions available locally") from None
         files = []
         for record in records:
-            if not isinstance(record, dict) or not isinstance(record.get("filename"), str):
-                raise ConfigError("Exact dbt comparison returned an invalid file record") from None
-            files.append(record["filename"])
-            if record.get("status") == "renamed":
-                if not isinstance(record.get("previous_filename"), str):
-                    raise ConfigError("Renamed dbt file is missing its previous path") from None
-                files.append(record["previous_filename"])
-    return list(dict.fromkeys(_safe_repo_path(Path(path)) for path in files))
+            if not isinstance(record, dict):
+                raise ConfigError("Exact PR comparison returned an invalid file record") from None
+            status = record.get("status")
+            if not isinstance(status, str) or status not in COMPARE_FILE_STATUSES:
+                raise ConfigError("Exact PR comparison returned an invalid file status") from None
+            files.append(_changed_file_path(record.get("filename")))
+            if status == "renamed":
+                files.append(_changed_file_path(record.get("previous_filename")))
+    return list(dict.fromkeys(_changed_file_path(path) for path in files))
+
+
+def _changed_file_path(value: object) -> str:
+    """Reject incomplete or normalized-away paths; never trim real file names."""
+    if not isinstance(value, str) or not value.strip() or value == ".":
+        raise ConfigError("Exact PR comparison returned an invalid file path")
+    normalized = _safe_repo_path(Path(value))
+    if normalized != value:
+        raise ConfigError("Exact PR comparison returned a noncanonical file path")
+    return value
 
 
 def pull_request_revision(side: str) -> tuple[str, str] | None:
@@ -60,7 +72,8 @@ def pull_request_revision(side: str) -> tuple[str, str] | None:
         return None
     pr = github_event_payload().get("pull_request", {})
     value = pr.get(side, {}) if isinstance(pr, dict) else {}
-    sha = value.get("sha") if isinstance(value, dict) else None
+    value = value if isinstance(value, dict) else {}
+    sha = value.get("sha")
     repo = value.get("repo", {}).get("full_name") if isinstance(value.get("repo"), dict) else None
     if not isinstance(sha, str) or not FULL_SHA.fullmatch(sha):
         raise ConfigError(f"Pull request {side} must identify an exact commit SHA")
