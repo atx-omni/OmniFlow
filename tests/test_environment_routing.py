@@ -136,13 +136,14 @@ class EnvironmentRoutingTests(unittest.TestCase):
             with self.subTest(filename=filename), self.assertRaisesRegex(ConfigError, "outside every model_path"):
                 self.discover(changed_files=[f"omni/unregistered/{filename}"])
 
-    def test_root_target_routes_generic_yaml_and_other_target_paths_cannot_skip(self):
+    def test_root_target_ignores_generic_yaml_but_other_target_sources_cannot_skip(self):
         flow = registry()
         flow["models"][1]["model_path"] = "."
-        self.assertEqual(len(self.discover(flow=flow, changed_files=["orders.yaml"])), 1)
+        self.assertEqual(self.discover(flow=flow, changed_files=["orders.yaml"]), [])
         flow["models"][1]["model_path"] = "omni/production"
+        self.assertEqual(self.discover(flow=flow, changed_files=["omni/shared/orders.yaml"]), [])
         with self.assertRaisesRegex(ConfigError, "outside every model_path"):
-            self.discover(flow=flow, changed_files=["omni/shared/orders.yaml"])
+            self.discover(flow=flow, changed_files=["omni/shared/orders.view.yaml"])
 
     def test_event_and_environment_base_or_head_disagreement_fails_closed(self):
         for changes in ({"event_base": "develop"}, {"event_head": "feature/different"}):

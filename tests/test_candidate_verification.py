@@ -262,8 +262,8 @@ def test_native_export_wrapper_matches_api_without_changing_git_proof(snapshot, 
 @pytest.mark.parametrize("change,reason,counts", [
     ("git_collision", "ambiguous_file_identity", (10, 9)),
     ("api_collision", "ambiguous_file_identity", (9, 10)),
-    ("double_wrapper", "file_inventory_mismatch", (9, 9)),
-    ("generic_yaml", "file_inventory_mismatch", (9, 9)),
+    ("double_wrapper", "file_inventory_mismatch", (8, 9)),
+    ("generic_yaml", "file_inventory_mismatch", (8, 9)),
     ("case_difference", "file_inventory_mismatch", (9, 9)),
     ("changed_bytes", "content_mismatch", (9, 9)),
 ])
@@ -293,7 +293,12 @@ def test_filename_correspondence_does_not_weaken_verification(snapshot, change, 
     assert error.candidate_reason == reason
     assert (error.candidate_counts["git_file_count"], error.candidate_counts["omni_file_count"]) == counts
     assert "SCHEMA" not in str(error)
-    if change in {"double_wrapper", "generic_yaml", "case_difference"}:
+    if change in {"double_wrapper", "generic_yaml"}:
+        # Unknown Git YAML is ignored, but the missing API-authored counterpart
+        # still prevents a verified pass. No generic filename alias is invented.
+        assert error.candidate_counts["git_only_count"] == 0
+        assert error.candidate_counts["omni_only_count"] == 1
+    if change == "case_difference":
         assert error.candidate_counts["git_only_count"] == error.candidate_counts["omni_only_count"] == 1
     if change == "changed_bytes":
         assert error.candidate_counts["git_only_count"] == error.candidate_counts["omni_only_count"] == 0

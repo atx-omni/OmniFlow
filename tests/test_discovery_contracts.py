@@ -117,7 +117,7 @@ class DiscoveryTests(unittest.TestCase):
                 with self.assertRaises(ConfigError):
                     discover_contexts(auto=True, allow_skip=True)
 
-    def test_nested_unregistered_omni_files_fail_closed(self):
+    def test_nested_generic_yaml_is_not_guessed_to_be_an_unregistered_omni_source(self):
         with temporary_workdir() as tmp:
             write_json(
                 tmp / ".omni/flow.json",
@@ -137,8 +137,8 @@ class DiscoveryTests(unittest.TestCase):
                 {"OMNIFLOW_CHANGED_FILES": "omni/unregistered/views/orders.yaml"},
                 clear=True,
             ):
-                with self.assertRaises(ConfigError):
-                    discover_contexts(auto=True, allow_skip=True)
+                contexts = discover_contexts(auto=True, allow_skip=True)
+        self.assertEqual(contexts, [])
 
     def test_multi_model_selection_by_changed_file_prefix(self):
         with temporary_workdir() as tmp:
@@ -505,8 +505,9 @@ class DiscoveryTests(unittest.TestCase):
 
         contexts = select_model_contexts(
             flow,
-            changed_files=["views/orders.yaml", "models/marts/orders.sql"],
+            changed_files=["views/orders.view.yaml", "models/marts/orders.sql"],
             branch_name="feature/omni",
+            allow_skip=True,
         )
         self.assertEqual([context.model_id for context in contexts], ["model-1"])
 

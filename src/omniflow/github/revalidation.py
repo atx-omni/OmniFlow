@@ -18,7 +18,7 @@ import requests
 
 from ..config import load_config
 from ..diagnostics import safe_exception_message
-from ..discovery import _is_probable_omni_file, _is_under_model_path, discover_contexts, load_flow_metadata
+from ..discovery import _is_under_model_path, _is_unregistered_omni_file, discover_contexts, load_flow_metadata
 from ..exceptions import ConfigError, SecurityPolicyError
 from ..git import git_value
 from ..json_evidence import reject_duplicate_keys
@@ -107,7 +107,7 @@ def _readiness_route(config, changed_files: list[str]) -> tuple[str, set[str], i
     _require_legacy_readiness_flow(flow)
     models = flow["models"] if flow else []
     for path in changed_files:
-        if _is_probable_omni_file(path) and not any(
+        if _is_unregistered_omni_file(path, [model["model_path"] for model in models]) and not any(
             _is_under_model_path(path, model["model_path"]) for model in models
         ):
             raise ConfigError("Readiness cannot skip Omni files outside registered model paths")
