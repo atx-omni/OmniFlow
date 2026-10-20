@@ -44,12 +44,18 @@ def read_trusted_repo_text(path: str | Path, *, max_bytes: int = MAX_TRUSTED_FIL
     if isinstance(base, dict) and "sha" in base:
         # Bind new exclusions and policy to the event's immutable trusted base,
         # not whichever commit a mutable main ref has advanced to meanwhile.
-        from .revision_data import pull_request_revision, read_git_text
+        from .revision_data import pull_request_revision, read_git_text, read_github_text
 
         revision = pull_request_revision("base")
         if revision is None:
             raise ConfigError("Trusted policy requires an immutable base revision")
-        return read_git_text(revision[0], repo_path, root=Path("."), max_bytes=max_bytes)
+        try:
+            return read_git_text(revision[0], repo_path, root=Path("."), max_bytes=max_bytes)
+        except ConfigError:
+            # Shallow Actions checkouts may contain only the merge commit. The
+            # same immutable base can be read as bounded data; never substitute
+            # the checked-out PR policy or a mutable branch reference.
+            return read_github_text(revision[1], revision[0], repo_path, max_bytes=max_bytes)
     base_ref = _safe_base_ref(os.environ["GITHUB_BASE_REF"])
     for ref in (f"refs/remotes/origin/{base_ref}", f"refs/heads/{base_ref}"):
         object_name = f"{ref}:{repo_path}"
