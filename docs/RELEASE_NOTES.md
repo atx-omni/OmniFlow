@@ -1,5 +1,11 @@
 # Release notes
 
+## Unreleased — certificate trust-store security refresh
+
+- Requires Certifi 2026.10.19 or newer and updates the hash-locked Action/release
+  runtime to that patch, addressing GHSA-6q48-6c7w-9gw2. TLS certificate validation
+  stays enabled; no custom trust exceptions or audit suppressions are added.
+
 ## Unreleased — type-specific artifact matching
 
 - Replaces the unpublished blanket filename matcher that rejected valid ATX views
