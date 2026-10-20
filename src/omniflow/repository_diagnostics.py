@@ -25,6 +25,7 @@ from .candidate import (
     _semantic_inventory,
 )
 from .exceptions import ConfigError, SecurityPolicyError
+from .file_scope import excluded_semantic_paths
 from .model_paths import identity_index
 from .repository_locations import SnapshotIndex
 from .repository_policy import RepositoryPolicy, resolve_repository_policy
@@ -153,11 +154,14 @@ def _verified_text(policy: RepositoryPolicy, sha: str, entry: dict, *, max_bytes
     return text
 
 
-def _load_snapshot(policy: RepositoryPolicy, model_path: str, side: str) -> Snapshot:
+def _load_snapshot(policy: RepositoryPolicy, model_path: str, side: str, *, non_omni_rules=()) -> Snapshot:
     sha = policy.head_sha if side == "head" else policy.base_sha
     model_path = "." if model_path == "." else _safe_path(model_path)
     entries = _tree(policy, sha)
     inventory = _semantic_inventory(entries, model_path)
+    if non_omni_rules:
+        excluded = excluded_semantic_paths(inventory, {}, model_path=model_path, rules=non_omni_rules)
+        inventory = {path: entry for path, entry in inventory.items() if path not in excluded}
     if not inventory:
         raise ConfigError("Repository diagnostic snapshot is empty")
     # Snapshot keys and digests remain exact Git paths. Independently reject
@@ -195,7 +199,8 @@ def _matches(snapshot: Snapshot, *, proof: dict | None, side: str, client: Any,
 
 
 def start_repository_context(context: Any, client: Any, *, branch_id: str | None,
-                             head_proof: dict | None = None, base_proof: dict | None = None) -> ContextEvidence | None:
+                             head_proof: dict | None = None, base_proof: dict | None = None,
+                             non_omni_rules=()) -> ContextEvidence | None:
     state = _session.get()
     if state is None or not state.policy.enabled:
         return None
@@ -204,7 +209,11 @@ def start_repository_context(context: Any, client: Any, *, branch_id: str | None
         if not _registered_context(state.policy, context):
             raise ConfigError("Repository diagnostic context is unregistered")
         for side, proof in (("head", head_proof), ("base", base_proof)):
-            snapshot = _load_snapshot(state.policy, context.model_path, side)
+            # Exclusion-aware repository detail is enabled only with a complete
+            # candidate proof; an unverified rule cannot authorize disclosure.
+            if non_omni_rules and not proof:
+                continue
+            snapshot = _load_snapshot(state.policy, context.model_path, side, non_omni_rules=non_omni_rules)
             if _matches(snapshot, proof=proof, side=side, client=client, context=context, branch_id=branch_id):
                 evidence.snapshots[side] = snapshot
     except Exception:

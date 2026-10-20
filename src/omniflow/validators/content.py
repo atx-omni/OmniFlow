@@ -10,6 +10,7 @@ from ..exceptions import OmniAPIError, OmniResponseError
 from ..omni_client import OmniClient
 from ..security import redact, secure_write_text
 from ..timestamps import utc_now_iso
+from ..validation_scope import MAX_TARGETED_SELECTORS, ContentScopePlan, ValidationEvidence
 from .content_identity import (
     CANONICAL_DOCUMENT,
     CANONICAL_QUERY,
@@ -556,18 +557,84 @@ def compare_history(
 def _fetch_validator_payload(
     client: OmniClient, model_id: str, *, branch_id: str | None, user_id: str | None,
     include_personal_folders: bool, comparison_mode: str, force_full_validation: bool = False,
+    evidence: ValidationEvidence, refresh: bool = False, selector: tuple[str, str] | None = None,
 ) -> Any:
     try:
-        return client.validate_content(
-            model_id, branch_id=branch_id, user_id=user_id,
+        return evidence.fetch(
+            client, "validate_content", model_id, refresh=refresh, branch_id=branch_id, user_id=user_id,
             include_personal_folders=include_personal_folders,
             **({"force_full_validation": True} if force_full_validation else {}),
+            **({"find_type": selector[0], "find": selector[1]} if selector else {}),
         )
     except OmniResponseError as exc:
         exc.validation_scope = "branch" if branch_id else "base"
         exc.comparison_mode = comparison_mode
         exc.requested_validation_depth = "full" if force_full_validation else "api_default"
         raise
+
+
+class _TargetedScopeIncomplete(Exception):
+    """Valid evidence that cannot establish the experimental targeted scope."""
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(reason)
+
+
+def _targeted_inventory(payload: Any) -> tuple:
+    # Explicit inventory is required for targeting; optional omissions remain
+    # accepted by broad validation. A valid empty search is not coverage proof.
+    if not isinstance(payload, dict) or not isinstance(payload.get("content"), list) or not payload["content"]:
+        raise _TargetedScopeIncomplete("targeted_inventory_unverified")
+    if any(payload.get(key) for key in ("partial", "truncated", "has_more", "next_cursor")):
+        raise _TargetedScopeIncomplete("targeted_inventory_unverified")
+    inventory = []
+    logical, physical = set(), set()
+    for document in payload["content"]:
+        identity = (document.get("identifier"), document.get("document_id"))
+        if any(not isinstance(value, str) or not value.strip() for value in identity):
+            raise _TargetedScopeIncomplete("targeted_inventory_unverified")
+        if identity[0] in logical or identity[1] in physical:
+            raise ContentEvidenceError(reason_code="ambiguous_document_identity")
+        logical.add(identity[0])
+        physical.add(identity[1])
+        if not all(isinstance(document.get(key), list) for key in ("queries_and_issues", "dashboard_filter_issues")):
+            raise _TargetedScopeIncomplete("targeted_inventory_unverified")
+        queries = []
+        for query in document["queries_and_issues"]:
+            identity_values = tuple(query.get(key) or "" for key in QUERY_IDENTITY_KEYS)
+            if not any(identity_values) or not isinstance(query.get("issues"), list):
+                raise _TargetedScopeIncomplete("targeted_inventory_unverified")
+            queries.append(identity_values)
+        if len(set(queries)) != len(queries):
+            raise _TargetedScopeIncomplete("targeted_inventory_unverified")
+        filters = []
+        for item in document["dashboard_filter_issues"]:
+            if not isinstance(item, dict) or not isinstance(item.get("filter_name"), str) or "issues" not in item:
+                raise _TargetedScopeIncomplete("targeted_inventory_unverified")
+            filters.append(item["filter_name"])
+        if len(set(filters)) != len(filters):
+            raise _TargetedScopeIncomplete("targeted_inventory_unverified")
+        inventory.append((*identity, tuple(sorted(queries)), tuple(sorted(filters))))
+    return tuple(sorted(inventory))
+
+
+def _merge_targeted_payloads(payloads: list[Any]) -> dict:
+    documents = {}
+    for payload in payloads:
+        # Validate each individual response's identities before deduplicating
+        # overlap between searches; never erase duplicates within one response.
+        _targeted_inventory(payload)
+        for document in payload["content"]:
+            identity = (document["identifier"], document["document_id"])
+            if identity in documents:
+                if evidence_signature([documents[identity]]) != evidence_signature([document]):
+                    raise _TargetedScopeIncomplete("targeted_overlap_inconsistent")
+            else:
+                documents[identity] = document
+    merged = {"content": list(documents.values())}
+    _targeted_inventory(merged)
+    return merged
 
 
 def run_content_validation(
@@ -586,21 +653,58 @@ def run_content_validation(
     max_samples: int = 20,
     redact_document_names: bool = False,
     allow_raw_response_output: bool = False,
+    scope_plan: ContentScopePlan | None = None,
+    evidence: ValidationEvidence | None = None,
 ) -> tuple[dict[str, Any], int]:
     comparison_mode = "new_only" if fail_on_new_only else "all_issues"
     requested_depth = "full" if force_full_validation else "api_default"
-    payload = _fetch_validator_payload(
-        client, model_id,
-        branch_id=branch_id,
-        user_id=user_id,
-        include_personal_folders=include_personal_folders,
-        comparison_mode=comparison_mode,
-        force_full_validation=force_full_validation,
-    )
-    payload = _prepare_validator_payload(
-        payload, [], {}, validation_scope="branch" if branch_id else "base", comparison_mode=comparison_mode,
-        requested_validation_depth=requested_depth,
-    )
+    snapshots = evidence if evidence is not None else ValidationEvidence()
+    plan = scope_plan if scope_plan is not None else ContentScopePlan()
+    if plan.mode == "targeted" and not (branch_id and fail_on_new_only):
+        plan = ContentScopePlan(reason="strict_health_scope")
+    if plan.mode == "targeted" and (
+        plan.reason != "qualified_semantic_scope"
+        or not 1 <= len(plan.selectors) <= MAX_TARGETED_SELECTORS
+        or len(set(plan.selectors)) != len(plan.selectors)
+        or any(kind not in {"FIELD", "VIEW", "TOPIC"} or not isinstance(name, str) or not name.strip()
+               for kind, name in plan.selectors)
+    ):
+        plan = ContentScopePlan(reason="semantic_coverage_unverified")
+
+    def read_scope(scope, *, refresh=False):
+        payloads = []
+        for selector in plan.selectors if plan.mode == "targeted" else (None,):
+            value = _fetch_validator_payload(
+                client, model_id, branch_id=scope, user_id=user_id,
+                include_personal_folders=include_personal_folders, comparison_mode=comparison_mode,
+                force_full_validation=force_full_validation, evidence=snapshots, refresh=refresh, selector=selector,
+            )
+            payloads.append(_prepare_validator_payload(
+                value, [], {}, validation_scope="branch" if scope else "base", comparison_mode=comparison_mode,
+                requested_validation_depth=requested_depth,
+            ))
+        try:
+            return _merge_targeted_payloads(payloads) if plan.mode == "targeted" else payloads[0]
+        except ContentEvidenceError as exc:
+            exc.validation_scope = "branch" if scope else "base"
+            exc.comparison_mode = comparison_mode
+            exc.requested_validation_depth = requested_depth
+            raise
+
+    baseline_needed = branch_id and (fail_on_new_only or labels)
+    try:
+        # Capture published debt before evaluating the candidate. No global cache
+        # or persisted history substitutes for this same-run baseline.
+        baseline_payload = read_scope(None) if baseline_needed else None
+        payload = read_scope(branch_id)
+        if plan.mode == "targeted" and _targeted_inventory(payload) != _targeted_inventory(baseline_payload):
+            raise _TargetedScopeIncomplete("targeted_inventory_changed")
+    except _TargetedScopeIncomplete as exc:
+        plan = ContentScopePlan(reason=exc.reason)
+        # Reacquire a fresh, symmetric broad comparison; never turn missing or
+        # partially returned targeted documents into clean/resolved evidence.
+        baseline_payload = read_scope(None, refresh=True) if baseline_needed else None
+        payload = read_scope(branch_id, refresh=True)
     records = client.list_content(
         labels=labels,
         branch_id=branch_id,
@@ -613,17 +717,7 @@ def run_content_validation(
     ):
         raise OmniAPIError("Content metadata is missing an identity required for label filtering")
     records_by_identifier = index_content_records(records)
-    baseline_payload = None
-    if branch_id and (fail_on_new_only or labels):
-        baseline_payload = _fetch_validator_payload(
-            client, model_id, branch_id=None, user_id=user_id,
-            include_personal_folders=include_personal_folders, comparison_mode=comparison_mode,
-            force_full_validation=force_full_validation,
-        )
-        baseline_payload = _prepare_validator_payload(
-            baseline_payload, [], {}, validation_scope="base", comparison_mode=comparison_mode,
-            requested_validation_depth=requested_depth,
-        )
+    if baseline_needed:
         if (isinstance(payload, dict) and "content" in payload
                 and isinstance(baseline_payload, dict) and "content" in baseline_payload):
             try:
@@ -644,17 +738,8 @@ def run_content_validation(
                 if proof.mappings:
                     # Bracket the actual validator evidence with mapping/version
                     # reads. A changed draft must never reuse stale error waivers.
-                    for scope, before in ((branch_id, current_docs), (None, base_docs)):
-                        after = _fetch_validator_payload(
-                            client, model_id, branch_id=scope, user_id=user_id,
-                            include_personal_folders=include_personal_folders, comparison_mode=comparison_mode,
-                            force_full_validation=force_full_validation,
-                        )
-                        after = _prepare_validator_payload(
-                            after, [], {}, validation_scope="branch" if scope else "base",
-                            comparison_mode=comparison_mode,
-                            requested_validation_depth=requested_depth,
-                        )
+                    for scope, before in ((None, base_docs), (branch_id, current_docs)):
+                        after = read_scope(scope, refresh=True)
                         if evidence_signature(before) != evidence_signature(content_documents(after)):
                             raise DocumentIdentityError("document_identity_changed")
                     proof.recheck()
@@ -769,6 +854,9 @@ def run_content_validation(
         "comparison_source": comparison_source,
         "comparison_mode": comparison_mode,
         "requested_validation_depth": requested_depth,
+        "content_scope_mode": plan.mode,
+        "content_scope_reason": plan.reason,
+        "content_selector_count": len(plan.selectors),
         "comparison_status": comparison_status,
         "content_health": "issues_in_scope" if normalized else "no_issues_in_scope",
         "regression_status": (
@@ -790,15 +878,17 @@ def run_content_validation(
         ),
     }
     write_json(report_out, redact(report))
-    write_json(
-        history_out,
-        {
-            "schema_version": HISTORY_SCHEMA_VERSION,
-            "generated_at": generated_at,
-            **history_context,
-            "issues": normalized,
-        },
-    )
+    if plan.mode != "targeted":
+        # A partial model scope must never become a reusable whole-model history.
+        write_json(
+            history_out,
+            {
+                "schema_version": HISTORY_SCHEMA_VERSION,
+                "generated_at": generated_at,
+                **history_context,
+                "issues": normalized,
+            },
+        )
     exit_code = 4 if evidence else 1 if (len(new_items) if fail_on_new_only else len(normalized)) > 0 else 0
     return report, exit_code
 

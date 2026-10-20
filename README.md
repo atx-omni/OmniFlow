@@ -162,7 +162,9 @@ External contributor opens a PR from a fork
 | New model warnings (new-only policy) | Warning; fail only with `fail_on_warnings: true` |
 | New Content Validator issues or additional occurrences (new-only policy) | Fail |
 | Unchanged, identity-matched model/content issues on the live base | Reported; nonblocking under the respective new-only policy |
+| Unchanged ordinary semantic-lint debt in a verified regression PR | Reported; nonblocking. New findings follow configured severity; security-scope controls are not waived |
 | Missing, malformed, or ambiguous comparison evidence | Block; never assume inherited issues |
+| Eligible synchronization gap with explicit onboarding `validation.mode: advisory` | Nonblocking but **incomplete**, not a verified pass; other blockers remain enforced |
 | Breaking Omni + dbt change in same PR (hold enabled) | Fail (split required) |
 | Breaking Omni while dbt deployment pending (hold enabled) | Fail (held until sync) |
 | dbt-only PR removing a column Omni references (impact enabled) | Fail (orphaned reference) |
@@ -187,7 +189,7 @@ The two optional dbt policies are complements:
 3. GitHub Actions starts OmniFlow from the trusted base-branch workflow.
 4. A credential-free preflight routes non-Omni pull requests to a successful `skipped` result before the validation process receives `OMNI_API_KEY`.
 5. OmniFlow selects the changed model from trusted base-branch metadata and resolves the Omni branch from the GitHub head branch.
-6. It pulls base and branch YAML, validates the model and content, computes the semantic diff, and searches Omni for downstream references.
+6. It verifies the Git/Omni snapshots, collects each new-only validator's live-base findings before its candidate findings, computes the semantic diff and lint regressions, and searches Omni for downstream references.
 7. The pull request receives a minimal reviewer summary. Verified private-repository runs also generate source-location diagnostics; the updated validation workflow uploads those separately for repository readers, never into the PR comment.
 8. GitHub branch protection blocks merge when required OmniFlow checks fail.
 9. After review and approval, the pull request is merged. Omni's configured pull-request webhook promotes the Omni branch and publishes associated draft content.
@@ -200,6 +202,22 @@ The final promotion is Omni Git integration behavior, not an OmniFlow API write.
 ## Installation Details
 
 These are the required installation components. New users should follow the [full step-by-step guide](docs/INSTALLATION.md), which includes prerequisites, exact sequencing, first-run expectations, and branch protection.
+
+Place the files relative to the **customer repository root**, not inside the model folder:
+
+```text
+repository/
+├── .omniflow.yml                     # required validation policy
+├── .omni/flow.json                   # trusted model identity
+├── .github/workflows/omniflow.yml    # GitHub automation
+└── omni/sales_model/                 # existing authored model; use its real path
+```
+
+For an existing installation, review the new policy keys and update **both** OmniFlow
+`uses:` references in the workflow to the same reviewed full commit SHA that supports
+them. Bootstrap required trusted files and merge the upgrade through the approved
+base-branch process, then create a fresh non-production test PR. An old workflow pin
+does not acquire new behavior when this repository changes.
 
 ### 1. Add The Workflow
 
@@ -389,9 +407,11 @@ The unreleased AI Repair scaffold emits minimal `repair.json` and `repair.md` du
 
 The required canonical `.omniflow.yml` explicitly sets `fail_on_new_only: true` under both `checks.content_validation` and `checks.model_validation`. For PR branch validation, each validator compares its branch findings with a fresh response from the same model's live base, using the same credential and applicable visibility scope. Each switch is independent: custom policies that omit it retain the strict `false` default for that validator. `OMNI_FAIL_ON_NEW_ONLY` remains content-only and does not change model policy. A missing policy file is an error, not a request for defaults.
 
-Unchanged, matched issues remain visible but nonblocking for the validator using new-only policy. Additional occurrences and changed model severity count as new; model warnings block only when `fail_on_warnings: true`. A passing regression gate means **no new blocking issues were detected in the compared scope**, not that the model or content is healthy or that the PR is proven to have caused every new finding. Unavailable or ambiguous comparison evidence cannot establish a pass; downstream contracts, lint, and other enabled checks can still block independently.
+Unchanged, matched issues remain visible but nonblocking for the validator using new-only policy. Each validator reads the live base before the candidate, using the same credential, visibility and requested depth. Evidence may be reused only within that run and identical request scope; required consistency rereads still fetch fresh evidence. Additional occurrences and worsening model severity count as new; model warnings block only when `fail_on_warnings: true`. In verified regression PRs, ordinary semantic-lint findings also compare against base findings by identity, severity and occurrence. Existing lint debt is nonblocking; new lint findings follow configured severity. Security-scope rules such as personal-folder validation restrictions are never grandfathered. A passing regression gate means **no new blocking findings were detected in the compared scope**, not clean health or proof that the PR caused every finding. Downstream contracts, deployment holds and other enabled gates remain independent.
 
-New-only PR runs verify live authored candidate/base YAML against the immutable Git head/base before and after checks. Missing or out-of-sync evidence blocks rather than falling back to an unrelated baseline. These are sampled checks, not an atomic live-content lock; Content Validator's default API depth also does not establish exhaustive instance coverage.
+New-only PR runs verify live authored candidate/base YAML against the immutable Git head/base before and after checks. Strict mode is the default: missing or out-of-sync evidence blocks. Initial ordinary sync mismatches receive one retry after two seconds per affected scope; final drift is not retried away. An ordinary sync failure may still produce explicitly health-only model/content observations, never new/existing PR attribution. These are sampled checks, not an atomic live-content lock; Content Validator's default API depth also does not establish exhaustive instance coverage.
+
+Two optional policies belong in the root `.omniflow.yml`: [trusted `files.non_omni` rules](docs/CONFIGURATION.md#trusted-non-omni-file-classification) classify reviewed Git-only ancillary files without hiding Omni/API sources; [onboarding `validation.mode: advisory`](docs/CONFIGURATION.md#enforcement-mode) makes only eligible synchronization gaps nonblocking. Advisory reports use `policy_decision: advisory`, `validation_complete: false`, and unknown PR impact even when the process exits `0`; this is not verified merge safety. Malformed evidence, security/scope conflicts and independent blockers are not waived. An enabled breaking-change hold prevents advisory downgrade, even if it could not run.
 
 Orchestrated runs without a branch, post-sync validation, and repair verification use strict health enforcement, not base-versus-itself comparison or historical suppression. Standalone no-branch content validation also defaults to strict health; explicit `--history-in` or `--fail-on-new-only` requests scoped history comparison and a missing usable baseline exits `4`. In GitHub PRs, standalone content/model new-only validation is rejected: use `omniflow run --auto` for verified Git head/base comparison. Existing content errors remain error-severity findings with `blocking: false` under new-only policy, not informational or fixed issues. See [Validation Diagnostics](docs/VALIDATION_DIAGNOSTICS.md).
 
@@ -400,6 +420,8 @@ Dashboard-filter errors support both legacy messages and the grouped `filter_nam
 Branch drafts can have different API identifiers from their published dashboards. OmniFlow verifies the exact active draft-to-published relationship for the selected branch before comparing findings or applying labels. An unchanged mapped draft must not turn existing errors into new ones. Missing, conflicting, stale, or changing identity evidence blocks with a sanitized evidence reason, not a claim that the PR introduced a defect. Matching never uses dashboard names or error text alone. Private comparison history uses schema version 3 and includes requested validation depth. Schema-2 history remains usable only at API-default depth; older history and depth changes invalidate reuse. Live PR comparisons use a fresh base and do not require a history migration.
 
 Optional `checks.content_validation.classify_comment_only: true` classifies narrow, verified comment/format-only Git changes without executing PR code. It is explanatory only: extra live branch edits and attached drafts cannot yet be excluded reliably, so content validation still runs. See [Validation Diagnostics](docs/VALIDATION_DIAGNOSTICS.md).
+
+`checks.content_validation.targeted` is experimental and defaults to `false`. Setting it to `true` alone still requests broad validation: the current CLI cannot independently prove dependency coverage or absence of branch-attached drafts. There is no automatic comment-only or no-impact skip. Reports show the actual content request scope and its safe fallback reason; do not interpret this setting as a completed performance optimization.
 
 ## CLI
 
@@ -452,7 +474,7 @@ unverified rather than being treated as a contradiction.
 
 Explicit identity flags are for local debugging. The customer workflow uses `omniflow run --auto`.
 
-Exit codes are `0` success, `1` validation failure, `2` configuration error, `3` authentication or authorization error, `4` Omni API error, `5` security policy violation, and `6` internal error.
+Exit codes are `0` success, intentional skip, or explicitly nonblocking onboarding advisory; `1` validation failure; `2` configuration error; `3` authentication or authorization error; `4` Omni API error; `5` security policy violation; and `6` internal error. Always read `policy_decision` and `validation_complete`: advisory exit `0` is not a verified pass.
 
 ## Documentation
 

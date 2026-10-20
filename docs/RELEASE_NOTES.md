@@ -1,5 +1,39 @@
 # Release notes
 
+## Unreleased — regression-first validation and explicit incomplete evidence
+
+- Model/content regression checks collect the live base before the candidate.
+  Request-scoped evidence is reusable only within one run; required consistency
+  rereads stay fresh. Matched existing debt remains visible and nonblocking;
+  new/additional or worsened issues follow the configured policy.
+- Verified regression PRs also compare ordinary semantic-lint debt with the base.
+  Security-scope restrictions are never grandfathered; independent contracts and
+  deployment holds are not waived.
+- Added reviewed `files.non_omni` ancillary classification using exact
+  `tag`/`pattern`/`reason` rules from trusted policy. Patterns are repository-relative
+  and bounded; overlaps, control files, known Omni sources and API-authored sources
+  fail closed. Both base and candidate inventories are checked.
+- Strict enforcement remains the default. Opt-in onboarding advisory mode can make
+  eligible synchronization gaps nonblocking with exit `0`, but reports explicitly
+  remain incomplete/health-only with unknown PR impact. API/security/malformed
+  evidence and independent blockers remain failures; enabled breaking-change
+  holds prevent advisory downgrade. Unexecuted checks are not passes.
+- Initial ordinary synchronization gaps receive one bounded retry; final drift is
+  never retried away. Public reports add safe mismatch category counters and
+  actual content scope/fallback status without source paths or customer text.
+- Experimental `content_validation.targeted` remains off by default. The current
+  CLI still uses broad validation even when enabled because independent dependency
+  and draft coverage is not established. Staged targeted support preserves
+  before/after selectors, bounded requests and broad fallback, but is not a
+  completed production optimization or a comment-only/no-impact skip.
+
+Upgrade the root `.omniflow.yml` and both workflow Action references together
+through the approved trusted-base process using a reviewed supporting full SHA.
+Keep `.omni/flow.json` at the root metadata location and the automation at
+`.github/workflows/omniflow.yml`. No new published pin is declared here.
+Fresh non-production consumer validation and adopter acceptance remain required;
+synthetic tests or partial probes do not establish production coverage.
+
 ## Unreleased — native authored filename correspondence
 
 - Candidate and base verification now recognize one `.yaml`/`.yml` serialization wrapper on known Omni authored filenames. Native Git exports can match extensionless API representations without renaming files or changing policy.

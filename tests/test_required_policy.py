@@ -145,4 +145,4 @@ def test_starter_content_policy_passes_existing_debt_but_blocks_new_findings(tmp
     assert code == int(new_issue)
     assert report["comparison_mode"] == "new_only" and report["comparison_status"] == "complete"
     assert report["existing_issues"] == 1 and report["new_issues"] == int(new_issue)
-    assert [call.kwargs["branch_id"] for call in fetch.call_args_list] == ["synthetic-branch", None]
+    assert [call.kwargs["branch_id"] for call in fetch.call_args_list] == [None, "synthetic-branch"]

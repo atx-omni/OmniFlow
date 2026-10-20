@@ -16,7 +16,7 @@ def _render_minimal_diagnostic(report: dict[str, Any]) -> str:
     blocking_count = sum(is_blocking(finding) for finding in findings)
     lines = [
         "# OmniFlow", "", "## Decision", "",
-        f"**{_decision_label(report.get('policy_decision', 'unknown'), operation=report.get('operation', 'validation'))}**",
+        f"**{_report_decision(report)}**",
         "", f"- Exit reason: `{_safe_code(report.get('exit_code_reason', 'unknown'))}`",
         f"- Run reference: `{_safe_code(report.get('run_reference', 'unavailable'))}`",
         f"- Validation complete: `{str(report.get('validation_complete', False)).lower()}`",
@@ -29,6 +29,22 @@ def _render_minimal_diagnostic(report: dict[str, Any]) -> str:
         "Health counts and policy blockers are different. A passing regression check does not establish "
         "that all model or content issues are resolved.",
     ]
+    if report.get("policy_decision") == "advisory":
+        lines.extend([
+            "", "Onboarding advisory mode is nonblocking. This is not a verified pass: "
+            "the proposed deployment's impact remains unknown.",
+        ])
+    if report.get("validation_complete") is True and any(
+        check.get("comparison_mode") == "new_only" and check.get("comparison_status") == "complete"
+        for context in report.get("model_reports", [report])
+        for check in context.get("check_reports", [context])
+    ):
+        lines.extend([
+            "", f"Compared findings: `{summary.get('new_issues', 0)}` new or worsened; "
+            f"`{summary.get('existing_issues', 0)}` existing; "
+            f"`{summary.get('resolved_issues', 0)}` resolved. "
+            "Occurrence counts describe the evaluated scopes, not unique dashboards.",
+        ])
     classification = report.get("change_classification")
     if isinstance(classification, dict):
         lines.extend([
@@ -50,6 +66,10 @@ def _render_minimal_diagnostic(report: dict[str, Any]) -> str:
     lines.extend(["", "## Check Execution", ""])
     for context in contexts:
         reference = _safe_code(context.get("context_reference", "context"))
+        proof = context.get("candidate_verification", {})
+        if type(proof.get("excluded_file_count")) is int:
+            lines.append(f"- `{reference}`: `{proof['excluded_file_count']}` confirmed non-Omni files "
+                         "excluded by trusted policy. Authoritative Omni sources were not removed.")
         states = context.get("check_states", [])
         for state in states:
             lines.append(f"- `{reference}` / `{_safe_code(state.get('validator', 'unknown'))}`: "
@@ -70,6 +90,16 @@ def _render_minimal_diagnostic(report: dict[str, Any]) -> str:
                     "- Depth records the API request, not verified exhaustive coverage. "
                     "Validation complete describes execution and available evidence, not full-depth coverage.",
                 ])
+            if check.get("health_only") is True:
+                lines.append("- Health-only observation: this check does not establish PR impact.")
+            if validator == "content" and check.get("content_scope_mode") in {"broad", "targeted"}:
+                lines.append(f"- Content request scope: `{check['content_scope_mode']}` "
+                             f"(`{_safe_code(check.get('content_scope_reason', 'unknown'))}`).")
+                if check.get("content_scope_reason") in {
+                    "semantic_coverage_unverified", "draft_coverage_unverified",
+                }:
+                    lines.append("- Broader checks remain necessary because complete affected-content "
+                                 "and branch-draft coverage has not been established.")
             health_summary = check.get("summary")
             if isinstance(health_summary, dict):
                 lines.append(f"- Current health errors: `{health_summary.get('errors', 0)}`; "
@@ -138,6 +168,9 @@ def _public_finding_lines(findings: list[dict[str, Any]], *, repository_detail: 
 def _comparison_outcome(check: dict[str, Any], validator: str) -> str:
     title = "Content" if validator == "content" else "Model"
     noun = title.lower()
+    if check.get("health_only") is True:
+        return (f"{title} health was inspected, but candidate correspondence was not verified. "
+                "These findings are not attributed to the PR and do not establish deployment safety.")
     mode = check.get("comparison_mode")
     blocking = check.get("blocking_issues")
     if type(blocking) is not int:
@@ -210,7 +243,7 @@ def render_markdown_report(report: dict[str, Any]) -> str:
         "",
         "## Decision",
         "",
-        f"**{_decision_label(decision, operation=operation)}**",
+        f"**{_report_decision(report)}**",
         "",
         f"- Policy decision: `{_safe_code(decision)}`",
         f"- Exit code reason: `{_safe_code(exit_reason)}`",
@@ -324,6 +357,8 @@ def _decision_label(decision: str, *, operation: str) -> str:
         return "Pass: OmniFlow checks passed."
     if decision == "skipped":
         return "Skipped: no Omni semantic-layer changes were detected."
+    if decision == "advisory":
+        return "Incomplete: PR impact is unverified; onboarding advisory mode is nonblocking."
     if decision == "fail":
         if operation == "dbt_sync":
             return "Fail: do not mark the dbt deployment complete."
@@ -331,9 +366,29 @@ def _decision_label(decision: str, *, operation: str) -> str:
     return "Review required: OmniFlow could not determine a final decision."
 
 
+def _report_decision(report: dict[str, Any]) -> str:
+    decision = report.get("policy_decision", "unknown")
+    if report.get("operation", "validation") == "validation":
+        if decision == "skipped":
+            return "Not evaluated: no eligible Omni validation context was selected."
+        if report.get("decision_status") == "incomplete" or (
+            report.get("validation_complete") is False and report.get("exit_code") in {2, 3, 4, 5, 6}
+        ):
+            if decision == "advisory":
+                return _decision_label(decision, operation="validation")
+            return "Incomplete: deployment impact could not be determined. Review the evidence gap before merge."
+        if decision == "pass" and any(
+            check.get("comparison_mode") == "new_only"
+            for context in report.get("model_reports", [report])
+            for check in context.get("check_reports", [context])
+        ):
+            return "Pass: no blocking new regressions detected in the evaluated scope."
+    return _decision_label(decision, operation=report.get("operation", "validation"))
+
+
 def _model_lines(report: dict[str, Any]) -> list[str]:
     if report.get("policy_decision") == "skipped":
-        return ["_Not evaluated because no Omni semantic-layer changes were detected._"]
+        return ["_Not evaluated: no eligible Omni validation context was selected._"]
     models = report.get("models")
     if isinstance(models, list) and models:
         lines = []
@@ -618,7 +673,7 @@ def _dbt_exposure_summaries(report: dict[str, Any]) -> list[dict[str, Any]]:
 def _dbt_exposure_lines(summaries: list[dict[str, Any]], *, decision: str) -> list[str]:
     if not summaries:
         if decision == "skipped":
-            return ["_Not evaluated because no Omni semantic-layer changes were detected._"]
+            return ["_Not evaluated: no eligible Omni validation context was selected._"]
         return ["_No dbt exposure result was produced for this run._"]
     lines = []
     for entry in summaries:
@@ -666,7 +721,7 @@ def _ai_eval_lines(
         if check_reports:
             return ["_AI eval was skipped for these model contexts; see the recorded reason in JSON evidence._"]
         if decision == "skipped":
-            return ["_Not evaluated because no Omni semantic-layer changes were detected._"]
+            return ["_Not evaluated: no eligible Omni validation context was selected._"]
         if decision != "pass":
             return ["_No AI eval result was produced; its enablement or execution cannot be established from this report._"]
         return ["_AI eval is disabled or has no configured prompt sets._"]
@@ -763,7 +818,7 @@ def _reviewer_actions(
         actions = ["- Review semantic diff and downstream impact artifacts before approving."]
         return actions + coverage_actions
     if decision == "skipped":
-        return ["- No reviewer action needed for OmniFlow unless this PR was expected to contain Omni changes."]
+        return ["- Check the routing reason if this PR should have run Omni validation; a skipped check is not a verified pass."]
     actions = []
     if any(issue.get("metadata_stage") == "view_names" for issue in blocking):
         actions.append(

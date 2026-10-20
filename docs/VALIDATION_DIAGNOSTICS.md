@@ -16,6 +16,8 @@
 | Downstream contracts / Coverage unavailable | Dependency analysis could not establish the affected consumers. | Verify the Action revision, relationship endpoints, model identity and reference-search access. |
 | Validation execution failed / incomplete | A check could not finish because of an API, context, or internal failure. | Retain completed findings, resolve the failed check, then rerun. Later checks marked “not run” are not successful. |
 | Advisory warning | The finding does not block under the recorded policy. | Review separately from blockers. Model warnings still block when `model_validation.fail_on_warnings` is enabled. |
+| `candidate_verification_failed` | Git/Omni correspondence was not established; ordinary sync failures may still have health-only observations. | Read the reason, scope and safe mismatch counts; synchronize before claiming PR impact. |
+| `policy_decision: advisory` with exit `0` | Explicit onboarding policy made an eligible synchronization gap nonblocking, not complete. | Read `validation_complete: false`; restore strict mode after onboarding. Do not treat unexecuted checks as passed. |
 
 No returned references is not proof of no consumers when coverage is unavailable. Content history counts (new/existing/resolved) describe content validation only; they are not the total blocking count across model, lint, contract and other checks. Missing optional results do not establish that those checks ran successfully.
 
@@ -26,8 +28,10 @@ can have only one blocker when two errors are matched baseline findings under ne
 are grouped separately by their safe category and occurrence count, rather than repeating one generic message.
 
 Semantic lint reports retain built-in rule IDs such as `require_field_descriptions`, `require_primary_keys`, and
-`require_owner_metadata`, each with a fixed corrective step. Lint findings describe the checked model and are not
-automatically classified as new-versus-existing PR defects. A new dashboard-filter finding identifies that check,
+`require_owner_metadata`, each with a fixed corrective step. In verified regression PRs, ordinary lint findings
+are compared with the base by identity, severity and occurrence; matched debt is nonblocking, new findings follow
+rule severity. The personal-folder scope restriction is never grandfathered. Outside regression PRs, lint remains
+strict health evidence. A new dashboard-filter finding identifies that check,
 its branch scope, and the next investigation step; it does not invent the underlying field or filter defect from
 an anonymous report. Open Content Validator in the same authorized Omni model and branch for those exact details.
 
@@ -116,15 +120,29 @@ These checks intentionally expose previously hidden upstream response problems. 
 
 ## Model and content regression gates versus health
 
-The canonical required policy explicitly sets `fail_on_new_only: true` independently under `checks.model_validation` and `checks.content_validation`. For PR branch runs, each validator compares its current findings with a fresh response for the same model's live base, using the same credential and applicable visibility scope. Neither switch changes the other; omitted custom settings remain `false`, and `OMNI_FAIL_ON_NEW_ONLY` affects content only.
+The canonical required policy explicitly sets `fail_on_new_only: true` independently under `checks.model_validation` and `checks.content_validation`. For PR branch runs, each validator collects its live-base findings before its candidate findings, using the same credential and applicable visibility scope. Request-scoped evidence may be reused within that run only; required consistency rereads stay fresh. Neither switch changes the other; omitted custom settings remain `false`, and `OMNI_FAIL_ON_NEW_ONLY` affects content only.
 
-The orchestrator first requires immutable PR base/head Git revisions and verifies authored live YAML against each: candidate versus head, live base versus trusted base. It repeats the checks after validation. Missing, unverifiable, or out-of-sync snapshots cannot authorize regression gating, even if the current issue list is empty. Resolve synchronization before rerunning. Before/after matches are sampled consistency evidence, not an atomic live-content or draft lock; no missing-repository or identity override replaces them.
+The orchestrator first requires immutable PR base/head Git revisions and verifies authored live YAML against each: candidate versus head, live base versus trusted base. It repeats the checks after validation. Missing, unverifiable, or out-of-sync snapshots cannot authorize a verified regression pass, even if the current issue list is empty. Initial ordinary sync failures receive one retry after two seconds per affected scope; final drift is never retried away. Resolve synchronization before rerunning. Before/after matches are sampled consistency evidence, not an atomic live-content or draft lock; no missing-repository or identity override replaces them.
+
+Default `validation.mode: strict` blocks incomplete correspondence. Explicit onboarding
+`advisory` mode can return `0` for eligible synchronization gaps only, with
+`policy_decision: advisory`, `decision_status: incomplete`, `validation_status: incomplete` in run evidence, and
+`validation_complete: false`. Available model/content observations are `health_only`,
+with unknown regression status and no new/existing/resolved attribution. Recorded
+security/scope, API/authentication, malformed-evidence and independent policy
+blockers remain enforced; an enabled breaking-change hold forbids advisory
+downgrade even when it has not run. Contracts/lint marked `not_run` are unverified,
+not clean. Advisory is not a readiness signal or evidence that merging is safe.
 
 Model comparisons match private issue identity, severity, and occurrence counts. If one matching error becomes two, the additional occurrence is new; a warning that becomes an error cannot be hidden as an existing warning. Existing matched model findings stay visible but nonblocking in new-only mode. New model errors block, while new warnings block only when `fail_on_warnings: true` (default `false`). Missing or ambiguous identity and malformed/unavailable responses cannot establish a clean comparison.
 
 For both validators, a pass means **no new blocking findings were detected in the compared scope**. It does not certify a healthy model/content estate, prove full instance coverage, or establish that the PR caused every finding. The baseline is a fresh live observation, not an immutable historic snapshot of every model and draft. Other enabled checks can still block independently.
 
-Content requests retain the API's default validation depth on both sides. The same request scope does not guarantee exhaustive API content coverage, particularly for large or changing inventories. Do not present a passing comparison as proof that every dashboard, query, or draft was validated.
+Content requests use the same configured depth on both sides and on rereads:
+API default unless `checks.content_validation.force_full_validation: true`.
+`requested_validation_depth` records intent, not observed exhaustive coverage.
+Do not present a passing comparison as proof that every dashboard, query, or
+draft was validated.
 
 Orchestrated validation without a branch, post-sync validation, and repair verification use strict health enforcement for both validators even if their new-only switches are enabled. They never pass by comparing the base to itself or by suppressing current findings with historical output. Standalone `content validate` retains its explicit scoped history mode as described below; it is not the PR or post-sync baseline mechanism.
 
@@ -147,7 +165,11 @@ This is a policy decision, not a parser fix. The workflow must resolve the inten
 
 Readable, identity-matched issues already present on the baseline can remain nonblocking under this policy; genuinely new issues and additional occurrences block. A passing content regression gate therefore means **no new issues were detected in the compared scope**, not that existing content is healthy. Orchestrated no-branch health checks and post-sync/repair verification enforce all-issues policy rather than comparing the base to itself.
 
-Unreadable evidence from either side remains exit `4`. If branch evidence cannot be parsed, processing stops before collecting the base response; the report must not infer that the failure is inherited. Identical unreadable error messages on both sides are not an acceptable baseline match.
+Unreadable evidence from either side remains exit `4`. The base is collected first:
+an unreadable base stops content comparison before the candidate; an unreadable
+candidate still cannot be waived by readable baseline findings. Neither outcome
+establishes an inherited defect. Identical unreadable error messages on both sides
+are not an acceptable baseline match.
 
 Content issues are matched by occurrence, not just by membership in a set. If one identical error becomes two, the additional occurrence is new. Query comparisons use stable document-scoped identity (`query_presentation_id`, then `query_id_map_key`, then supported `query_id`). Missing or duplicate query identity cannot establish that an issue is preexisting; such current findings remain new even when the message is unchanged. Query names alone are insufficient.
 
@@ -181,6 +203,7 @@ The content check's JSON includes:
 - `baseline_issues` and `current_issues`; a missing baseline is `null`, not an invented zero.
 - `content_health`: `issues_in_scope`, `no_issues_in_scope`, or `unknown`.
 - `regression_status`: `new_issues_detected`, `no_new_issues_detected`, or `unknown` when a complete comparison cannot be established.
+- `content_scope_mode`, `content_scope_reason`, and `content_selector_count`: actual request mode and fixed fallback category, without selector names.
 
 Historical/resolved evidence is reprocessed under the current privacy boundary before appearing in a shareable report. Limited scope and absent evidence must not be presented as complete instance health.
 
@@ -190,12 +213,22 @@ Model routing is based on changed paths and trusted metadata, not a semantic int
 
 The optional `checks.content_validation.classify_comment_only: true` setting enables explanatory classification only; its default is `false`. It inspects pinned Git snapshots conservatively without executing PR-head code. Unsupported YAML/dependencies, mixed changes, or missing evidence remain unverified. Even a `comment_only` classification records `content_validation_required: true`; it never skips Content Validator or changes the gate result. Git snapshots cannot establish the state of all live Omni content and attached drafts. A future bypass would require separately demonstrated candidate/content provenance and a reviewed policy, not merely an unchanged parsed YAML document.
 
+Experimental `checks.content_validation.targeted` is also off by default. Enabling
+it alone does not narrow the current CLI's requests: semantic/dependency coverage
+and absence of live branch drafts are not independently proven, so the report
+shows broad scope and a qualification gap. Staged targeted requests require
+identical before/after selectors and verified returned identities; missing,
+partial, disappearing or conflicting results fall back to fresh broad
+base/candidate validation. They never create whole-model history. This is neither
+a no-impact classification nor a released optimization.
+
 ## Reading the improved report
 
 - Public reports use `diagnostic_schema_version: 2` with fixed categories, safe reason codes, bounded counts, boolean coverage information, and generated context references. Customer-authored text and direct resource IDs/paths are excluded under both standard and strict settings. Missing details never become a raw JSON dump.
 - Content evidence gaps and dependency coverage gaps remain explicit. Detailed object attribution belongs in authorized private investigation, not a shareable artifact.
 - **Input/PR Git SHA** and **OmniFlow Action revision** are separate provenance facts. Obtain them from authorized workflow/private evidence; public JSON and evidence deliberately omit both. A floating Action tag is not independently attested by an environment-supplied reference.
 - The aggregate exit reason preserves operational API failures rather than mislabeling them ordinary validation failures.
+- Candidate inventory failures expose only safe counters: Git/API totals and unmatched counts, plus uniquely paired case/directory/suffix mismatch hints. These are not automatic normalization rules, source locations or proof of a particular root cause. Trusted ancillary classifications cannot remove an API source. See [candidate troubleshooting](TROUBLESHOOTING.md#candidate-verification-git-and-omni-snapshots-differ).
 - **Check Execution** records completed, failed operationally, not run, and disabled checks for each model/branch. “Completed” means execution finished, not that the check passed its configured policy. JSON records these as `completed`, `failed`, `not_run`, and `disabled`; `validation_complete` describes execution completeness separately from the pass/fail decision.
 - When one check fails, completed findings remain visible. Unfinished analysis is explicitly incomplete; zero recorded impacts or gaps is not proof of no impact. Older failed reports without execution metadata remain unknown rather than being treated as complete.
 - Identical findings in different model/branch contexts retain separate generated context references and coverage counts within a report, without publishing direct identity. Unknown or object-like diagnostic text is omitted; guidance uses fixed vocabulary.

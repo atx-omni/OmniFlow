@@ -32,21 +32,28 @@ Do not put the key in command history or a local file. Remove it from the proces
 
 ### Candidate Verification: Git and Omni Snapshots Differ
 
-`candidate_verification_failed` with exit code `2` means OmniFlow could not establish
+In default strict mode, `candidate_verification_failed` with exit code `2` means OmniFlow could not establish
 that it is validating the proposed Git revision. It does **not** establish a model
 or dashboard defect. Check **Check Execution**: checks marked `not_run` have not
 validated anything. A failure during the final recheck also leaves validation incomplete.
 
 Use the public report's `candidate_reason`, `validation_scope` (`branch` or `base`),
-and available `git_file_count`, `omni_file_count`, `git_only_count`, `omni_only_count`:
+and available `git_file_count`, `omni_file_count`, `git_only_count`, `omni_only_count`.
+Safe mismatch hints also include `case_only_count`, `directory_only_count`, and
+`suffix_only_count`: these count uniquely paired unmatched names in that order,
+not proposed automatic fixes. Counts may not explain every unmatched file and do
+not prove equality. Successful scoped proofs may include `excluded_file_count`
+for reviewed ancillary files. No mismatch paths or rule text are made public.
 
 | Reason | What to check |
 | --- | --- |
-| `file_inventory_mismatch` | Check the exact trusted `model_path`, initial model export, and Git/Omni synchronization for that scope. Extra YAML inside a registered model directory is included, not silently ignored. |
+| `file_inventory_mismatch` | Check the exact trusted `model_path`, initial model export, and Git/Omni synchronization for that scope. Unknown YAML remains included; reviewed Git-only ancillary files may use narrow trusted `files.non_omni` rules. |
 | `ambiguous_file_identity` | Resolve duplicate exports such as both `orders.view` and `orders.view.yaml`, or both `.yaml` and `.yml`. Even identical duplicate contents are ambiguous. |
 | `content_mismatch` | File identities match, but bytes differ. Save/synchronize the intended Omni branch or base and its corresponding PR Git revision. Comments and whitespace still count as byte differences. |
 | `changed_during_validation` | The snapshot changed during the checks. Let synchronization finish, then rerun against the current PR revision. |
 | `api_snapshot_unavailable` / `git_snapshot_unavailable` | Restore API/repository access or availability and complete Git history before rerunning. |
+| `non_omni_source_conflict` | A classification rule covers a known Omni/control file or a source returned by Omni. Narrow/remove the trusted rule; do not suppress the source. |
+| `non_omni_rule_conflict` | Multiple rules classify the same file or duplicate a tag/pattern. Resolve the ambiguity on the trusted base; there is no first-match precedence. |
 
 **Native filename compatibility:** supporting revisions match one trailing `.yaml`
 or `.yml` on known Omni names: root `model`, root `relationships`, and typed
@@ -68,6 +75,53 @@ model files. A path such as `omni/Snowflake Analytics` must match the real direc
 exactly. Source-file differences are intentionally not printed in public diagnostics;
 compare them inside your authorized repository and Omni instance. Matching file
 counts alone do not prove matching inventories or contents.
+
+Initial ordinary inventory/content/missing-branch synchronization failures receive
+one retry after two seconds per affected scope. Final drift is never retried away.
+After an ordinary sync failure, available model/content results may be shown as
+**health only**. They do not establish what this PR broke; new/existing/resolved
+attribution is withheld and unfinished checks remain `not_run`.
+
+### Exit 0 But The Report Says Advisory Or Incomplete
+
+Check the trusted root `.omniflow.yml` for `validation.mode: advisory`. This is
+onboarding-only: eligible synchronization gaps can be nonblocking while the report
+still says `policy_decision: advisory`, `decision_status: incomplete`,
+`validation_complete: false`, and unknown PR impact. It is not a verified pass.
+An enabled breaking-change hold prevents this downgrade, including when the hold
+could not run. Security/scope conflicts, malformed evidence, API/authentication
+failures and independent blockers remain blocking.
+
+Resolve synchronization and restore `validation.mode: strict` for production merge
+gating. Do not interpret an exit code, green job, or skipped advisory JUnit finding
+as successful validation without reading the report's completeness and policy.
+Checks marked `not_run`, including contracts or lint, have not passed.
+
+### Ancillary YAML Is Not An Omni Model File
+
+Do not move `.omni/flow.json`, rename real source files, or use a blanket exclusion.
+An authorized maintainer can add a narrow `files.non_omni` rule to the trusted
+root policy for a Git-only ancillary file, with `tag`, repository-relative
+`pattern`, and a short `reason`. Both base and candidate are checked against
+Omni's authored inventory; a matching Omni source or conflicting rule still
+blocks. See the [supported pattern grammar](CONFIGURATION.md#trusted-non-omni-file-classification).
+
+### Existing Lint Debt Still Appears In The Report
+
+Presence and blocking are different. In a verified regression PR, matched ordinary
+lint debt is `existing` and nonblocking; new/additional findings follow rule
+severity. Model/content debt requires the corresponding `fail_on_new_only: true`.
+The personal-folder scope restriction and other security controls are not
+grandfathered. No-branch health checks remain strict.
+
+### Targeted Content Is Enabled But Requests Are Still Broad
+
+This is intentional. `checks.content_validation.targeted` is experimental and
+defaults to `false`; the current CLI cannot prove complete dependency scope and
+absence of branch drafts. `true` therefore reports `content_scope_mode: broad`
+with `semantic_coverage_unverified`. It does not skip comment-only changes or
+establish no impact. Do not change validation depth or disable checks to force
+targeting; production qualification is still required.
 
 ### Required Policy File Is Missing
 
@@ -118,7 +172,7 @@ Confirm that:
 
 ### Omni Git Configuration Mismatch
 
-PR new-only validation additionally verifies live authored candidate/base YAML against immutable Git head/base before and after checks. Missing, unverifiable, or out-of-sync snapshots block even when current issue lists are empty. Confirm the exact selected model/branch and Git objects, synchronize the Omni candidate and base, then rerun. Do not use missing-repository or identity overrides to manufacture a baseline. Sampled matches and the API's default validation depth are not atomic or exhaustive content-coverage guarantees.
+PR new-only validation additionally verifies live authored candidate/base YAML against immutable Git head/base before and after checks. Missing, unverifiable, or out-of-sync snapshots cannot establish a verified pass even when current issue lists are empty; strict mode blocks them. Confirm the exact selected model/branch and Git objects, synchronize the Omni candidate and base, then rerun. Do not use missing-repository or identity overrides to manufacture a baseline. Sampled matches and the API's default validation depth are not atomic or exhaustive content-coverage guarantees.
 
 `omniflow doctor --auto` compares configured model path, base branch, provider, and repository URL with Omni when the API allows it. Correct the stale value in `.omni/flow.json` or the Omni Git integration. Do not disable the comparison without resolving which system is authoritative.
 
@@ -313,7 +367,7 @@ The policy is enabled but OmniFlow could not locate the Omni YAML. Add `checks.d
 
 | Code | Meaning |
 | --- | --- |
-| `0` | Success or intentional non-Omni skip. |
+| `0` | Success, intentional non-Omni skip, or explicitly nonblocking onboarding advisory. Check policy/completeness; advisory is not a verified pass. |
 | `1` | Validation or policy gate failed. |
 | `2` | Configuration or discovery error. |
 | `3` | Authentication or authorization error. |

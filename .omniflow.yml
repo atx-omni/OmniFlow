@@ -5,6 +5,23 @@
 # Model identity belongs in .omni/flow.json. Credentials belong in secrets,
 # never in this file. See docs/INSTALLATION.md for the complete setup.
 
+validation:
+  # Default strict: incomplete PR synchronization blocks. Optional advisory is
+  # onboarding-only: eligible sync gaps exit 0 but remain incomplete/health-only,
+  # NOT a verified pass. Security, malformed evidence and other blockers remain;
+  # an enabled breaking-change hold prevents advisory downgrade.
+  mode: strict
+
+# Optional trusted classification of Git-only ancillary files inside model paths.
+# Patterns are repository-relative, not relative to model_path. A rule cannot
+# exclude a known Omni source, an API-returned source, or a control/policy file.
+# Matching files must be absent from the corresponding Omni snapshot on each side.
+# files:
+#   non_omni:
+#     - tag: build_metadata
+#       pattern: omni/sales_model/metadata/*.yaml
+#       reason: Build metadata not authored by Omni
+
 contracts:
   enabled: true
   # Optional overrides: these safety gates already default to true.
@@ -29,6 +46,9 @@ checks:
     # force_full_validation: true
     # Optional explanatory classification only; never skips live validation.
     # classify_comment_only: true
+    # Experimental, default false. This flag alone still uses BROAD requests:
+    # the current CLI cannot prove dependency coverage and absence of drafts.
+    # targeted: true
     # Optional scope restriction. Leave commented to validate all visible content.
     # labels:
     #   - Verified
@@ -45,6 +65,9 @@ checks:
 
   semantic_lint:
     enabled: true
+    # Verified regression PRs compare ordinary lint debt with the base too.
+    # New/additional findings follow rule severity; security-scope rules never
+    # receive an existing-debt waiver. Non-PR health checks remain strict.
     # Optional rule-severity overrides; built-in rules apply when omitted.
     # rules:
     #   require_field_descriptions: warn

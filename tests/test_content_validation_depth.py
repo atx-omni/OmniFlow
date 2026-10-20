@@ -52,7 +52,7 @@ def test_branch_and_base_request_same_depth_and_report_only_requested_depth(tmp_
     client = client_for()
     report, code = validate(tmp_path, client, full=full)
     assert code == 0
-    assert [call.kwargs["branch_id"] for call in client.validate_content.call_args_list] == ["branch", None]
+    assert [call.kwargs["branch_id"] for call in client.validate_content.call_args_list] == [None, "branch"]
     for call in client.validate_content.call_args_list:
         assert call.kwargs.get("force_full_validation", False) is full
         assert ("force_full_validation" in call.kwargs) is full
@@ -84,7 +84,7 @@ def test_verified_draft_evidence_rereads_preserve_depth(tmp_path, full):
     )
     report, code = validate(tmp_path, client, full=full)
     assert code == 0 and report["existing_issues"] == 1
-    assert [call.kwargs["branch_id"] for call in client.validate_content.call_args_list] == ["branch", None, "branch", None]
+    assert [call.kwargs["branch_id"] for call in client.validate_content.call_args_list] == [None, "branch", None, "branch"]
     assert all(call.kwargs.get("force_full_validation", False) is full for call in client.validate_content.call_args_list)
 
 

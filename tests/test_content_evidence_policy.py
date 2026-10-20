@@ -85,7 +85,7 @@ def test_existing_defects_pass_regression_gate_without_claiming_content_is_healt
     assert report["new_issues"] == 0
     assert report["content_health"] == "issues_in_scope"
     assert report["regression_status"] == "no_new_issues_detected"
-    assert [call.kwargs["branch_id"] for call in fetch.call_args_list] == ["branch", None]
+    assert [call.kwargs["branch_id"] for call in fetch.call_args_list] == [None, "branch"]
     assert json.loads((tmp_path / "report.json").read_text())["content_health"] == "issues_in_scope"
 
 
@@ -135,7 +135,7 @@ def test_malformed_branch_or_base_remains_unavailable_not_preexisting(tmp_path, 
     error = caught.value
     finding = error.report_issue()
     assert error.exit_code == 4
-    assert finding["validation_scope"] == ("base" if scope == "base" else "branch")
+    assert finding["validation_scope"] == ("branch" if scope == "branch" else "base")
     assert finding["comparison_mode"] == "new_only"
     assert finding["comparison_status"] == "unavailable"
     assert finding["reason_code"] == "missing_issue_message"

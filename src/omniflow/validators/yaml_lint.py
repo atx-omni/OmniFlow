@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from typing import Any
 
 from ..diff.semantic_graph import SemanticGraph
@@ -91,7 +92,27 @@ def lint_graph(
 
 
 def has_error(issues: list[dict[str, Any]]) -> bool:
-    return any(issue["severity"] == "error" for issue in issues)
+    return any(issue["severity"] == "error" and issue.get("blocking", True) for issue in issues)
+
+
+def compare_lint_findings(current: list[dict], baseline: list[dict]) -> list[dict]:
+    """Apply PR regression policy to lint debt, not security-scope controls."""
+    def identity(issue: dict) -> tuple:
+        return tuple(issue.get(key) for key in
+                     ("rule_id", "file", "field", "view", "topic", "relationship", "severity"))
+
+    remaining = Counter(identity(issue) for issue in baseline)
+    result = []
+    for issue in current:
+        key = identity(issue)
+        # This is an execution-scope security policy, never grandfathered debt.
+        protected = issue.get("rule_id") == "forbid_personal_folder_validation_scope"
+        existing = not protected and remaining[key] > 0
+        if existing:
+            remaining[key] -= 1
+        result.append(dict(issue, state="existing" if existing else "new",
+                           blocking=issue["severity"] == "error" and not existing))
+    return result
 
 
 def _is_measure(field: dict[str, Any]) -> bool:
