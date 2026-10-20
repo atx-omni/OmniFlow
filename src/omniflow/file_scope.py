@@ -11,7 +11,7 @@ from pathlib import PurePosixPath
 from typing import Any
 
 from .exceptions import ConfigError
-from .model_paths import authored_file_identity
+from .model_paths import authored_file_identity, filename_identity
 
 MAX_NON_OMNI_RULES = 100
 MAX_PATTERN_LENGTH = 1024
@@ -173,7 +173,7 @@ def excluded_semantic_paths(
     api_identities: set[str] = set()
     for path in api_paths:
         identity = authored_file_identity(path)
-        api_identities.add(identity)
+        api_identities.add(filename_identity(path))
         aliases = {path, identity}
         if is_known_omni_source(identity):
             aliases.update({identity + ".yaml", identity + ".yml"})
@@ -183,7 +183,7 @@ def excluded_semantic_paths(
     excluded = set()
     for path in git_paths:
         if classify_repo_file(prefix + path, rules) == "tagged_non_omni":
-            if authored_file_identity(path) in api_identities:
+            if filename_identity(path) in api_identities:
                 raise FileScopeError("non_omni_source_conflict")
             excluded.add(path)
     return excluded

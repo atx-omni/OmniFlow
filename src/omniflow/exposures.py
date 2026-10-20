@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from .config import DbtExposureSettings
-from .exceptions import OmniFlowError
+from .exceptions import OmniAPIError, OmniFlowError, exception_diagnostic
 from .omni_client import OmniClient
 from .security import redact
 from .timestamps import utc_now_iso
@@ -39,6 +39,8 @@ def run_dbt_exposure_enrichment(
                 {
                     "validator": "dbt_exposures",
                     "severity": "warning",
+                    "reason_code": "dbt_exposures_unmapped",
+                    "coverage_complete": False,
                     "message": message,
                 }
             )
@@ -48,6 +50,8 @@ def run_dbt_exposure_enrichment(
             "generated_at": utc_now_iso(),
             "model_id": model_id,
             "branch_id": branch_id,
+            "execution_status": "partial" if unmapped_dashboards else "completed",
+            "coverage_complete": not unmapped_dashboards,
             "summary": {
                 "total_records": len(records),
                 "total_exposures": len(exposures),
@@ -61,9 +65,15 @@ def run_dbt_exposure_enrichment(
         }
         return report, 0
     except OmniFlowError as exc:
+        cause = exception_diagnostic(exc)
         issue = {
+            **{key: value for key, value in cause.items() if key != "reason_code"},
             "validator": "dbt_exposures",
             "severity": "error" if settings.fail_on_unavailable else "warning",
+            "reason_code": "dbt_exposures_unavailable",
+            "cause_code": cause.get("reason_code", "unknown_failure"),
+            "coverage_complete": False,
+            "operational_failure": True,
             "message": f"dbt exposure enrichment unavailable: {redact(str(exc))}",
         }
         report = {
@@ -72,6 +82,8 @@ def run_dbt_exposure_enrichment(
             "generated_at": utc_now_iso(),
             "model_id": model_id,
             "branch_id": branch_id,
+            "execution_status": "unavailable",
+            "coverage_complete": False,
             "summary": {
                 "total_records": 0,
                 "total_exposures": 0,
@@ -95,8 +107,6 @@ def _normalize_exposures(payload: Any) -> list[dict[str, Any]]:
     records = _exposure_records(payload)
     exposures = []
     for record in records:
-        if not isinstance(record, dict):
-            continue
         nested = record.get("exposure")
         if nested is None and "exposure" in record:
             continue
@@ -132,14 +142,42 @@ def _is_unmapped_exposure_record(record: Any) -> bool:
 
 def _exposure_records(payload: Any) -> list[Any]:
     if isinstance(payload, list):
-        return payload
-    if not isinstance(payload, dict):
-        return []
-    for key in ("exposures", "records", "items", "dashboards", "results"):
-        value = payload.get(key)
-        if isinstance(value, list):
-            return value
-    return []
+        records = payload
+    elif isinstance(payload, dict):
+        containers = [key for key in ("exposures", "records", "items", "dashboards", "results") if key in payload]
+        if len(containers) != 1 or not isinstance(payload[containers[0]], list):
+            raise _malformed_exposures()
+        records = payload[containers[0]]
+    else:
+        raise _malformed_exposures()
+    for record in records:
+        if not isinstance(record, dict) or not record:
+            raise _malformed_exposures()
+        if "exposure" in record:
+            exposure = record["exposure"]
+            if exposure is None:
+                continue  # Documented unmapped dashboard, not malformed evidence.
+            if not isinstance(exposure, dict) or not exposure:
+                raise _malformed_exposures()
+        else:
+            exposure = record  # Retain supported flat exposure records.
+        dependency_keys = [key for key in ("depends_on", "dependsOn", "dependencies") if key in exposure]
+        if len(dependency_keys) > 1:
+            raise _malformed_exposures()
+        if dependency_keys:
+            dependencies = exposure[dependency_keys[0]]
+            if not isinstance(dependencies, list) or any(
+                not isinstance(item, (str, dict)) for item in dependencies
+            ):
+                raise _malformed_exposures()
+    return records
+
+
+def _malformed_exposures() -> OmniAPIError:
+    return OmniAPIError(
+        "dbt exposure response contains an unsupported record; mapping coverage is unavailable.",
+        reason_code="invalid_dbt_exposure_response",
+    )
 
 
 def _depends_on(record: dict[str, Any]) -> list[str]:

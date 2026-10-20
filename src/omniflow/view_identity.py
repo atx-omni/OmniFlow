@@ -4,6 +4,7 @@ from pathlib import PurePosixPath
 from typing import Any
 
 from .exceptions import ConfigError
+from .model_paths import filename_identity
 from .semantic_files import infer_file_kind
 from .yaml_security import parse_secure_yaml
 
@@ -33,11 +34,16 @@ class ViewNamesMetadataError(ConfigError):
         )
 
 
-def normalize_api_view_names(value: Any, files: dict[str, str]) -> dict[str, str]:
+def normalize_api_view_names(
+    value: Any, files: dict[str, str], *, parse_contents: bool = True,
+) -> dict[str, str]:
     """Normalize either supported API orientation; snapshots stay name -> path.
 
     File inventory membership chooses the orientation for the whole map, never
     entry-by-entry. Reject ambiguity rather than losing identities on inversion.
+    Identity-only callers may classify recognized typed filenames without parsing
+    their YAML. That mode proves no validator health; generic filenames still
+    need secure parsing to establish their type and mapping definition.
     """
     if (
         not isinstance(value, dict) or len(value) > len(files)
@@ -55,10 +61,16 @@ def normalize_api_view_names(value: Any, files: dict[str, str]) -> dict[str, str
     if not paths_are_keys and not paths_are_values:
         raise ViewNamesMetadataError("unsupported_orientation")
 
-    # Reuse graph classification, including legacy YAML payload hints. Secure
-    # parsing retains the YAML bounds and never expands unresolved inheritance.
-    parsed = {path: parse_secure_yaml(text, source=path) for path, text in files.items()}
-    kinds = {path: infer_file_kind(path, payload) for path, payload in parsed.items()}
+    # Strict snapshot/graph callers retain content validation. Candidate identity
+    # callers can leave malformed, explicitly typed YAML to model validation.
+    # Legacy generic YAML always requires secure payload-based classification.
+    parsed, kinds = {}, {}
+    for path, text in files.items():
+        kind = None if parse_contents else _typed_file_kind(path)
+        if kind is None:
+            parsed[path] = parse_secure_yaml(text, source=path)
+            kind = infer_file_kind(path, parsed[path])
+        kinds[path] = kind
     names: dict[str, str] = {}
     if paths_are_keys:
         for path, name in value.items():
@@ -81,11 +93,25 @@ def normalize_api_view_names(value: Any, files: dict[str, str]) -> dict[str, str
         raise ViewNamesMetadataError("non_view_identity")
     covered = set(names.values())
     if any(
-        path not in covered or not isinstance(parsed[path], dict)
+        path not in covered or (path in parsed and not isinstance(parsed[path], dict))
         for path, kind in kinds.items() if kind == "view"
     ):
         raise ViewNamesMetadataError("incomplete_identity")
     return names
+
+
+def _typed_file_kind(path: str) -> str | None:
+    """Only supported, case-sensitive authored names carry a declared type."""
+    name = filename_identity(path)
+    if name.endswith(".view"):
+        return "view"
+    if name.endswith((".topic", ".composite_topic")):
+        return "topic"
+    if name == "relationships" or name.endswith(".relationships"):
+        return "relationship"
+    if name == "model":
+        return "model"
+    return None
 
 
 def _safe_file_path(path: Any) -> bool:

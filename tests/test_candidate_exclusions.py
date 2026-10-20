@@ -78,8 +78,9 @@ def test_excluding_ancillary_yaml_does_not_hide_changed_omni_bytes(snapshot):
     assert caught.value.candidate_reason == "content_mismatch"
 
 
-def test_api_authored_generic_yaml_cannot_be_excluded(snapshot):
-    snapshot.files["resources/config.yaml"] = "synthetic: tooling\n"
+@pytest.mark.parametrize("api_path", ["resources/config.yaml", "different/config.yaml"])
+def test_api_authored_generic_yaml_cannot_be_excluded(snapshot, api_path):
+    snapshot.files[api_path] = "synthetic: tooling\n"
     with pytest.raises(CandidateVerificationError) as caught:
         verify_candidate(snapshot.client, snapshot.context, non_omni_rules=rules())
     assert caught.value.candidate_reason == "non_omni_source_conflict"

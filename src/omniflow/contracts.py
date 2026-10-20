@@ -60,6 +60,8 @@ def evaluate_contracts(
             "coverage_errors": sum(1 for issue in coverage_issues if issue.get("severity") == "error"),
         },
         "dependency_generation_mode": dependencies.get("generation_mode"),
+        "execution_status": "partial" if coverage_issues else "completed",
+        "coverage_complete": not coverage_issues,
         "coverage_gaps": dependencies.get("coverage_gaps", [])
         if isinstance(dependencies.get("coverage_gaps"), list)
         else [],
@@ -172,6 +174,9 @@ def _coverage_issues(dependencies: dict[str, Any], settings: ContractSettings) -
                 "referenced": False,
                 "referenced_content": [],
                 "name": gap.get("name"),
+                "reason_code": gap.get("reason_code") or "dependency_coverage_incomplete",
+                **{key: gap[key] for key in ("cause_code", "http_status", "operation_stage", "retryable") if key in gap},
+                "coverage_complete": False,
                 "message": gap.get("message") or "Downstream dependency coverage is incomplete.",
             }
         )

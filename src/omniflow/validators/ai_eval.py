@@ -5,7 +5,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from ..exceptions import ExitCodes, OmniAPIError, OmniFlowError
+from ..exceptions import ExitCodes, OmniAPIError, OmniFlowError, exception_diagnostic
 from ..omni_client import AI_EVAL_STATES, AI_EVAL_TERMINAL_STATES, OmniClient
 from ..timestamps import utc_now_iso
 
@@ -15,7 +15,7 @@ class EvalFailure(OmniAPIError):
 
     def __init__(self, reason: str):
         self.reason = reason
-        super().__init__(f"AI eval could not establish a complete comparison: {reason}")
+        super().__init__(f"AI eval could not establish a complete comparison: {reason}", reason_code=reason)
 
 
 def run_ai_eval_validation(
@@ -61,6 +61,8 @@ def run_ai_eval_validation(
     }
     set_results: list[dict[str, Any]] = []
     failure: OmniFlowError | None = None
+    stage = "prompt_set_preflight"
+    scope: str | None = None
 
     def persist() -> None:
         if record_runs is not None:
@@ -69,6 +71,7 @@ def run_ai_eval_validation(
     try:
         if not branch_id:
             report["note"] = "No Omni branch is available; AI eval comparison was skipped."
+            report["skipped_reason"] = "no_branch"
         else:
             selected = []
             for configured in prompt_sets:
@@ -81,10 +84,13 @@ def run_ai_eval_validation(
                     selected.append((configured, _expected_prompts(prompt_set)))
             if not selected:
                 report["note"] = "No configured AI eval prompt set belongs to this model; comparison was skipped."
+                report["skipped_reason"] = "no_matching_prompt_set"
             # All selected sets are preflighted before the first mutation.
             for configured, expected in selected:
                 owned = []
                 for target_branch in (None, branch_id):
+                    stage = "run_creation"
+                    scope = "base" if target_branch is None else "branch"
                     journal["creation_outcome"] = "pending_or_ambiguous"
                     persist()
                     run_id = client.start_ai_eval_run(
@@ -111,6 +117,8 @@ def run_ai_eval_validation(
                     # Bind the returned run before starting more work.
                     _read_bound_run(client, entry)
                     persist()
+                stage = "run_polling"
+                scope = None  # Both bound runs are polled; do not guess the failing side.
                 main_run, branch_run = _poll_both(
                     client,
                     owned,
@@ -165,6 +173,7 @@ def run_ai_eval_validation(
                     "severity": "error" if fail_on_regression else "warning",
                     "prompt_set_id": sr["set"]["id"],
                     "reason": "accuracy_regression",
+                    "reason_code": "accuracy_regression",
                     "message": f"{len(regressions)} AI eval prompts regressed from binary pass to fail.",
                     "prompt_ids": [row["prompt_id"] for row in regressions[:samples_remaining]],
                     "active": True,
@@ -175,18 +184,34 @@ def run_ai_eval_validation(
         reason = failure.reason if isinstance(failure, EvalFailure) else "request_failed"
         if failure is None:
             reason = "cleanup_unconfirmed"
-        report["issues"].append(
-            {
+        cause = exception_diagnostic(failure) if failure is not None else {}
+        diagnostic = {
+                **{key: value for key, value in cause.items() if key != "reason_code"},
                 "validator": "ai_eval",
                 "severity": "error",
                 "reason": reason,
+                "reason_code": reason if isinstance(failure, EvalFailure) or failure is None else "ai_eval_request_failed",
+                "cause_code": cause.get("reason_code", reason),
+                "operation_phase": stage if failure is not None else "run_cleanup",
                 "message": f"AI eval comparison is incomplete ({reason}); review restricted run evidence.",
                 "active": True,
+                "blocking": True,
+                "coverage_complete": False,
+                "operational_failure": True,
             }
-        )
+        if scope is not None:
+            diagnostic["validation_scope"] = scope
+        report["issues"].append(diagnostic)
+        detail["failure"] = dict(diagnostic)
     report["regressed_count"] = total_regressions
     report["operational_failure"] = failure is not None or journal["cleanup_required"]
     report["cleanup_required"] = journal["cleanup_required"]
+    report["execution_status"] = (
+        "partial" if report["operational_failure"] and set_results else
+        "unavailable" if report["operational_failure"] else
+        "skipped" if report.get("skipped_reason") else "completed"
+    )
+    report["validation_complete"] = report["execution_status"] == "completed"
     report["summary"] = {
         "total_issues": len(report["issues"]),
         "errors": sum(issue["severity"] == "error" for issue in report["issues"]),
@@ -254,15 +279,16 @@ def _cleanup_runs(client: OmniClient, entries: list[dict[str, Any]]) -> bool:
                 entry["cleanup"] = "cancel_requested"
                 try:
                     client.cancel_ai_eval_run(entry["run_id"])
-                except OmniFlowError:
+                except OmniFlowError as exc:
                     # Reconcile a lost response once; never repeat the mutation.
-                    pass
+                    entry["cleanup_diagnostic"] = exception_diagnostic(exc)
                 run = _read_bound_run(client, entry)
             if run["status"] not in AI_EVAL_TERMINAL_STATES:
                 raise EvalFailure("cleanup_unconfirmed")
             entry["cleanup"] = "terminal_confirmed"
-        except OmniFlowError:
+        except OmniFlowError as exc:
             entry["cleanup"] = "manual_review_required"
+            entry["cleanup_diagnostic"] = exception_diagnostic(exc)
             unresolved = True
     return unresolved
 

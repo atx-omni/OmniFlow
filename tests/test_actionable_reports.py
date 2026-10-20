@@ -77,10 +77,11 @@ def test_public_annotations_group_before_limit_and_keep_policy_levels(monkeypatc
     cli._emit_github_annotations(safe["issues"], limit=20)
     lines = capsys.readouterr().out.splitlines()
     assert len(lines) == 8
-    assert lines[0].startswith("::error ") and "Dashboard-filter validation failed" in lines[0]
-    assert sum(line.startswith("::error ") for line in lines) == 1
-    assert sum(line.startswith("::notice ") for line in lines) == 2
-    assert sum(line.startswith("::warning ") for line in lines) == 5
+    assert lines[0].startswith("::error::") and "Dashboard-filter validation failed" in lines[0]
+    assert sum(line.startswith("::error::") for line in lines) == 1
+    assert sum(line.startswith("::notice::") for line in lines) == 2
+    assert sum(line.startswith("::warning::") for line in lines) == 5
+    assert all("file=" not in line and "line=" not in line for line in lines)
     assert any("require_field_descriptions" in line and "279 occurrences" in line for line in lines)
     assert "private-model" not in "".join(lines)
 

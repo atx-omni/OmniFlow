@@ -244,14 +244,17 @@ class OmniClient:
     def resolve_branch_id(self, model_id: str, branch_name: str | None) -> str | None:
         if not branch_name:
             return None
-        for record in self.list_models(model_kind="BRANCH", base_model_id=model_id, name=branch_name):
-            if record.get("modelKind") != "BRANCH":
-                continue
-            if record.get("baseModelId") != model_id:
-                continue
-            if record.get("name") == branch_name:
-                return record.get("id")
-        return None
+        matches = [record for record in self.list_models(model_kind="BRANCH", base_model_id=model_id, name=branch_name)
+                   if record.get("modelKind") == "BRANCH" and record.get("baseModelId") == model_id
+                   and record.get("name") == branch_name]
+        if not matches:
+            return None
+        if len(matches) != 1:
+            raise ConfigError("More than one Omni branch matches the selection", reason_code="branch_ambiguous")
+        identifier = matches[0].get("id")
+        if not isinstance(identifier, str) or not identifier.strip():
+            raise ConfigError("Selected Omni branch has no usable ID", reason_code="branch_identity_invalid")
+        return validate_path_segment(identifier, name="branch_id")
 
     def list_content(
         self,
@@ -287,12 +290,14 @@ class OmniClient:
         published_identifier = validate_path_segment(published_identifier, name="published_identifier")
         try:
             payload = self._request("GET", f"/api/v1/documents/{published_identifier}/drafts")
-        except OmniAuthError:
-            raise OmniAuthError("Document draft lookup was not authorized") from None
-        except OmniAPIError:
+        except OmniAuthError as exc:
+            exc.args = ("Document draft lookup was not authorized",)
+            raise exc from None
+        except OmniAPIError as exc:
             # The shared transport error can contain the requested API path.
             # Do not copy the document identifier into this adapter's errors.
-            raise OmniAPIError("Document draft lookup failed") from None
+            exc.args = ("Document draft lookup failed",)
+            raise exc from None
         if not isinstance(payload, list):
             raise OmniAPIError("Document draft lookup returned an invalid response shape")
         return [_document_draft_metadata(record) for record in payload]
@@ -525,6 +530,13 @@ class OmniClient:
         }
 
     def _paginate(self, path: str, *, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        def failure(message: str, *, limit: bool = False) -> OmniAPIError:
+            return OmniAPIError(
+                message,
+                reason_code="omni_pagination_limit_exceeded" if limit else "omni_pagination_invalid",
+                diagnostic_context={"service": "omni", "api_operation": _api_operation(path), "retryable": False},
+            )
+
         records: list[dict[str, Any]] = []
         record_count = 0
         cursor: str | None = None
@@ -536,35 +548,35 @@ class OmniClient:
                 page_params["cursor"] = cursor
             payload = self._request("GET", path, params=page_params)
             if not isinstance(payload, Mapping):
-                raise OmniAPIError("Omni pagination returned an unexpected response shape")
+                raise failure("Omni pagination returned an unexpected response shape")
             page_records = payload.get("records")
             if not isinstance(page_records, list):
-                raise OmniAPIError("Omni pagination returned an unexpected records shape")
+                raise failure("Omni pagination returned an unexpected records shape")
             if any(not isinstance(item, dict) for item in page_records):
-                raise OmniAPIError("Omni pagination returned an invalid record")
+                raise failure("Omni pagination returned an invalid record")
             record_count += len(page_records)
             if record_count > MAX_PAGINATION_RECORDS:
-                raise OmniAPIError("Omni pagination exceeded the 50,000 record safety limit")
+                raise failure("Omni pagination exceeded the 50,000 record safety limit", limit=True)
             records.extend(page_records)
             # Preserve single-page compatibility when pageInfo is omitted;
             # explicit malformed metadata cannot establish a complete inventory.
             page_info = payload.get("pageInfo", {})
             if not isinstance(page_info, Mapping):
-                raise OmniAPIError("Omni pagination returned an unexpected pageInfo shape")
+                raise failure("Omni pagination returned an unexpected pageInfo shape")
             if "hasNextPage" in page_info and not isinstance(page_info["hasNextPage"], bool):
-                raise OmniAPIError("Omni pagination returned an invalid hasNextPage flag")
+                raise failure("Omni pagination returned an invalid hasNextPage flag")
             next_cursor = page_info.get("nextCursor")
             if next_cursor is not None and (not isinstance(next_cursor, str) or not next_cursor.strip()):
-                raise OmniAPIError("Omni pagination returned an invalid cursor")
+                raise failure("Omni pagination returned an invalid cursor")
             cursor = next_cursor.strip() if isinstance(next_cursor, str) else None
             if "hasNextPage" in page_info and page_info["hasNextPage"] != bool(cursor):
-                raise OmniAPIError("Omni pagination returned inconsistent continuation metadata")
+                raise failure("Omni pagination returned inconsistent continuation metadata")
             if not cursor:
                 return records
             if cursor in seen_cursors:
-                raise OmniAPIError("Omni pagination repeated a cursor and was stopped")
+                raise failure("Omni pagination repeated a cursor and was stopped")
             seen_cursors.add(cursor)
-        raise OmniAPIError("Omni pagination exceeded the 500 page safety limit")
+        raise failure("Omni pagination exceeded the 500 page safety limit", limit=True)
 
     def _request(
         self,
@@ -579,6 +591,10 @@ class OmniClient:
         last_error: Exception | None = None
         attempts = 4 if retry_transient else 1
         for attempt in range(attempts):
+            context = {
+                "service": "omni", "api_operation": _api_operation(path),
+                "attempt_count": attempt + 1, "max_attempts": attempts,
+            }
             try:
                 response = self.session.request(
                     method,
@@ -592,13 +608,22 @@ class OmniClient:
             except requests.RequestException as exc:
                 last_error = exc
                 if attempt == attempts - 1:
-                    raise OmniAPIError(f"Omni API request failed: {redact(str(exc))}") from exc
+                    reason = _request_failure_reason(exc)
+                    raise OmniAPIError(
+                        "Omni API request could not complete; review the connection failure category.",
+                        reason_code=reason,
+                        diagnostic_context={**context, "retryable": retry_transient and reason != "omni_tls_error"},
+                    ) from exc
                 time.sleep(2**attempt)
                 continue
 
             if response.status_code in {401, 403}:
                 _close_response(response)
-                raise OmniAuthError(f"Omni authorization failed: {response.status_code}")
+                raise OmniAuthError(
+                    f"Omni authorization failed: {response.status_code}",
+                    reason_code="omni_unauthorized" if response.status_code == 401 else "omni_forbidden",
+                    diagnostic_context={**context, "http_status": response.status_code, "retryable": False},
+                )
             if response.status_code == 429 or 500 <= response.status_code < 600:
                 if attempt < attempts - 1:
                     retry_after = _retry_after_seconds(response.headers.get("Retry-After"))
@@ -607,14 +632,65 @@ class OmniClient:
                     continue
             if not response.ok:
                 _close_response(response)
-                raise OmniAPIError(f"Omni API request failed: HTTP {response.status_code} for {method} {path}")
+                reason = ("omni_rate_limited" if response.status_code == 429 else
+                          "omni_service_unavailable" if 500 <= response.status_code < 600 else "omni_http_error")
+                raise OmniAPIError(
+                    f"Omni API request failed: HTTP {response.status_code}", reason_code=reason,
+                    diagnostic_context={
+                        **context, "http_status": response.status_code,
+                        "retryable": retry_transient and (response.status_code == 429 or 500 <= response.status_code < 600),
+                    },
+                )
             try:
                 return _bounded_response_json(response)
+            except OmniAPIError as exc:
+                exc.diagnostic_context.update({
+                    **context, "http_status": response.status_code,
+                    "retryable": retry_transient and getattr(exc, "reason_code", None) == "omni_response_interrupted",
+                })
+                raise
             finally:
                 _close_response(response)
 
         LOG.debug("Final Omni request error: %s", redact(str(last_error)))
-        raise OmniAPIError("Omni API request failed after retries")
+        raise OmniAPIError("Omni API request failed after retries", reason_code="omni_request_failed")
+
+
+def _request_failure_reason(exc: requests.RequestException) -> str:
+    if isinstance(exc, requests.exceptions.SSLError):
+        return "omni_tls_error"
+    if isinstance(exc, requests.Timeout):
+        return "omni_timeout"
+    if isinstance(exc, requests.ConnectionError):
+        return "omni_connection_error"
+    return "omni_request_failed"
+
+
+def _api_operation(path: str) -> str:
+    """Only fixed labels enter diagnostics, never endpoint identifiers or queries."""
+    parts = path.split("?", 1)[0].strip("/").split("/")
+    if parts[:3] == ["api", "v1", "models"]:
+        if len(parts) == 3:
+            return "model_list"
+        if len(parts) == 5:
+            return {"yaml": "model_yaml", "validate": "model_validation", "content-validator": "content_validation",
+                    "git": "git_configuration", "dbt-exposures": "dbt_exposures", "refresh": "schema_refresh"}.get(
+                        parts[4], "omni_request")
+        if parts[4:] == ["git", "commit"]:
+            return "git_commit"
+    if parts == ["api", "v1", "content"]:
+        return "content_list"
+    if parts[:3] == ["api", "v1", "documents"] and len(parts) == 5 and parts[4] == "drafts":
+        return "document_drafts"
+    if parts[:3] == ["api", "v1", "jobs"] and len(parts) == 5 and parts[4] == "status":
+        return "job_status"
+    if parts[:4] == ["api", "v1", "ai", "jobs"]:
+        return "ai_job" if len(parts) == 4 else "ai_job_cancel" if parts[-1] == "cancel" else "ai_job_status"
+    if parts[:5] == ["api", "v1", "ai", "eval", "prompt-sets"]:
+        return "ai_prompt_set"
+    if parts[:5] == ["api", "v1", "ai", "eval", "runs"]:
+        return "ai_eval_run" if len(parts) == 5 else "ai_eval_cancel" if parts[-1] == "cancel" else "ai_eval_status"
+    return "omni_request"
 
 
 def _retry_after_seconds(value: str | None) -> int | None:
@@ -725,7 +801,7 @@ def _bounded_response_json(response: Any) -> Any:
     if content_length is not None:
         try:
             if int(content_length) > MAX_RESPONSE_BYTES:
-                raise OmniAPIError("Omni API response exceeded the 64 MiB safety limit")
+                raise OmniAPIError("Omni API response exceeded the 64 MiB safety limit", reason_code="omni_response_limit_exceeded")
         except ValueError:
             pass
 
@@ -738,9 +814,12 @@ def _bounded_response_json(response: Any) -> Any:
                     continue
                 body.extend(chunk)
                 if len(body) > MAX_RESPONSE_BYTES:
-                    raise OmniAPIError("Omni API response exceeded the 64 MiB safety limit")
+                    raise OmniAPIError("Omni API response exceeded the 64 MiB safety limit", reason_code="omni_response_limit_exceeded")
         except requests.RequestException as exc:
-            raise OmniAPIError("Omni API response could not be read safely") from exc
+            raise OmniAPIError(
+                "Omni API response could not be read safely", reason_code="omni_response_interrupted",
+                diagnostic_context={"cause_code": _request_failure_reason(exc)},
+            ) from exc
         if not body:
             raise OmniResponseError("empty_api_response")
         try:
@@ -755,9 +834,9 @@ def _bounded_response_json(response: Any) -> Any:
     try:
         encoded_size = len(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
     except (TypeError, ValueError) as exc:
-        raise OmniAPIError("Omni API did not return a valid JSON value") from exc
+        raise OmniResponseError("invalid_json_response") from exc
     if encoded_size > MAX_RESPONSE_BYTES:
-        raise OmniAPIError("Omni API response exceeded the 64 MiB safety limit")
+        raise OmniAPIError("Omni API response exceeded the 64 MiB safety limit", reason_code="omni_response_limit_exceeded")
     return payload
 
 

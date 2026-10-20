@@ -28,6 +28,12 @@ omniflow doctor --auto
 
 Do not put the key in command history or a local file. Remove it from the process environment when finished. `doctor` validates model discovery, API access, branch resolution where applicable, and Omni Git configuration metadata when the token permits it. It does not identify the credential type, test every enabled endpoint, or establish complete content coverage.
 
+If the model read succeeds but Git metadata access is denied, `doctor` reports **incomplete**, not ready. Model paths and branch names are case-sensitive; spaces are valid. A trailing directory slash is normalized for the legacy model-path comparison only, not branch names.
+
+For configuration failures, use the safe `config_key`, `expected_type`, `source_line`/`source_column` and 1-based `entry_index` when present. The actual invalid value is deliberately omitted. Missing policy or metadata means the trusted file was not found; `policy_inaccessible` or `model_metadata_inaccessible` means it could not be read. PR-only policy edits cannot authorize themselves: correct the target-branch file and fetch that trusted history first.
+
+`changed_files_unavailable` means Git comparisons failed, not that no relevant files changed. Restore the checkout and required revisions, then rerun. Missing credentials have separate codes for validation (`OMNI_API_KEY`), repair (`OMNI_REPAIR_API_KEY`) and synchronization (`OMNI_SYNC_API_KEY`); use the documented trusted secret injection, never committed credentials.
+
 ## Common Results
 
 ### Candidate Verification: Git and Omni Snapshots Differ
@@ -39,16 +45,17 @@ validated anything. A failure during the final recheck also leaves validation in
 
 Use the public report's `candidate_reason`, `validation_scope` (`branch` or `base`),
 and available `git_file_count`, `omni_file_count`, `git_only_count`, `omni_only_count`.
-Safe mismatch hints also include `case_only_count`, `directory_only_count`, and
-`suffix_only_count`: these count uniquely paired unmatched names in that order,
-not proposed automatic fixes. Counts may not explain every unmatched file and do
+Safe mismatch hints include `case_only_count` and `suffix_only_count` for
+uniquely paired unmatched filenames, not proposed automatic fixes. Older reports
+also used `directory_only_count`; organizational folders need not match when typed
+identity establishes a unique counterpart. Schema/database identity is preserved. Counts may not explain every unmatched file and do
 not prove equality. Successful scoped proofs may include `excluded_file_count`
 for reviewed ancillary files. No mismatch paths or rule text are made public.
 
 | Reason | What to check |
 | --- | --- |
 | `file_inventory_mismatch` | Check the exact trusted `model_path`, initial model export, and Git/Omni synchronization for that scope. Git-only generic YAML is ignored automatically; recognized Omni sources and generic YAML returned by Omni still require matching Git counterparts. |
-| `ambiguous_file_identity` | Resolve duplicate exports such as both `orders.view` and `orders.view.yaml`, or both `.yaml` and `.yml`. Even identical duplicate contents are ambiguous. |
+| `ambiguous_file_identity` | Inspect the private path examples. Repeated view basenames across databases/schemas are valid; retain canonical view identity or authored `catalog`/`schema`/`table_name` qualification. Resolve duplicate topic names, model/global relationships definitions, or duplicate export copies. Do not rename valid schema-scoped views. Identical bytes cannot disambiguate identity. |
 | `content_mismatch` | File identities match, but bytes differ. Save/synchronize the intended Omni branch or base and its corresponding PR Git revision. Comments and whitespace still count as byte differences. |
 | `changed_during_validation` | The snapshot changed during the checks. Let synchronization finish, then rerun against the current PR revision. |
 | `api_snapshot_unavailable` / `git_snapshot_unavailable` | Restore API/repository access or availability and complete Git history before rerunning. |
@@ -56,12 +63,25 @@ for reviewed ancillary files. No mismatch paths or rule text are made public.
 | `non_omni_rule_conflict` | Multiple rules classify the same file or duplicate a tag/pattern. Resolve the ambiguity on the trusted base; there is no first-match precedence. |
 
 **Native filename compatibility:** supporting revisions match one trailing `.yaml`
-or `.yml` on known Omni names: root `model`, root `relationships`, and typed
+or `.yml` on known Omni names: `model`, `relationships`, and typed
 `.view`, `.query.view`, `.topic`, `.composite_topic`, `.relationships` files.
-For example, Git `SCHEMA/orders.view.yaml` can match API `SCHEMA/orders.view`.
-Directories, capitalization and spaces stay significant; all authored source contents
-must still match exactly. Generic API-authored filenames require exact counterparts;
+For example, Git `SCHEMA/orders.view.yaml` can match API `Reporting/orders.view`
+when the typed name is unique in both complete inventories. Repeated view filenames
+can match exact authored paths, canonical view filenames, or unambiguous matching
+catalog/schema/table qualification. A directory label alone is not assumed to be a
+database or schema. Filename capitalization and spaces stay significant; all authored
+source contents must still match exactly.
+Generic API-authored filenames require exact basename counterparts;
 unknown names and repeated suffixes do not acquire guessed aliases.
+
+Topics and singleton definitions must be unique within that model; views may repeat
+basenames when qualified identities distinguish them. SQL/query views keep canonical
+Omni identity rather than requiring a physical table. Do not change connection view
+naming settings to work around an inventory error. A file outside
+`model_path` cannot satisfy a missing artifact inside it, even with the same name.
+A new Omni file is not skipped merely because the API lacks it: save/synchronize
+it to the candidate so the validators actually evaluate the proposed addition.
+This matching change does not change new-only versus all-issues validation policy.
 
 Older Action pins can report `file_inventory_mismatch` even when native exported
 files and API files have identical contents. Upgrade **every** applicable OmniFlow
@@ -162,7 +182,7 @@ Fork pull requests intentionally do not receive the secret. Forked Omni changes 
 
 The file must exist on the pull request's protected base branch. Adding it only to the proposed pull-request branch is not sufficient because OmniFlow refuses to trust model hosts supplied by unmerged code.
 
-Check the filename, JSON syntax, `version: 1`, and the pull request's target branch.
+Check the filename, JSON syntax, the selected schema version (`1` for the single-target format or `2` for the environment registry), and the pull request's target branch.
 
 ### Omni Files Are Outside Every Registered Model Path
 

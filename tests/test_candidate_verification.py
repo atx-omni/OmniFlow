@@ -320,3 +320,120 @@ def test_native_export_remote_fallback_reads_original_git_paths(snapshot, monkey
     monkeypatch.setattr(candidate, "read_github_text", reader)
     assert verify_candidate(snapshot.client, snapshot.context)["file_count"] == 9
     assert {call.args[2] for call in reader.call_args_list} == {"omni/" + path for path in remote_files}
+
+
+@pytest.mark.parametrize("side", ["head", "base"])
+def test_equal_inventories_with_38_directory_differences_verify_all_contents(snapshot, side, monkeypatch):
+    # Reproduce the reported shape without customer names or content.
+    from omniflow.model_paths import identity_index
+
+    git_files = dict(snapshot.files)
+    files = snapshot.client.get_model_yaml.return_value["files"]
+    for index in range(1219 - len(files)):
+        name = f"group-{index % 3}/synthetic_{index}.view.yaml"
+        text = f"description: synthetic {index}\n"
+        path = Path("omni", name)
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(text)
+        git_files[name] = text
+        api_name = f"alternate/synthetic_{index}.view" if index < 38 else name
+        files[api_name] = text
+    sha = _commit_snapshot(snapshot)
+    # Old path-based correspondence rejected these 38 pairs before content reads.
+    assert len(identity_index(git_files).keys() - identity_index(files).keys()) == 38
+    # Keep the scale test bounded: small fixtures test actual Git reads; here the
+    # real immutable tree still checks every returned byte against its blob hash.
+    def read_snapshot(ref, path, **kwargs):
+        assert ref == sha
+        return git_files[path.removeprefix("omni/")]
+
+    reader = Mock(side_effect=read_snapshot)
+    monkeypatch.setattr(candidate, "read_git_text", reader)
+    proof = verify_candidate(snapshot.client, snapshot.context, revision_side=side)
+    assert proof["status"] == "verified"
+    assert proof["file_count"] == 1219
+    assert reader.call_count == 1219
+
+
+@pytest.mark.parametrize("side", ["head", "base"])
+def test_directory_independence_still_compares_contents(snapshot, side):
+    files = snapshot.client.get_model_yaml.return_value["files"]
+    files["different/orders.view.yaml"] = files.pop("SCHEMA/orders.view") + "sql: select 2\n"
+    snapshot.event["pull_request"]["base"] = copy.deepcopy(snapshot.event["pull_request"]["head"])
+    Path("event.json").write_text(json.dumps(snapshot.event))
+    with pytest.raises(CandidateVerificationError) as caught:
+        verify_candidate(snapshot.client, snapshot.context, revision_side=side)
+    assert caught.value.candidate_reason == "content_mismatch"
+    assert caught.value.candidate_samples == [{
+        "git_path": "SCHEMA/orders.view", "omni_path": "different/orders.view.yaml",
+        "comparison": "different", "pairing": "authored_identity",
+        "validation_scope": "branch" if side == "head" else "base",
+    }]
+
+
+@pytest.mark.parametrize("side", ["git", "api"])
+def test_extra_same_basename_view_is_not_hidden_by_matching_another_view(snapshot, side):
+    files = snapshot.client.get_model_yaml.return_value["files"]
+    text = files["SCHEMA/orders.view"]
+    if side == "git":
+        Path("omni/QUERY/orders.view.yaml").write_text(text)
+        _commit_snapshot(snapshot)
+    else:
+        files["QUERY/orders.view.yaml"] = text
+    with pytest.raises(CandidateVerificationError) as caught:
+        verify_candidate(snapshot.client, snapshot.context)
+    assert caught.value.candidate_reason == "file_inventory_mismatch"
+    assert caught.value.candidate_counts["git_only_count" if side == "git" else "omni_only_count"] == 1
+
+
+def test_filename_matching_does_not_cross_model_scope(snapshot):
+    Path("another_model").mkdir()
+    Path("omni/SCHEMA/orders.view").rename(Path("another_model/orders.view"))
+    _commit_snapshot(snapshot)
+    with pytest.raises(CandidateVerificationError) as caught:
+        verify_candidate(snapshot.client, snapshot.context)
+    assert caught.value.candidate_reason == "file_inventory_mismatch"
+    assert caught.value.candidate_counts["omni_only_count"] == 1
+
+
+def test_api_confirmed_custom_files_and_reserved_names_match_across_directories(snapshot):
+    files = snapshot.client.get_model_yaml.return_value["files"]
+    for name in ("model", "relationships", "nested/settings.yaml"):
+        files["API folder/" + Path(name).name] = files.pop(name)
+    Path("omni/model").rename(Path("omni/nested/model.yaml"))
+    # Same generic tooling filename in two folders must not block validation.
+    Path("omni/tooling.yaml").write_text("unrelated: true\n")
+    Path("omni/nested/tooling.yaml").write_text("unrelated: false\n")
+    _commit_snapshot(snapshot)
+    assert verify_candidate(snapshot.client, snapshot.context)["file_count"] == len(snapshot.files)
+
+
+@pytest.mark.parametrize("side", ["head", "base"])
+@pytest.mark.parametrize("moved,qualification", [(False, "schema"), (True, "schema"), (True, "database")])
+def test_repeated_warehouse_view_names_verify_in_exact_and_reorganized_folders(snapshot, side, moved, qualification):
+    files = snapshot.client.get_model_yaml.return_value["files"]
+    for index in range(2):
+        catalog = f"warehouse_{index}" if qualification == "database" else "warehouse"
+        schema = "sales" if qualification == "database" else f"schema_{index}"
+        api_path = f"{catalog}.{schema}/shared_table.view"
+        git_path = f"Team Review/{index}/shared_table.view.yaml" if moved else api_path + ".yaml"
+        text = f"catalog: {catalog}\nschema: {schema}\ntable_name: shared_table\ndimensions: {{}}\n"
+        target = Path("omni", git_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text)
+        files[api_path] = text
+    _commit_snapshot(snapshot)
+    proof = verify_candidate(snapshot.client, snapshot.context, revision_side=side)
+    assert proof["status"] == "verified"
+    assert proof["file_count"] == len(snapshot.files) + 2
+    assert len(proof["identity_digest"]) == 64
+
+
+def test_candidate_recheck_binds_canonical_metadata_even_when_authored_bytes_are_unchanged(snapshot):
+    names = {"schema__orders": "SCHEMA/orders.view", "query_orders": "QUERY/orders.query.view"}
+    snapshot.client.get_model_yaml.return_value["viewNames"] = names
+    first = verify_candidate(snapshot.client, snapshot.context)
+    names["renamed__orders"] = names.pop("schema__orders")
+    second = verify_candidate(snapshot.client, snapshot.context)
+    assert first["snapshot_digest"] == second["snapshot_digest"]
+    assert first["identity_digest"] != second["identity_digest"]

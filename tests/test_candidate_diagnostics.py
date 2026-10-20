@@ -8,8 +8,8 @@ from omniflow.github.annotations import annotation_lines
 
 
 @pytest.mark.parametrize("reason,phrase", [
-    ("file_inventory_mismatch", "inventories differ"),
-    ("ambiguous_file_identity", "Multiple files map"),
+    ("file_inventory_mismatch", "unmatched authored artifacts"),
+    ("ambiguous_file_identity", "cannot be matched unambiguously"),
     ("content_mismatch", "contents differ"),
     ("changed_during_validation", "changed during validation"),
     ("api_snapshot_unavailable", "Omni authored YAML could not be retrieved"),
@@ -30,6 +30,12 @@ def test_reason_specific_guidance_and_counts_are_private_safe_in_every_format(tm
     assert phrase in issue["message"]
     assert "Git files: 37, Omni files: 38, Git-only: 1, Omni-only: 2" in issue["message"]
     assert issue["git_file_count"] == 37
+    assert safe["exit_code"] == 2 and safe["validation_complete"] is False
+    assert issue["blocking"] is True
+    assert "Do not bypass verification" in issue["message"]
+    if reason == "ambiguous_file_identity":
+        assert "Repeated view filenames across databases or schemas are valid" in issue["message"]
+        assert "do not rename valid schema-scoped views" in issue["message"]
     for path in (tmp_path / "public").iterdir():
         assert private not in path.read_text()
     output = "\n".join(annotation_lines(safe["issues"]))

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .exceptions import OmniAPIError
+from .exceptions import OmniAPIError, exception_diagnostic
 from .omni_client import OmniClient
 from .security import redact
 from .timestamps import utc_now_iso
@@ -22,7 +22,7 @@ def generate_downstream_dependencies(
     dependencies: list[dict[str, Any]] = []
     seen = set()
     mode = "targeted"
-    coverage_gaps: list[dict[str, str]] = _coverage_gaps_from_diff(diff_result)
+    coverage_gaps: list[dict[str, Any]] = _coverage_gaps_from_diff(diff_result)
     for search in searches:
         try:
             payload = client.search_content_references(
@@ -35,12 +35,16 @@ def generate_downstream_dependencies(
             )
             search_dependencies = _dependencies_from_payload(payload, search)
         except OmniAPIError as exc:
+            cause = exception_diagnostic(exc)
             mode = "targeted_partial" if dependencies else "targeted_unavailable"
             coverage_gaps.append(
                 {
                     "type": search["type"],
                     "name": search["name"],
                     "message": redact(str(exc)),
+                    **{key: value for key, value in cause.items() if key != "reason_code"},
+                    "reason_code": "dependency_search_unavailable",
+                    "cause_code": cause.get("reason_code", "unknown_failure"),
                 }
             )
             continue
@@ -62,6 +66,8 @@ def generate_downstream_dependencies(
         "branch_id": branch_id,
         "generated_at": utc_now_iso(),
         "generation_mode": mode,
+        "execution_status": "partial" if coverage_gaps and dependencies else "unavailable" if coverage_gaps else "completed",
+        "coverage_complete": not coverage_gaps,
         "searches": searches,
         "coverage_gaps": coverage_gaps,
         "dependencies": dependencies,
@@ -101,6 +107,7 @@ def _coverage_gaps_from_diff(diff_result: dict[str, Any]) -> list[dict[str, str]
                 {
                     "type": "relationship",
                     "name": str(change.get("name") or change.get("field") or ""),
+                    "reason_code": "relationship_endpoints_unavailable",
                     "message": (
                         "Relationship impact could not be derived because the semantic diff did not identify joined views. "
                         "Both endpoint roles must be available in each required revision."
@@ -122,7 +129,8 @@ def _dependencies_from_payload(payload: Any, search: dict[str, str]) -> list[dic
     dependencies = []
     for document in content_documents(payload):
         if not any(document.get(key) for key in ("document_id", "id", "identifier")):
-            raise OmniAPIError("Content Validator response is missing a referenced document identity")
+            raise OmniAPIError("Content Validator response is missing a referenced document identity",
+                               reason_code="invalid_content_document_identity")
         base = {
             "content_id": document.get("document_id") or document.get("id"),
             "content_identifier": document.get("identifier"),

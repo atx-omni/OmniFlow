@@ -17,12 +17,15 @@ def _render_minimal_diagnostic(report: dict[str, Any]) -> str:
     lines = [
         "# OmniFlow", "", "## Decision", "",
         f"**{_report_decision(report)}**",
+        *_primary_blocker_lines(findings),
         "", f"- Exit reason: `{_safe_code(report.get('exit_code_reason', 'unknown'))}`",
         f"- Run reference: `{_safe_code(report.get('run_reference', 'unavailable'))}`",
         f"- Validation complete: `{str(report.get('validation_complete', False)).lower()}`",
         f"- Blocking issues (all checks): `{blocking_count}`",
         f"- Recorded errors: `{summary.get('errors', 0)}`; warnings: `{summary.get('warnings', 0)}`",
-        "", ("Repository-only diagnostics: verified source identifiers and locations are included. "
+        f"- OmniFlow version: `{_safe_code(report.get('tool_version', 'unavailable'))}`",
+        *_tool_revision_lines(report),
+        "", ("Repository-only diagnostics: available source locations and scoped observations are included. "
              "Do not forward as a shareable support report. Raw API messages and data values remain excluded."
              if repository_detail else
              "This report explains check categories and policy decisions without exposing customer text or resource identities."),
@@ -34,6 +37,10 @@ def _render_minimal_diagnostic(report: dict[str, Any]) -> str:
             "", "Onboarding advisory mode is nonblocking. This is not a verified pass: "
             "the proposed deployment's impact remains unknown.",
         ])
+    availability = report.get("repository_diagnostics")
+    if isinstance(availability, dict) and availability.get("status"):
+        lines.extend(["", f"- Repository diagnostic detail: `{_safe_code(availability['status'])}` "
+                      f"(`{_safe_code(availability.get('diagnostics_reason', 'unknown'))}`)."])
     if report.get("validation_complete") is True and any(
         check.get("comparison_mode") == "new_only" and check.get("comparison_status") == "complete"
         for context in report.get("model_reports", [report])
@@ -61,6 +68,11 @@ def _render_minimal_diagnostic(report: dict[str, Any]) -> str:
             "- Locations refer to the recorded head or base snapshot, not necessarily the latest branch contents.",
             "- Unmapped findings retain safe guidance. No location or underlying cause is guessed.",
         ])
+        reasons = detail.get("unavailable_reasons")
+        if isinstance(reasons, dict):
+            for reason, count in sorted(reasons.items()):
+                if type(count) is int and count > 0:
+                    lines.append(f"- Location evidence unavailable: `{_safe_code(reason)}` — `{count}` occurrence(s).")
     lines.extend(_public_finding_lines(findings, repository_detail=repository_detail))
     contexts = report.get("model_reports") or [report]
     lines.extend(["", "## Check Execution", ""])
@@ -73,7 +85,7 @@ def _render_minimal_diagnostic(report: dict[str, Any]) -> str:
         states = context.get("check_states", [])
         for state in states:
             lines.append(f"- `{reference}` / `{_safe_code(state.get('validator', 'unknown'))}`: "
-                         f"`{_safe_code(state.get('status', 'unknown'))}`")
+                         f"`{_safe_code(state.get('status', 'unknown'))}`{_state_detail(state)}")
         if not states:
             lines.append(f"- `{reference}`: execution evidence unavailable.")
         checks = context.get("check_reports") or [context]
@@ -110,18 +122,7 @@ def _render_minimal_diagnostic(report: dict[str, Any]) -> str:
                 if key in check:
                     value = "unknown" if check[key] is None else str(check[key])
                     lines.append(f"- {key.replace('_', ' ')}: `{_safe_code(value)}`")
-    lines.extend([
-        "", "## Next Steps", "",
-        "- For readable content findings, inspect Content Validator in Omni for the same model, branch, "
-        "and visibility scope. Sensitive object details are intentionally omitted here.",
-        "- For model findings, validate the same model branch in Omni. Current errors remain health findings "
-        "even when matched baseline issues do not block the PR.",
-        "- Under new-only policy, unchanged matched baseline issues are nonblocking; new, increased, or worsened "
-        "issues follow severity policy. Under all-issues policy, current issues follow severity policy even "
-        "if they already existed. Model warnings block only when warning gating is enabled.",
-        "- For unavailable evidence, resolve the response or access problem and rerun. Do not treat "
-        "missing evidence as a clean baseline or disable validation to obtain a pass.",
-    ])
+    lines.extend(_next_action_lines(report, findings))
     return "\n".join(lines) + "\n"
 
 
@@ -147,11 +148,24 @@ def _public_finding_lines(findings: list[dict[str, Any]], *, repository_detail: 
                          f"**{count} occurrence{'s' if count != 1 else ''}**: "
                          f"{_safe_text(finding.get('message', 'No recognized diagnostic category was supplied.'))}")
             lines.append(f"   - policy: `{'blocking' if blocking else 'nonblocking'}`")
+            if finding.get("diagnostic_code"):
+                lines.append(f"   - diagnostic code: `{_safe_code(finding['diagnostic_code'])}`")
+            if finding.get("title") and finding["title"] != finding.get("message"):
+                lines.append(f"   - diagnosis: {_safe_text(finding['title'])}")
+            if finding.get("next_action"):
+                lines.append(f"   - next action: {_safe_text(finding['next_action'])}")
             if repository_detail:
-                for key in ("file", "line", "field", "view", "topic", "source_revision", "diagnostic_code"):
+                for key in ("file", "line", "field", "view", "topic", "source_revision", "git_revision",
+                            "location_unavailable_reason"):
                     if key in finding:
                         lines.append(f"   - {key.replace('_', ' ')}: `{_safe_code(finding[key])}`")
+                lines.extend(_candidate_observation_lines(finding))
             for key in ("context_reference", "validation_scope", "state", "reason_code", "candidate_reason",
+                        "cause_code", "service", "api_operation", "http_status", "attempt_count", "max_attempts",
+                        "operation_phase", "retryable", "config_key", "expected_type", "source_kind", "source_line",
+                        "source_column", "entry_index", "contents_comparison", "compared_file_count",
+                        "git_file_count", "omni_file_count", "git_only_count", "omni_only_count",
+                        "candidate_sample_count", "candidate_sample_omitted_count", "last_observed_status",
                         "comparison_mode", "comparison_status", "content_health", "model_health",
                         "regression_status", "requested_validation_depth", "active"):
                 if key in finding:
@@ -162,6 +176,82 @@ def _public_finding_lines(findings: list[dict[str, Any]], *, repository_detail: 
             lines.append(f"Additional safe findings are available in the JSON report: "
                          f"{len(selected) - 20} more categories, {omitted} occurrences.")
         lines.append("")
+    return lines
+
+
+def _primary_blocker_lines(findings: list[dict[str, Any]]) -> list[str]:
+    primary = next((finding for finding in findings if is_blocking(finding)), None)
+    if primary is None:
+        return []
+    title = primary.get("title") or primary.get("message") or "The check could not establish a safe result."
+    code = primary.get("diagnostic_code") or primary.get("reason_code") or primary.get("type", "unknown")
+    lines = ["", f"**Primary blocker:** {_safe_text(title)} (`{_safe_code(code)}`)"]
+    if primary.get("context_reference") or primary.get("validation_scope"):
+        lines.append(f"- Affected check: `{_safe_code(primary.get('context_reference', 'context'))}` / "
+                     f"`{_safe_code(primary.get('validator', 'execution'))}` / "
+                     f"`{_safe_code(primary.get('validation_scope', 'unknown'))}` scope.")
+    action = primary.get("next_action")
+    if action:
+        lines.append(f"**Next action:** {_safe_text(action)}")
+    return lines
+
+
+def _next_action_lines(report: dict[str, Any], findings: list[dict[str, Any]]) -> list[str]:
+    lines = ["", "## Next Steps", ""]
+    seen = set()
+    active = [finding for finding in findings if finding.get("active", True)]
+    active.sort(key=lambda finding: not is_blocking(finding))
+    for finding in active:
+        action = finding.get("next_action")
+        if not isinstance(action, str) or not action.strip() or action in seen:
+            continue
+        seen.add(action)
+        code = finding.get("diagnostic_code") or finding.get("validator", "execution")
+        lines.append(f"- `{_safe_code(code)}`: {_safe_text(action)}")
+        if len(seen) >= 10:
+            break
+    if not seen:
+        lines.append("- Review the failed or incomplete check and its recorded reason before rerunning."
+                     if report.get("validation_complete") is not True or any(is_blocking(item) for item in findings)
+                     else "- No blocking corrective action is recorded; review any nonblocking findings under the configured policy.")
+    if report.get("validation_complete") is not True:
+        lines.append("- Missing or partial evidence is not a clean baseline or a verified pass. "
+                     "Do not disable checks to turn unavailable evidence into success.")
+    return lines
+
+
+def _state_detail(state: dict[str, Any]) -> str:
+    details = []
+    if type(state.get("elapsed_ms")) is int and state["elapsed_ms"] >= 0:
+        details.append(f"elapsed `{state['elapsed_ms']}` ms")
+    for key in ("blocked_by", "skipped_reason"):
+        if isinstance(state.get(key), str):
+            details.append(f"{key.replace('_', ' ')} `{_safe_code(state[key])}`")
+    return " — " + "; ".join(details) if details else ""
+
+
+def _candidate_observation_lines(finding: dict[str, Any]) -> list[str]:
+    if finding.get("candidate_evidence_kind") != "observations_not_correspondence":
+        return []
+    samples = finding.get("candidate_samples")
+    if not isinstance(samples, list) or not samples:
+        return []
+    lines = ["   - Candidate path observations (not verified correspondence):"]
+    for sample in samples[:5]:
+        if not isinstance(sample, dict):
+            continue
+        paths = []
+        for key, label in (("git_path", "Git"), ("omni_path", "Omni")):
+            if isinstance(sample.get(key), str):
+                paths.append(f"{label}: `{_safe_code(sample[key])}`")
+        if not paths:
+            continue
+        comparison = ("contents differ" if sample.get("comparison") == "different"
+                      else "contents not compared")
+        hint = "; basename hint only" if sample.get("pairing") == "basename_hint" else ""
+        lines.append(f"     - {'; '.join(paths)} — {comparison}{hint}.")
+    lines.append("   - Observed paths and filename hints do not prove that files correspond. "
+                 "Do not rename or overwrite files solely to make the check pass.")
     return lines
 
 
@@ -371,9 +461,7 @@ def _report_decision(report: dict[str, Any]) -> str:
     if report.get("operation", "validation") == "validation":
         if decision == "skipped":
             return "Not evaluated: no eligible Omni validation context was selected."
-        if report.get("decision_status") == "incomplete" or (
-            report.get("validation_complete") is False and report.get("exit_code") in {2, 3, 4, 5, 6}
-        ):
+        if report.get("decision_status") == "incomplete" or report.get("validation_complete") is False:
             if decision == "advisory":
                 return _decision_label(decision, operation="validation")
             return "Incomplete: deployment impact could not be determined. Review the evidence gap before merge."
@@ -530,7 +618,11 @@ def _checks_incomplete(report: dict[str, Any], validators: set[str]) -> bool:
 
 def _execution_lines(report: dict[str, Any]) -> list[str]:
     lines = []
-    labels = {"completed": "completed", "failed": "failed operationally", "not_run": "not run", "disabled": "disabled"}
+    labels = {
+        "completed": "completed", "failed": "failed operationally", "not_run": "not run", "disabled": "disabled",
+        "skipped": "skipped", "partial": "partial evidence", "unavailable": "evidence unavailable",
+        "not_applicable": "not applicable",
+    }
     for context in _execution_contexts(report):
         scope = "; ".join(_scope_parts(context)) or "Context identity unavailable"
         states = _check_states(context)
@@ -541,7 +633,7 @@ def _execution_lines(report: dict[str, Any]) -> list[str]:
         for state in states:
             status = state.get("status")
             label = labels.get(status, "status unavailable") if isinstance(status, str) else "status unavailable"
-            lines.append(f"- {scope} · `{_safe_code(state.get('validator'))}`: {label}.")
+            lines.append(f"- {scope} · `{_safe_code(state.get('validator'))}`: {label}{_state_detail(state)}.")
     if any(_check_states(context) for context in _execution_contexts(report)):
         lines.append("Completed describes execution only; recorded findings may still block under configured policy.")
     return lines

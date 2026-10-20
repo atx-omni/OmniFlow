@@ -34,7 +34,8 @@ def test_explicit_policy_is_authoritative_across_report_formats(severity, blocki
     if active:
         assert ("Blocks under configured policy" in annotations[0]) is blocking
         if severity == "error" and not blocking:
-            assert annotations[0].startswith("::notice ")
+            assert annotations[0].startswith("::notice::")
+        assert "file=" not in annotations[0] and "line=" not in annotations[0]
     assert PRIVATE not in json.dumps(safe) + to_junit(safe) + json.dumps(result) + "".join(annotations)
 
 

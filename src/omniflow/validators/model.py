@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any
 
-from ..exceptions import OmniAPIError, OmniResponseError
+from ..exceptions import OmniAPIError, OmniFlowError, exception_diagnostic
 from ..model_response import normalize_model_response
 from ..omni_client import OmniClient
 from ..timestamps import utc_now_iso
@@ -18,6 +18,9 @@ def parse_model_issues(payload: Any) -> list[dict[str, Any]]:
             {
                 "validator": "model",
                 "type": "model_validation_issue",
+                # The API does not supply a typed defect category. Preserve the
+                # authored location and text privately, without guessing a cause.
+                "reason_code": "model_validation_issue",
                 "severity": "warning" if is_warning else "error",
                 "message": item["message"],
                 "yaml_path": item["yaml_path"],
@@ -81,10 +84,17 @@ def _fetch(
     client: OmniClient, model_id: str, branch_id: str | None, mode: str, evidence: ValidationEvidence,
 ) -> list[dict]:
     try:
-        return parse_model_issues(evidence.fetch(client, "validate_model", model_id, branch_id=branch_id))
-    except OmniResponseError as exc:
+        payload = evidence.fetch(client, "validate_model", model_id, branch_id=branch_id)
+        try:
+            return parse_model_issues(payload)
+        except OmniAPIError as exc:
+            if not getattr(exc, "reason_code", None):
+                exc.reason_code = "invalid_model_validation_response"
+            raise
+    except OmniFlowError as exc:
         exc.validation_scope = "branch" if branch_id else "base"
         exc.comparison_mode = mode
+        exc.diagnostic_context.update(validation_scope=exc.validation_scope, comparison_mode=mode)
         raise
 
 
@@ -119,8 +129,13 @@ def run_model_validation(
             baseline = _fetch(client, model_id, None, mode, snapshots)
         except OmniAPIError as exc:
             status = "unavailable"
-            reason = exc.reason_code if isinstance(exc, OmniResponseError) else "model_comparison_unavailable"
-            evidence = [dict(_evidence_issue(reason), validation_scope="base")]
+            cause = exception_diagnostic(exc)
+            evidence = [{
+                **_evidence_issue("model_comparison_unavailable"),
+                **{key: value for key, value in cause.items() if key != "reason_code"},
+                "cause_code": cause.get("reason_code", "unknown_failure"),
+                "validation_scope": "base",
+            }]
     current = _fetch(client, model_id, branch_id, mode, snapshots)
     if new_only:
         if baseline is not None:
@@ -161,6 +176,7 @@ def run_model_validation(
         "improved_issues": sum(issue.get("state") == "improved" for issue in issues),
         "blocking_issues": blocking + len(evidence),
         "validation_complete": not evidence,
+        "execution_status": "unavailable" if evidence else "completed",
         "summary": {
             "total_issues": len(current),
             "errors": error_count,

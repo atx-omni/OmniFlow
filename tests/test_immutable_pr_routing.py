@@ -7,7 +7,7 @@ import pytest
 
 from omniflow import discovery
 from omniflow.cli import main
-from omniflow.exceptions import ConfigError, SecurityPolicyError
+from omniflow.exceptions import ConfigError, GitHubAPIError, SecurityPolicyError
 from omniflow.github.revalidation import GitHubRepository
 from omniflow.revision_data import pull_request_changed_files
 
@@ -190,6 +190,11 @@ def test_github_transport_rejects_duplicate_json_keys(monkeypatch):
     transport.__exit__ = Mock(return_value=False)
     request = Mock(return_value=transport)
     monkeypatch.setattr("requests.request", request)
-    with pytest.raises(ConfigError, match="unavailable or invalid data"):
+    with pytest.raises(GitHubAPIError) as caught:
         GitHubRepository("owner/repo", "synthetic-token").request("GET", "/compare/" + "a" * 40 + "..." + "b" * 40)
+    assert caught.value.reason_code == "github_invalid_json_response"
+    assert caught.value.diagnostic_context["http_status"] == 200
+    assert caught.value.diagnostic_context["retryable"] is False
+    assert "omni/orders.view" not in str(caught.value)
+    assert "synthetic-token" not in str(caught.value)
     assert request.call_args.kwargs["allow_redirects"] is False

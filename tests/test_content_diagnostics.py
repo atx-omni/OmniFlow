@@ -9,6 +9,7 @@ import yaml
 
 from omniflow.cli import build_parser, cmd_run
 from omniflow.config import _to_config
+from omniflow.diagnostics import public_diagnostic
 from omniflow.discovery import ModelContext
 from omniflow.git import tool_revision
 from omniflow.reporting.junit_report import to_junit
@@ -148,7 +149,7 @@ def test_api_to_cli_reports_incomplete_evidence_and_preserves_privacy(tmp_path, 
     assert report["diagnostic_schema_version"] == 2
     assert len(report["run_reference"]) == 32
     assert "git_sha" not in report
-    assert "tool_revision" not in report
+    assert report["tool_revision"] == {"commit": action_sha, "source": "github_action_ref"}
     assert "model_id" not in report["models"][0]
     assert "model_path" not in report["models"][0]
     finding = report["issues"][0]
@@ -166,7 +167,7 @@ def test_api_to_cli_reports_incomplete_evidence_and_preserves_privacy(tmp_path, 
     assert evidence["exit_code_reason"] == "Omni API error"
     assert evidence["diagnostic_schema_version"] == 2
     assert evidence["run_reference"] == report["run_reference"]
-    assert "tool_revision" not in evidence
+    assert evidence["tool_revision"] == report["tool_revision"]
     assert json.loads((public / "report.sarif").read_text())["runs"][0]["results"][0]["level"] == "error"
     assert ElementTree.fromstring((public / "junit.xml").read_text()).get("failures") == "1"
     for path in public.iterdir():
@@ -178,7 +179,6 @@ def test_api_to_cli_reports_incomplete_evidence_and_preserves_privacy(tmp_path, 
         assert "doc-id" not in text
         assert "doc-short" not in text
         assert input_sha not in text
-        assert action_sha not in text
     assert not (tmp_path / ".omniflow/restricted").exists()
 
 
@@ -232,13 +232,25 @@ def test_cli_unverified_draft_is_safe_operational_failure_not_new_content_defect
     assert not (tmp_path / ".omniflow/restricted").exists()
 
 
-@pytest.mark.parametrize("action_ref, expected", [("A" * 40, "a" * 40), ("main", None), ("v0.5.0", None), ("", None)])
+@pytest.mark.parametrize("action_ref, expected", [
+    ("A" * 40, "a" * 40), ("main", None), ("v0.5.0", None), ("", None),
+    ("g" * 40, None), ("a" * 39, None), ("a" * 41, None),
+])
 def test_action_provenance_never_uses_the_input_sha(monkeypatch, action_ref, expected):
     monkeypatch.setenv("OMNIFLOW_ACTION_REF", action_ref)
     monkeypatch.setenv("GITHUB_SHA", "c" * 40)
     result = tool_revision()
     assert result["commit"] == expected
     assert result["source"] == ("github_action_ref" if expected else "unavailable")
+    safe = public_diagnostic({"tool_revision": {**result, "private_detail": "DO-NOT-PUBLISH"}})
+    if expected:
+        assert safe["tool_revision"] == result
+    else:
+        assert "tool_revision" not in safe
+    assert "DO-NOT-PUBLISH" not in json.dumps(safe)
+    assert "c" * 40 not in json.dumps(safe)
+    for source in ("git_sha", "github_sha", "unavailable", "DO-NOT-PUBLISH"):
+        assert "tool_revision" not in public_diagnostic({"tool_revision": {"commit": "a" * 40, "source": source}})
 
 
 def test_all_cli_action_steps_receive_action_ref_via_environment():

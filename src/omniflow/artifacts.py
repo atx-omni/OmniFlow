@@ -9,7 +9,11 @@ from .diagnostics import public_diagnostic, record_private_report
 from .exceptions import OmniFlowError, SecurityPolicyError
 from .git import tool_revision
 from .reporting.writer import write_reports
-from .repository_diagnostics import clear_repository_reports, write_repository_reports
+from .repository_diagnostics import (
+    clear_repository_reports,
+    repository_diagnostic_availability,
+    write_repository_reports,
+)
 from .security import secure_write_text
 from .timestamps import utc_now_iso
 
@@ -37,6 +41,9 @@ def write_public_reports(
     try:
         clear_repository_reports(output_dir)
         safe_report = public_diagnostic(report)
+        record_private_report(report)
+        write_repository_reports(report, safe_report, output_dir=output_dir)
+        safe_report["repository_diagnostics"] = repository_diagnostic_availability()
         # A changed format preference must not leave a previous, possibly
         # identity-rich report available for the workflow to upload.
         current_formats = set(formats)
@@ -53,14 +60,13 @@ def write_public_reports(
                 # Normal orchestration replaces this with its current evidence
                 # envelope next. Until then, only current safe evidence remains.
                 secure_write_text(evidence_path, json.dumps(safe_report, indent=2) + "\n")
-        record_private_report(report)
-        write_repository_reports(report, safe_report, output_dir=output_dir)
     except SecurityPolicyError:
         # Never retry an output path rejected by the filesystem safety checks.
         raise
     except Exception as exc:
         write_emergency_failure(output_dir=output_dir)
-        raise OmniFlowError("Report generation failed; current validation evidence is incomplete.") from exc
+        raise OmniFlowError("Report generation failed; current validation evidence is incomplete.",
+                            reason_code="report_generation_failed") from exc
     return safe_report
 
 
@@ -71,8 +77,10 @@ def write_emergency_failure(*, output_dir: str | Path) -> None:
     metadata must never be serialized by this last-resort public path.
     """
     clear_repository_reports(output_dir)
-    message = "OmniFlow could not complete this run. Current validation evidence is incomplete; do not merge."
-    issue = {"validator": "execution", "type": "internal_execution_failure", "severity": "error", "message": message}
+    message = "OF-EXECUTION-INTERNAL: OmniFlow could not complete this run. Current validation evidence is incomplete; do not merge."
+    issue = {"validator": "execution", "type": "internal_execution_failure", "severity": "error", "message": message,
+             "diagnostic_code": "OF-EXECUTION-INTERNAL", "next_action": "Inspect the first failed step and tool version; "
+             "check runner output permissions and contact the maintainer with the public report."}
     report = {
         "tool": "omniflow", "diagnostic_schema_version": 2,
         "policy_decision": "fail", "validation_complete": False,

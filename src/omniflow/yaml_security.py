@@ -15,7 +15,7 @@ MAX_YAML_ALIASES = 50
 MAX_YAML_EVENTS = 250_000
 
 
-def parse_secure_yaml(text: str, *, source: str) -> Any:
+def parse_secure_yaml(text: str, *, source: str, source_kind: str = "model_yaml") -> Any:
     encoded_size = len(text.encode("utf-8"))
     if encoded_size > MAX_YAML_FILE_BYTES:
         raise SecurityPolicyError(f"Omni YAML file '{_source_label(source)}' exceeds the 5 MiB safety limit")
@@ -23,7 +23,7 @@ def parse_secure_yaml(text: str, *, source: str) -> Any:
         _validate_event_limits(text, source=source)
         value = yaml.safe_load(text) or {}
     except yaml.YAMLError as exc:
-        raise _sanitized_yaml_error(source, exc) from exc
+        raise _sanitized_yaml_error(source, exc, source_kind=source_kind) from exc
     except RecursionError as exc:
         raise SecurityPolicyError(f"Omni YAML file '{_source_label(source)}' exceeds safe nesting limits") from exc
     _validate_constructed_graph(value, source=source)
@@ -79,10 +79,14 @@ def _validate_constructed_graph(value: Any, *, source: str) -> None:
     walk(value, 0)
 
 
-def _sanitized_yaml_error(source: str, exc: yaml.YAMLError) -> ConfigError:
+def _sanitized_yaml_error(source: str, exc: yaml.YAMLError, *, source_kind: str = "model_yaml") -> ConfigError:
     mark = getattr(exc, "problem_mark", None)
     location = f" at line {mark.line + 1}, column {mark.column + 1}" if mark is not None else ""
-    return ConfigError(f"Could not parse Omni YAML file '{_source_label(source)}'{location}")
+    context = {"source_kind": source_kind if source_kind in {"policy", "model_yaml"} else "model_yaml"}
+    if mark is not None:
+        context.update(source_line=mark.line + 1, source_column=mark.column + 1)
+    return ConfigError(f"Could not parse YAML{location}", reason_code="yaml_parse_error",
+                       diagnostic_context=context)
 
 
 def _source_label(source: str) -> str:

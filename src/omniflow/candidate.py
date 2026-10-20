@@ -11,33 +11,39 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from .exceptions import ConfigError, OmniFlowError
+from .artifact_identity import ArtifactIdentityError, identity_digest, match_artifacts
+from .exceptions import ConfigError, OmniFlowError, exception_diagnostic
 from .file_scope import FileScopeError, NonOmniRule, excluded_semantic_paths
 from .git import git_executable
 from .model_paths import (
     AmbiguousModelPath,
-    authored_file_identity,
+    filename_identity,
     identity_index,
     is_git_model_file,
     is_repo_control_file,
     is_semantic_file,
 )
 from .revision_data import FULL_SHA, pull_request_revision, read_git_text, read_github_text
+from .view_identity import normalize_api_view_names
 from .yaml_security import MAX_YAML_FILE_BYTES, MAX_YAML_FILES, MAX_YAML_TOTAL_BYTES
 
 MAX_TREE_BYTES = 2 * 1024 * 1024
 MAX_TREE_ENTRIES = 10_000
+MAX_CANDIDATE_SAMPLES = 5
 CANDIDATE_COUNT_FIELDS = frozenset({
     "git_file_count", "omni_file_count", "git_only_count", "omni_only_count",
     "case_only_count", "directory_only_count", "suffix_only_count",
+    "candidate_sample_count", "candidate_sample_omitted_count", "compared_file_count",
 })
 
 
 class CandidateVerificationError(ConfigError):
     """Public diagnostics use categories only, never model paths or contents."""
 
-    def __init__(self, reason: str, **counts: int) -> None:
+    def __init__(self, reason: str, *, candidate_samples: Sequence[dict] = (), **counts: int) -> None:
         self.candidate_reason = reason
+        # Private observations only. Renderers separately authorize disclosure.
+        self.candidate_samples = [dict(sample) for sample in candidate_samples[:MAX_CANDIDATE_SAMPLES]]
         self.candidate_counts = {
             key: value for key, value in counts.items()
             if key in CANDIDATE_COUNT_FIELDS and type(value) is int and 0 <= value <= 2**31 - 1
@@ -50,7 +56,28 @@ class CandidateVerificationError(ConfigError):
 
 
 class _GitUnavailable(Exception):
-    pass
+    def __init__(self, reason_code: str = "git_revision_unavailable") -> None:
+        self.reason_code = reason_code
+
+
+def _retain_candidate_cause(exc: OmniFlowError, reason: str) -> None:
+    """Keep the original auth/API/security type and structured transport cause."""
+    exc.candidate_reason = reason
+    cause = exception_diagnostic(exc).get("reason_code")
+    exc.diagnostic_context["candidate_reason"] = reason
+    if isinstance(cause, str):
+        exc.diagnostic_context.setdefault("cause_code", cause)
+
+
+def _bind_samples(exc: CandidateVerificationError, *, sha: str, model_id: str, branch_id: str | None,
+                  comparison: str) -> CandidateVerificationError:
+    # These are private binding evidence, never permission to disclose a sample.
+    exc.candidate_git_sha = sha
+    exc.candidate_model_id = model_id
+    exc.candidate_branch_id = branch_id
+    exc.contents_comparison = comparison
+    exc.diagnostic_context["contents_comparison"] = comparison
+    return exc
 
 
 def verify_candidate(
@@ -63,8 +90,11 @@ def verify_candidate(
     """
     try:
         return _verify_snapshot(client, context, revision_side=revision_side, non_omni_rules=non_omni_rules)
-    except CandidateVerificationError as exc:
+    except OmniFlowError as exc:
         exc.validation_scope = "base" if revision_side == "base" else "branch"
+        exc.diagnostic_context["validation_scope"] = exc.validation_scope
+        for sample in getattr(exc, "candidate_samples", []):
+            sample["validation_scope"] = exc.validation_scope
         raise
 
 
@@ -80,7 +110,14 @@ def _verify_snapshot(
     model_path = "." if scope == "." else _safe_path(scope)
     try:
         revision = pull_request_revision(revision_side)
-    except (OmniFlowError, AttributeError, TypeError, ValueError):
+    except ConfigError as exc:
+        error = CandidateVerificationError("invalid_pr_revision")
+        error.diagnostic_context.update(exception_diagnostic(exc))
+        raise error from exc
+    except OmniFlowError as exc:
+        _retain_candidate_cause(exc, "invalid_pr_revision")
+        raise
+    except (AttributeError, TypeError, ValueError):
         raise CandidateVerificationError("invalid_pr_revision") from None
     if revision is None:
         raise CandidateVerificationError("missing_pr_revision")
@@ -89,8 +126,12 @@ def _verify_snapshot(
     try:
         entries = _local_tree(sha, root=root)
         remote = False
-    except _GitUnavailable:
-        entries = _remote_tree(repository, sha)
+    except _GitUnavailable as local_error:
+        try:
+            entries = _remote_tree(repository, sha)
+        except OmniFlowError as exc:
+            exc.diagnostic_context["local_git_reason"] = local_error.reason_code
+            raise
         remote = True
     expected = _semantic_inventory(entries, model_path, include_unrecognized=True)
     if not expected:
@@ -101,14 +142,15 @@ def _verify_snapshot(
             context.model_id, branch_id=branch_id, mode="combined", include_checksums=False,
             fully_resolved=False,
         )
-    except OmniFlowError:
-        raise CandidateVerificationError("api_snapshot_unavailable") from None
+    except OmniFlowError as exc:
+        _retain_candidate_cause(exc, "api_snapshot_unavailable")
+        raise
     actual = _api_files(payload)
     counts = {"git_file_count": len(expected), "omni_file_count": len(actual)}
     # Keep the complete inventories through path, type, size and collision
     # validation. Rules cannot erase malformed evidence or real Omni sources.
     try:
-        expected_names, actual_names = identity_index(expected), identity_index(actual)
+        identity_index(expected)
     except AmbiguousModelPath:
         raise CandidateVerificationError("ambiguous_file_identity", **counts) from None
     try:
@@ -118,28 +160,21 @@ def _verify_snapshot(
     if excluded:
         expected = {path: entry for path, entry in expected.items() if path not in excluded}
     expected = _source_inventory(expected, actual)
-    expected_names = identity_index(expected)
     counts["git_file_count"] = len(expected)
     if not expected:
         raise CandidateVerificationError("empty_git_snapshot", **counts)
-    counts.update(git_only_count=len(expected_names.keys() - actual_names.keys()),
-                  omni_only_count=len(actual_names.keys() - expected_names.keys()))
-    if counts["git_only_count"] or counts["omni_only_count"]:
-        counts.update(_mismatch_category_counts(set(expected_names), set(actual_names)))
-        raise CandidateVerificationError("file_inventory_mismatch", **counts)
-    # Compare by authored identity, but retain original Git keys and entries for
-    # independent immutable blob verification, report locations and proof digests.
-    corresponding = {path: actual_names[identity] for identity, path in expected_names.items()}
-
-    digest = hashlib.sha256()
+    # Read only immutable Git objects, binding every returned byte to the tree's
+    # blob hash before using authored qualification to establish correspondence.
+    git_files = {}
     for path, entry in sorted(expected.items()):
         try:
             if remote:
                 text = read_github_text(repository, sha, entry["path"], max_bytes=MAX_YAML_FILE_BYTES)
             else:
                 text = read_git_text(sha, entry["path"], root=root, max_bytes=MAX_YAML_FILE_BYTES)
-        except OmniFlowError:
-            raise CandidateVerificationError("git_snapshot_unavailable") from None
+        except OmniFlowError as exc:
+            _retain_candidate_cause(exc, "git_snapshot_unavailable")
+            raise
         if not isinstance(text, str):
             raise CandidateVerificationError("incomplete_git_snapshot")
         raw = _utf8(text)
@@ -149,13 +184,51 @@ def _verify_snapshot(
         blob = algorithm(b"blob " + str(len(raw)).encode("ascii") + b"\0" + raw).hexdigest()  # nosec B324
         if len(raw) != entry["size"] or blob != entry["sha"].lower():
             raise CandidateVerificationError("incomplete_git_snapshot")
-        if raw != actual[corresponding[path]]:
-            raise CandidateVerificationError("content_mismatch", **counts)
+        git_files[path] = text
+    omni_files = {path: raw.decode("utf-8") for path, raw in actual.items()}
+    view_names = normalize_api_view_names(
+        payload["viewNames"], omni_files, parse_contents=False,
+    ) if "viewNames" in payload else None
+    try:
+        correspondence = match_artifacts(git_files, omni_files, omni_view_names=view_names)
+    except ArtifactIdentityError as exc:
+        samples = [{"git_path": item.get("git_path"), "omni_path": item.get("omni_path"),
+                    "comparison": "not_compared", "pairing": "ambiguous_identity"}
+                   for item in exc.candidates[:MAX_CANDIDATE_SAMPLES]]
+        raise _bind_samples(CandidateVerificationError(
+            "ambiguous_file_identity", candidate_samples=samples, **counts,
+            candidate_sample_count=len(samples),
+            candidate_sample_omitted_count=max(0, exc.candidate_count - len(samples)), compared_file_count=0,
+        ), sha=sha, model_id=context.model_id, branch_id=branch_id, comparison="not_compared") from None
+    counts.update(git_only_count=len(correspondence.unmatched_git),
+                  omni_only_count=len(correspondence.unmatched_omni))
+    if counts["git_only_count"] or counts["omni_only_count"]:
+        counts.update(_mismatch_category_counts(correspondence.unmatched_git, correspondence.unmatched_omni))
+        pairs = _mismatch_pairs(correspondence.unmatched_git, correspondence.unmatched_omni)
+        samples = [{"git_path": left, "omni_path": right, "comparison": "not_compared", "pairing": pairing}
+                   for left, right, pairing in pairs[:MAX_CANDIDATE_SAMPLES]]
+        raise _bind_samples(CandidateVerificationError(
+            "file_inventory_mismatch", candidate_samples=samples, **counts,
+            candidate_sample_count=len(samples), candidate_sample_omitted_count=len(pairs) - len(samples),
+            compared_file_count=0,
+        ), sha=sha, model_id=context.model_id, branch_id=branch_id, comparison="not_compared")
+    digest = hashlib.sha256()
+    for compared_count, (path, text) in enumerate(sorted(git_files.items()), start=1):
+        raw = _utf8(text)
+        api_path = correspondence.pairs[path]
+        if raw != actual[api_path]:
+            raise _bind_samples(CandidateVerificationError(
+                "content_mismatch", **counts,
+                candidate_samples=[{"git_path": path, "omni_path": api_path,
+                                    "comparison": "different", "pairing": "authored_identity"}],
+                candidate_sample_count=1, candidate_sample_omitted_count=0, compared_file_count=compared_count,
+            ), sha=sha, model_id=context.model_id, branch_id=branch_id, comparison="different")
         name = path.encode("utf-8")
         digest.update(len(name).to_bytes(8, "big") + name + len(raw).to_bytes(8, "big") + raw)
     proof = {
         "status": "verified", "method": "authored_yaml_snapshot", f"{revision_side}_sha": sha,
         "file_count": len(expected), "snapshot_digest": digest.hexdigest(),
+        "identity_digest": identity_digest(correspondence.pairs, omni_view_names=view_names),
     }
     if non_omni_rules:
         proof["excluded_file_count"] = len(excluded)
@@ -164,12 +237,22 @@ def _verify_snapshot(
 
 def _mismatch_category_counts(expected: set[str], actual: set[str]) -> dict[str, int]:
     """Describe unique unmatched pairs without relaxing equality or exposing names."""
+    pairs = _mismatch_pairs(expected, actual)
+    return {category: sum(pairing == hint for _, _, pairing in pairs) for category, hint in (
+        ("case_only_count", "case_hint"), ("directory_only_count", "basename_hint"),
+        ("suffix_only_count", "suffix_hint"),
+    )}
+
+
+def _mismatch_pairs(expected: set[str], actual: set[str]) -> list[tuple[str | None, str | None, str]]:
+    """Observational hints; never used to select files or establish equality."""
     git_only, omni_only = expected - actual, actual - expected
-    counts = {}
-    for category, key in (
-        ("case_only_count", str.casefold),
-        ("directory_only_count", lambda path: PurePosixPath(path).name),
-        ("suffix_only_count", _without_yaml_suffixes),
+    result = []
+    for hint, key, normalized_case in (
+        ("case_hint", str.casefold, False),
+        ("case_hint", lambda path: filename_identity(path).casefold(), True),
+        ("basename_hint", lambda path: PurePosixPath(path).name, False),
+        ("suffix_hint", _without_yaml_suffixes, False),
     ):
         left: dict[str, list[str]] = defaultdict(list)
         right: dict[str, list[str]] = defaultdict(list)
@@ -177,12 +260,15 @@ def _mismatch_category_counts(expected: set[str], actual: set[str]) -> dict[str,
             left[key(path)].append(path)
         for path in omni_only:
             right[key(path)].append(path)
-        pairs = [(paths[0], right[name][0]) for name, paths in left.items()
-                 if len(paths) == 1 and len(right.get(name, [])) == 1]
-        counts[category] = len(pairs)
+        pairs = sorted((paths[0], right[name][0]) for name, paths in left.items()
+                       if len(paths) == 1 and len(right.get(name, [])) == 1
+                       and (not normalized_case or filename_identity(paths[0]) != filename_identity(right[name][0])))
+        result.extend((left, right, hint) for left, right in pairs)
         git_only.difference_update(path for path, _ in pairs)
         omni_only.difference_update(path for _, path in pairs)
-    return counts
+    result.extend((path, None, "unpaired") for path in sorted(git_only))
+    result.extend((None, path, "unpaired") for path in sorted(omni_only))
+    return result
 
 
 def _without_yaml_suffixes(path: str) -> str:
@@ -249,10 +335,10 @@ def _source_inventory(inventory: dict[str, dict], api_files: dict) -> dict[str, 
     Unrelated Git-only YAML is ignored without reading its contents. API source
     evidence is never discarded merely because its name is not a default.
     """
-    api_names = identity_index(api_files)
+    api_names = {filename_identity(path) for path in api_files}
     selected = {
         path: entry for path, entry in inventory.items()
-        if is_git_model_file(path) or authored_file_identity(path) in api_names
+        if is_git_model_file(path) or filename_identity(path) in api_names
     }
     if (len(selected) > MAX_YAML_FILES
             or any(entry["size"] > MAX_YAML_FILE_BYTES for entry in selected.values())
@@ -306,8 +392,12 @@ def _semantic_inventory(
 def _bounded_git(args: list[str], *, root: Path, limit: int) -> bytes:
     """Bound captured bytes as well as duration; kill before draining overflow."""
     try:
+        executable = git_executable()
+    except OSError:
+        raise _GitUnavailable("git_missing_executable") from None
+    try:
         with subprocess.Popen(  # nosec B603
-            [git_executable(), "--no-replace-objects", *args], cwd=root,
+            [executable, "--no-replace-objects", *args], cwd=root,
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         ) as process:
             with ThreadPoolExecutor(max_workers=1) as reader:
@@ -323,7 +413,11 @@ def _bounded_git(args: list[str], *, root: Path, limit: int) -> bytes:
                     if process.poll() is None:
                         process.kill()
                     process.wait()
-    except (OSError, subprocess.SubprocessError, TimeoutError):
+    except (subprocess.TimeoutExpired, TimeoutError):
+        raise _GitUnavailable("git_timeout") from None
+    except OSError:
+        raise _GitUnavailable() from None
+    except subprocess.SubprocessError:
         raise _GitUnavailable() from None
 
 
@@ -354,13 +448,20 @@ def _remote_tree(repository: str, sha: str) -> list[dict]:
 
     token = os.getenv("OMNIFLOW_GITHUB_TOKEN")
     if not token:
-        raise CandidateVerificationError("git_snapshot_unavailable")
+        exc = ConfigError(
+            "OMNIFLOW_GITHUB_TOKEN is required to read exact pull request data",
+            reason_code="github_missing_token",
+            diagnostic_context={"service": "github", "api_operation": "github_tree", "retryable": False},
+        )
+        _retain_candidate_cause(exc, "git_snapshot_unavailable")
+        raise exc
     try:
         payload = GitHubRepository(repository, token).request(
             "GET", f"/git/trees/{sha}?recursive=1", max_bytes=MAX_TREE_BYTES,
         )
-    except OmniFlowError:
-        raise CandidateVerificationError("git_snapshot_unavailable") from None
+    except OmniFlowError as exc:
+        _retain_candidate_cause(exc, "git_snapshot_unavailable")
+        raise
     if not isinstance(payload, dict) or payload.get("truncated") is not False or not isinstance(payload.get("tree"), list):
         raise CandidateVerificationError("incomplete_git_snapshot")
     return payload["tree"]
