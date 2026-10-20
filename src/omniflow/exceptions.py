@@ -1,5 +1,44 @@
 from __future__ import annotations
 
+from typing import Any
+
+API_OPERATIONS = frozenset({
+    "model_yaml", "model_validation", "content_validation", "git_configuration",
+    "model_list", "content_list", "document_drafts", "dbt_exposures", "schema_refresh",
+    "job_status", "ai_job", "ai_job_status", "ai_job_cancel", "ai_prompt_set",
+    "ai_eval_run", "ai_eval_status", "ai_eval_cancel", "git_commit", "omni_request",
+    "github_compare", "github_tree", "github_blob", "github_pull_request",
+    "github_check", "github_variable", "github_label", "github_request",
+    "git_revision_read", "git_tree_read",
+})
+TRANSPORT_REASON_CODES = frozenset({
+    "omni_unauthorized", "omni_forbidden", "omni_rate_limited", "omni_service_unavailable",
+    "omni_http_error", "omni_timeout", "omni_tls_error", "omni_connection_error",
+    "omni_request_failed", "omni_response_interrupted", "omni_response_limit_exceeded",
+    "omni_pagination_invalid", "omni_pagination_limit_exceeded",
+    "empty_api_response", "invalid_json_response",
+    "github_missing_token", "github_invalid_repository", "github_unauthorized", "github_forbidden",
+    "github_not_found_or_inaccessible", "github_rate_limited", "github_service_unavailable",
+    "github_http_error", "github_timeout", "github_tls_error", "github_connection_error",
+    "github_request_failed", "github_response_interrupted", "github_invalid_json_response",
+    "github_response_limit_exceeded", "git_revision_unavailable", "git_missing_executable",
+    "git_timeout", "git_invalid_encoding",
+})
+
+
+def exception_diagnostic(exc: BaseException) -> dict[str, Any]:
+    """Copy structured evidence only; renderers must apply their own allowlist.
+
+    Exception messages, response bodies and exception chains are not diagnostic
+    authority. Existing subclasses that set reason_code themselves remain valid.
+    """
+    context = getattr(exc, "diagnostic_context", None)
+    result = dict(context) if isinstance(context, dict) else {}
+    reason = getattr(exc, "reason_code", None)
+    if isinstance(reason, str):
+        result["reason_code"] = reason
+    return result
+
 
 class ExitCodes:
     SUCCESS = 0
@@ -14,10 +53,16 @@ class ExitCodes:
 class OmniFlowError(Exception):
     exit_code = ExitCodes.INTERNAL_ERROR
 
-    def __init__(self, message: str, *, exit_code: int | None = None) -> None:
+    def __init__(
+        self, message: str, *, exit_code: int | None = None, reason_code: str | None = None,
+        diagnostic_context: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         if exit_code is not None:
             self.exit_code = exit_code
+        if reason_code is not None:
+            self.reason_code = reason_code
+        self.diagnostic_context = dict(diagnostic_context or {})
 
 
 class ConfigError(OmniFlowError):
@@ -81,3 +126,11 @@ class OmniResponseError(OmniAPIError):
 
 class OmniAuthError(OmniFlowError):
     exit_code = ExitCodes.AUTHORIZATION_ERROR
+
+
+class GitHubAPIError(OmniAPIError):
+    """GitHub transport/evidence failure, not a policy configuration error."""
+
+
+class GitHubAuthError(OmniAuthError):
+    """GitHub rejected the supplied credential or its access scope."""

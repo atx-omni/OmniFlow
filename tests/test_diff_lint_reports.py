@@ -382,7 +382,7 @@ class DiffLintReportTests(unittest.TestCase):
         self.assertIn("%2C", lines[0])
         self.assertIn("%0A", lines[0])
         self.assertIn("%25", lines[0])
-        self.assertTrue(lines[1].startswith("::error "))
+        self.assertEqual(lines[1], "::error::Blocks under configured policy: blocked")
         self.assertEqual(len(lines), 2)
 
     def test_markdown_report_is_reviewer_friendly_for_contract_failure(self):

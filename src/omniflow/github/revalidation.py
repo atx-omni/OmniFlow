@@ -19,7 +19,7 @@ import requests
 from ..config import load_config
 from ..diagnostics import safe_exception_message
 from ..discovery import _is_under_model_path, _is_unregistered_omni_file, discover_contexts, load_flow_metadata
-from ..exceptions import ConfigError, SecurityPolicyError
+from ..exceptions import ConfigError, GitHubAPIError, GitHubAuthError, SecurityPolicyError
 from ..git import git_value
 from ..json_evidence import reject_duplicate_keys
 from ..revision_data import FULL_SHA, REPOSITORY, pull_request_changed_files
@@ -28,10 +28,38 @@ CHECK_NAME = "OmniFlow deployment readiness"
 MAX_RESPONSE = 2 * 1024 * 1024
 
 
+def _github_operation(path: str) -> str:
+    """Fixed operation names only; never disclose repository or object paths."""
+    parts = path.split("?", 1)[0].strip("/").split("/")
+    if parts[:1] == ["compare"]:
+        return "github_compare"
+    if parts[:2] == ["git", "trees"]:
+        return "github_tree"
+    if parts[:2] == ["git", "blobs"]:
+        return "github_blob"
+    if parts[:1] == ["pulls"]:
+        return "github_pull_request"
+    if parts[:1] == ["check-runs"]:
+        return "github_check"
+    if parts[:2] == ["actions", "variables"]:
+        return "github_variable"
+    if len(parts) >= 3 and parts[0] == "issues" and parts[2] == "labels":
+        return "github_label"
+    return "github_request"
+
+
 class GitHubRepository:
     def __init__(self, repository: str, token: str):
-        if not REPOSITORY.fullmatch(repository) or not token:
-            raise ConfigError("Deployment readiness requires a repository and GitHub token")
+        if not REPOSITORY.fullmatch(repository):
+            raise ConfigError(
+                "GitHub access requires a valid owner/repository identifier",
+                reason_code="github_invalid_repository", diagnostic_context={"service": "github", "retryable": False},
+            )
+        if not token:
+            raise ConfigError(
+                "GitHub access requires OMNIFLOW_GITHUB_TOKEN",
+                reason_code="github_missing_token", diagnostic_context={"service": "github", "retryable": False},
+            )
         api = os.getenv("GITHUB_API_URL", "https://api.github.com").rstrip("/")
         parsed = urlparse(api)
         if parsed.scheme != "https" or not parsed.hostname or any(
@@ -43,21 +71,56 @@ class GitHubRepository:
         self.headers = {"Accept": "application/vnd.github+json", "Authorization": f"Bearer {token}"}
 
     def request(self, method: str, path: str, body: dict | None = None, *, max_bytes: int = MAX_RESPONSE):
+        context = {
+            "service": "github", "api_operation": _github_operation(path),
+            "attempt_count": 1, "max_attempts": 1,
+        }
+        response_started = False
         try:
             with requests.request(
                 method, f"{self.url}{path}", headers=self.headers, json=body,
                 timeout=30, allow_redirects=False, stream=True,
             ) as response:
+                response_started = True
+                context["http_status"] = response.status_code
                 if response.status_code not in {200, 201, 204}:
-                    raise ConfigError(f"GitHub readiness operation failed with HTTP {response.status_code}")
+                    limited = response.status_code == 429 or (
+                        response.status_code == 403 and response.headers.get("X-RateLimit-Remaining") == "0"
+                    )
+                    reason = ("github_rate_limited" if limited else
+                              "github_unauthorized" if response.status_code == 401 else
+                              "github_forbidden" if response.status_code == 403 else
+                              "github_not_found_or_inaccessible" if response.status_code == 404 else
+                              "github_service_unavailable" if 500 <= response.status_code < 600 else "github_http_error")
+                    error_type = GitHubAuthError if response.status_code in {401, 403} and not limited else GitHubAPIError
+                    raise error_type(
+                        f"GitHub operation failed with HTTP {response.status_code}", reason_code=reason,
+                        diagnostic_context={**context, "retryable": method == "GET" and (limited or 500 <= response.status_code < 600)},
+                    )
                 value = bytearray()
                 for chunk in response.iter_content(65536):
                     value.extend(chunk)
                     if len(value) > max_bytes:
-                        raise SecurityPolicyError("GitHub response exceeds its configured size bound")
+                        raise SecurityPolicyError(
+                            "GitHub response exceeds its configured size bound",
+                            reason_code="github_response_limit_exceeded",
+                            diagnostic_context={**context, "retryable": False},
+                        )
                 return json.loads(value, object_pairs_hook=reject_duplicate_keys) if value else None
-        except (requests.RequestException, ValueError) as exc:
-            raise ConfigError("GitHub readiness operation returned unavailable or invalid data") from exc
+        except requests.RequestException as exc:
+            cause = ("github_tls_error" if isinstance(exc, requests.exceptions.SSLError) else
+                     "github_timeout" if isinstance(exc, requests.Timeout) else
+                     "github_connection_error" if isinstance(exc, requests.ConnectionError) else "github_request_failed")
+            reason = "github_response_interrupted" if response_started else cause
+            raise GitHubAPIError(
+                "GitHub operation could not complete; review the connection failure category.", reason_code=reason,
+                diagnostic_context={**context, "cause_code": cause, "retryable": method == "GET" and cause != "github_tls_error"},
+            ) from exc
+        except ValueError as exc:
+            raise GitHubAPIError(
+                "GitHub returned invalid JSON evidence", reason_code="github_invalid_json_response",
+                diagnostic_context={**context, "retryable": False},
+            ) from exc
 
     def pull_request(self, number: int) -> dict:
         pr = self.request("GET", f"/pulls/{number}")

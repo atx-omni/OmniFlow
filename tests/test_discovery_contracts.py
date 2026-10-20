@@ -54,13 +54,14 @@ class DiscoveryTests(unittest.TestCase):
                 },
             )
             with mock.patch.dict(os.environ, {"GITHUB_HEAD_REF": "feature/a"}, clear=True):
-                contexts = discover_contexts(auto=True)
+                contexts = discover_contexts(auto=True, changed_files=[])
         self.assertEqual(len(contexts), 1)
         self.assertEqual(contexts[0].model_id, "model-1")
         self.assertEqual(contexts[0].branch_name, "feature/a")
 
     def test_auto_routing_skips_when_no_omni_context_exists(self):
         with temporary_workdir():
+            subprocess.run(["git", "init", "-q"], check=True)
             with mock.patch.dict(os.environ, {}, clear=True):
                 contexts = discover_contexts(auto=True, allow_skip=True)
         self.assertEqual(contexts, [])
@@ -285,7 +286,7 @@ class DiscoveryTests(unittest.TestCase):
             write_json(tmp / "event.json", event)
             with mock.patch.dict(os.environ, {"GITHUB_EVENT_PATH": str(tmp / "event.json")}, clear=True):
                 marker = load_pr_marker()
-                contexts = discover_contexts(auto=True)
+                contexts = discover_contexts(auto=True, changed_files=[])
         self.assertEqual(marker["model_id"], "b")
         self.assertEqual(contexts[0].model_id, "b")
         self.assertEqual(contexts[0].branch_name, "feature/content")
@@ -312,7 +313,7 @@ class DiscoveryTests(unittest.TestCase):
             env = {"GITHUB_EVENT_PATH": str(tmp / "event.json"), "GITHUB_HEAD_REF": "risky/branch"}
             with mock.patch.dict(os.environ, env, clear=True):
                 with self.assertRaises(SecurityPolicyError):
-                    discover_contexts(auto=True)
+                    discover_contexts(auto=True, changed_files=[])
 
     def test_pull_request_must_target_the_models_trusted_base_branch(self):
         with temporary_workdir() as tmp:
@@ -511,7 +512,7 @@ class DiscoveryTests(unittest.TestCase):
         )
         self.assertEqual([context.model_id for context in contexts], ["model-1"])
 
-    def test_auto_routing_skips_single_model_when_changed_files_unavailable(self):
+    def test_auto_routing_fails_when_all_changed_file_comparisons_are_unavailable(self):
         with temporary_workdir() as tmp:
             write_json(
                 tmp / ".omni/flow.json",
@@ -523,8 +524,9 @@ class DiscoveryTests(unittest.TestCase):
                 },
             )
             with mock.patch.dict(os.environ, {"GITHUB_HEAD_REF": "feature/dbt"}, clear=True):
-                contexts = discover_contexts(auto=True, allow_skip=True)
-        self.assertEqual(contexts, [])
+                with self.assertRaises(ConfigError) as caught:
+                    discover_contexts(auto=True, allow_skip=True)
+        self.assertEqual(caught.exception.reason_code, "changed_files_unavailable")
 
     def test_malformed_pr_marker_is_config_error(self):
         with temporary_workdir() as tmp:

@@ -236,6 +236,23 @@ class RepairOrchestratorTests(unittest.TestCase):
         self.assertEqual(outcome.report["status"], "rolled_back")
         self.assertEqual(client.files["orders.view"], ORIGINAL_VIEW)
 
+    def test_zero_exit_incomplete_or_advisory_validation_cannot_commit_repair(self):
+        for validation in (
+            {"policy_decision": "pass", "validation_complete": False},
+            {"policy_decision": "advisory", "validation_complete": True},
+        ):
+            with self.subTest(validation=validation):
+                client = FakeRepairClient()
+                outcome = run_ai_repair(
+                    config=enabled_config(), context=context(), event=event(),
+                    client=client, guard=FakeGuard(), validation_runner=lambda validation=validation: (validation, 0),
+                )
+                self.assertEqual(outcome.exit_code, ExitCodes.OMNI_API_ERROR)
+                self.assertEqual(outcome.report["status"], "rolled_back")
+                self.assertEqual(outcome.report["reason_code"], "ai_repair_validation_incomplete")
+                self.assertFalse(any(call[0] == "commit" for call in client.calls))
+                self.assertEqual(client.files["orders.view"], ORIGINAL_VIEW)
+
     def test_timeout_cancels_job_before_rollback(self):
         client = FakeRepairClient(states=["EXECUTING"], validation_responses=[
             [{"message": "bad", "is_warning": False, "yaml_path": "orders.view"}]

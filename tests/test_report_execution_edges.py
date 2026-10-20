@@ -156,5 +156,6 @@ def test_warning_outputs_preserve_severity_and_explain_policy_blocking(blocking,
     if not active:
         assert annotations == []
     else:
-        assert annotations[0].startswith("::warning ")
+        assert annotations[0].startswith("::warning::")
+        assert "file=" not in annotations[0] and "line=" not in annotations[0]
         assert ("Blocks under configured policy: " in annotations[0]) is blocking

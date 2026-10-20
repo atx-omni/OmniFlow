@@ -4,6 +4,8 @@ from omniflow.discovery import _is_probable_omni_file, _is_under_model_path
 from omniflow.model_paths import (
     AmbiguousModelPath,
     authored_file_identity,
+    filename_identity,
+    filename_index,
     identity_index,
     is_git_model_file,
     is_semantic_file,
@@ -42,6 +44,22 @@ def test_full_paths_case_and_spaces_are_preserved():
     assert index["A Space/orders.view"] == paths[-1]
 
 
+def test_model_filename_correspondence_preserves_case_and_original_paths():
+    paths = ["A Space/orders.view.yaml", "elsewhere/Orders.view.yml", "nested/model.yaml"]
+    assert filename_index(paths) == {"orders.view": paths[0], "Orders.view": paths[1], "model": paths[2]}
+    assert filename_identity("another/settings.yaml") == "settings.yaml"
+    assert filename_identity("another/orders.view.yaml.yaml") == "orders.view.yaml.yaml"
+
+
+@pytest.mark.parametrize("paths", [
+    ["a/orders.view.yaml", "b/orders.view"], ["a/model.yml", "b/model.yaml"],
+    ["a/settings.yaml", "b/settings.yaml"],
+])
+def test_duplicate_filenames_in_different_directories_are_ambiguous(paths):
+    with pytest.raises(AmbiguousModelPath):
+        filename_index(paths)
+
+
 @pytest.mark.parametrize("path", ["SCHEMA/orders.view.yaml", "A Space/orders.query.view.yml", "Sales.topic.yaml"])
 def test_root_model_routing_recognizes_native_typed_exports(path):
     assert _is_probable_omni_file(path)
@@ -71,6 +89,7 @@ def test_candidate_and_analysis_use_the_same_file_classifier(path):
     "model", "model.yaml", "model.yml", "relationships", "relationships.yaml", "relationships.yml",
     "SCHEMA/orders.view", "SCHEMA/orders.view.yaml", "A Space/orders.query.view.yml",
     "sales.topic", "sales.topic.yaml", "sales.composite_topic.yml", "joins.relationships.yaml",
+    "nested/model.yaml", "nested/relationships",
 ])
 def test_git_defaults_only_recognize_omni_families(path):
     assert is_git_model_file(path)
@@ -78,7 +97,7 @@ def test_git_defaults_only_recognize_omni_families(path):
 
 @pytest.mark.parametrize("path", [
     "README.md", "query.sql", "data.csv", "metadata.json", ".DS_Store", "settings.yaml", "schema.yml",
-    "views/orders.yaml", "topics/tooling.yml", "nested/model.yaml", "nested/relationships",
+    "views/orders.yaml", "topics/tooling.yml",
     "Model.yaml", "orders.VIEW.yaml", "orders.view.yaml.yaml",
 ])
 def test_unrelated_git_files_are_not_model_sources(path):

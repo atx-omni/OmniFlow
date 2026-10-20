@@ -116,6 +116,7 @@ def _issue(
     issue: dict[str, Any] = {
         "validator": VALIDATOR,
         "rule": rule,
+        "reason_code": rule,
         "severity": severity,
         "message": message,
         "breaking_change_count": len(breaking_changes),

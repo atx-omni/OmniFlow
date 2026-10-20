@@ -16,6 +16,7 @@ from omniflow.repository_diagnostics import (
     _load_snapshot,
     clear_repository_reports,
     finish_repository_context,
+    record_candidate_diagnostics,
     repository_reporting,
     start_repository_context,
 )
@@ -93,6 +94,52 @@ def execute(context, client, issues):
 def write(value, output_dir=".omniflow"):
     return write_public_reports(value, output_dir=output_dir,
                                 formats=["json", "markdown", "sarif", "junit"], redaction_level="standard")
+
+
+@pytest.mark.parametrize("side", ["base", "head"])
+def test_mismatch_samples_are_private_observations_without_successful_candidate_proof(repository, side):
+    from omniflow.candidate import CandidateVerificationError
+
+    context, _, policy = repository
+    issue = {"validator": "candidate", "type": "candidate_verification_failed", "severity": "error",
+             "candidate_reason": "file_inventory_mismatch", "contents_comparison": "not_compared", "blocking": True}
+    error = CandidateVerificationError("file_inventory_mismatch", candidate_samples=[{
+        "git_path": "orders.view", "omni_path": "other/orders.view", "comparison": "not_compared", "pairing": "basename_hint",
+    }])
+    error.validation_scope = "base" if side == "base" else "branch"
+    error.candidate_git_sha = policy.base_sha if side == "base" else policy.head_sha
+    error.candidate_model_id = context.model_id
+    error.candidate_branch_id = None if side == "base" else context.branch_id
+    with repository_reporting(object(), output_dir=Path(".omniflow")):
+        record_candidate_diagnostics(context, error, issue)
+        safe = write({**report([issue]), "exit_code": 2, "validation_complete": False})
+    private = json.loads(Path(".omniflow/repository/report.json").read_text())
+    finding = private["issues"][0]
+    assert finding["candidate_samples"][0]["git_path"] == "omni/orders.view"
+    assert finding["candidate_samples"][0]["comparison"] == "not_compared"
+    assert finding["candidate_evidence_kind"] == "observations_not_correspondence"
+    assert finding["git_revision"] == error.candidate_git_sha
+    assert private["exit_code"] == safe["exit_code"] == 2
+    assert private["validation_complete"] is safe["validation_complete"] is False
+    assert "candidate_samples" not in safe["issues"][0]
+    assert "orders.view" not in json.dumps(safe)
+    assert safe["repository_diagnostics"]["status"] == "available"
+
+
+@pytest.mark.parametrize("binding", ["candidate_git_sha", "candidate_model_id", "candidate_branch_id"])
+def test_mismatch_samples_require_registered_live_context_and_exact_revision(repository, binding):
+    from omniflow.candidate import CandidateVerificationError
+
+    context, _, policy = repository
+    issue = {"validator": "candidate", "severity": "error"}
+    error = CandidateVerificationError("file_inventory_mismatch", candidate_samples=[{"git_path": "orders.view"}])
+    error.candidate_git_sha, error.candidate_model_id, error.candidate_branch_id = policy.head_sha, context.model_id, context.branch_id
+    setattr(error, binding, "not-the-verified-target")
+    with repository_reporting(object(), output_dir=Path(".omniflow")):
+        record_candidate_diagnostics(context, error, issue)
+        safe = write(report([issue]))
+    assert not Path(".omniflow/repository/report.json").exists()
+    assert safe["repository_diagnostics"]["status"] == "unavailable"
 
 
 def test_private_default_enriches_separate_reports_not_public_or_annotations(repository, capsys, monkeypatch):
@@ -193,14 +240,21 @@ def test_registry_bytes_must_match_immutable_tree_even_when_model_snapshot_match
     assert not Path(".omniflow/repository/report.json").exists()
 
 
-def test_verified_candidate_proofs_reuse_snapshot_without_extra_omni_reads(repository, monkeypatch):
+def test_candidate_proofs_still_bind_reporting_aliases_to_fresh_omni_evidence(repository, monkeypatch):
     context, client, policy = repository
     proofs = {}
     for side in ("head", "base"):
         snapshot = _load_snapshot(policy, context.model_path, side)
         proofs[side] = {"status": "verified", "method": "authored_yaml_snapshot", f"{side}_sha": snapshot.sha,
                         "snapshot_digest": snapshot.digest, "file_count": len(snapshot.files)}
-    monkeypatch.setattr(client, "get_model_yaml", lambda *args, **kwargs: pytest.fail("proof should be reused"))
+    original = client.get_model_yaml
+    calls = []
+
+    def observed(*args, **kwargs):
+        calls.append(kwargs["branch_id"])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(client, "get_model_yaml", observed)
     with repository_reporting(object(), output_dir=Path(".omniflow")):
         issues = findings()
         evidence = start_repository_context(context, client, branch_id="candidate", head_proof=proofs["head"],
@@ -209,6 +263,7 @@ def test_verified_candidate_proofs_reuse_snapshot_without_extra_omni_reads(repos
                                   head_proof=proofs["head"], base_proof=proofs["base"])
         write(report(issues))
     assert Path(".omniflow/repository/report.json").exists()
+    assert calls == ["candidate", None, "candidate", None]
 
 
 @pytest.mark.parametrize("custom_source", [False, True])
@@ -296,10 +351,20 @@ def test_custom_only_snapshot_can_be_verified_but_drift_withholds_details(reposi
 
 @pytest.mark.parametrize("repository", [".yaml", ".yml"], indirect=True)
 @pytest.mark.parametrize("use_proofs", [False, True])
-def test_serialized_git_paths_keep_head_base_locations_and_public_privacy(repository, monkeypatch, use_proofs):
+@pytest.mark.parametrize("api_directory", ["", "different/folder/"])
+def test_serialized_git_paths_keep_head_base_locations_and_public_privacy(
+    repository, monkeypatch, use_proofs, api_directory,
+):
     from omniflow.candidate import verify_candidate
 
     context, client, policy = repository
+    original_api = client.get_model_yaml
+
+    def relocated_api(*args, **kwargs):
+        payload = original_api(*args, **kwargs)
+        return {**payload, "files": {api_directory + name: text for name, text in payload["files"].items()}}
+
+    monkeypatch.setattr(client, "get_model_yaml", relocated_api)
     snapshots = {side: _load_snapshot(policy, context.model_path, side) for side in ("head", "base")}
     source_name = next(iter(snapshots["head"].files))
     assert source_name.endswith((".view.yaml", ".view.yml"))
@@ -311,7 +376,6 @@ def test_serialized_git_paths_keep_head_base_locations_and_public_privacy(reposi
                   for side in ("head", "base")}
         for side, snapshot in snapshots.items():
             assert proofs[f"{side}_proof"]["snapshot_digest"] == snapshot.digest
-        monkeypatch.setattr(client, "get_model_yaml", lambda *args, **kwargs: pytest.fail("proof should be reused"))
     issues = [
         {"validator": "model", "type": "model_validation_issue", "severity": "error",
          "yaml_path": "orders.view,measures,total,sql", "message": "secret_patient_literal"},

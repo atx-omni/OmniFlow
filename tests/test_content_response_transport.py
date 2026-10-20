@@ -80,7 +80,11 @@ def test_public_report_explains_content_decision(mode, current, new, existing, c
                                "existing_issues": existing, "comparison_status": comparison})
     text = render_markdown_report(report)
     assert expected in text
-    assert "same model, branch, and visibility scope" in text
+    # These legacy summaries contain counts but no finding or execution receipt.
+    # Do not prescribe an unrelated validator or infer a verified overall pass.
+    assert "## Next Steps" in text
+    assert "Review the failed or incomplete check and its recorded reason" in text
+    assert "Missing or partial evidence is not a clean baseline or a verified pass" in text
 
 
 def test_exception_reason_cannot_introduce_free_text_or_crash_safe_reporting():

@@ -35,12 +35,13 @@ def load_json(path: str | Path) -> dict[str, Any] | None:
     try:
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
         if not isinstance(payload, dict):
-            raise OmniAPIError("Content validation history has an invalid envelope")
+            raise OmniAPIError("Content validation history has an invalid envelope", reason_code="invalid_content_history")
         return payload
     except FileNotFoundError:
         return None
     except (OSError, UnicodeError, ValueError):
-        raise OmniAPIError("Content validation history could not be read as valid JSON; comparison evidence is unavailable") from None
+        raise OmniAPIError("Content validation history could not be read as valid JSON; comparison evidence is unavailable",
+                           reason_code="invalid_content_history") from None
 
 
 def write_json(path: str | Path, payload: dict[str, Any]) -> None:
@@ -220,19 +221,23 @@ def _dashboard_filter_entries(value: Any, *, document: dict[str, Any]) -> list[d
 def content_documents(payload: Any) -> list[dict[str, Any]]:
     """Validate evidence-bearing members before filtering or interpreting emptiness."""
     if not isinstance(payload, dict) or not isinstance(payload.get("content"), list):
-        raise OmniAPIError("Content Validator response has an unexpected content envelope")
+        raise OmniAPIError("Content Validator response has an unexpected content envelope",
+                           reason_code="invalid_content_response_envelope")
     for document in payload["content"]:
         if not isinstance(document, dict):
-            raise OmniAPIError("Content Validator response contains an invalid document")
+            raise OmniAPIError("Content Validator response contains an invalid document",
+                               reason_code="invalid_content_document")
         for key in ("document_id", "identifier"):
             if key in document and (not isinstance(document[key], str) or not document[key].strip()):
-                raise OmniAPIError("Content Validator response contains an invalid document identity")
+                raise OmniAPIError("Content Validator response contains an invalid document identity",
+                                   reason_code="invalid_content_document_identity")
         if "dashboard_filter_issues" in document:
             _dashboard_filter_entries(document["dashboard_filter_issues"], document=document)
         if "queries_and_issues" in document:
             queries = document["queries_and_issues"]
             if not isinstance(queries, list) or any(not isinstance(query, dict) for query in queries):
-                raise OmniAPIError("Content Validator response contains an invalid query list")
+                raise OmniAPIError("Content Validator response contains an invalid query list",
+                                   reason_code="invalid_content_query_list")
             for query in queries:
                 if {"errors", "validation_issues"}.intersection(query):
                     raise ContentEvidenceError(
@@ -240,7 +245,8 @@ def content_documents(payload: Any) -> list[dict[str, Any]]:
                     )
                 for key in ("query_presentation_id", "query_id", "query_id_map_key"):
                     if key in query and (not isinstance(query[key], str) or not query[key].strip()):
-                        raise OmniAPIError("Content Validator response contains an invalid query identity")
+                        raise OmniAPIError("Content Validator response contains an invalid query identity",
+                                           reason_code="invalid_content_query_identity")
                 if "issues" in query:
                     _issue_list(query["issues"], issue_type="query", document=document, query=query)
     return payload["content"]
@@ -302,7 +308,8 @@ def extract_issues(payload: Any) -> list[Any]:
     if isinstance(payload, list):
         return _issue_list(payload)
     if not isinstance(payload, dict):
-        raise OmniAPIError("Content Validator response has an unexpected envelope")
+        raise OmniAPIError("Content Validator response has an unexpected envelope",
+                           reason_code="invalid_content_response_envelope")
     if sum(key in payload for key in ISSUE_ENVELOPE_KEYS) > 1:
         # Never choose an empty preferred container while ignoring another
         # recognized source of errors. Unrelated response metadata is allowed.
@@ -313,7 +320,8 @@ def extract_issues(payload: Any) -> list[Any]:
     for key in ISSUE_ENVELOPE_KEYS[1:]:
         if key in payload:
             return _issue_list(payload[key])
-    raise OmniAPIError("Content Validator response has an unexpected envelope")
+    raise OmniAPIError("Content Validator response has an unexpected envelope",
+                       reason_code="invalid_content_response_envelope")
 
 
 def issue_identity(issue: Any) -> str:
@@ -447,7 +455,8 @@ def filter_validator_payload(payload: Any, allowed_identifiers: set[str]) -> Any
     filtered = dict(payload)
     documents = content_documents(payload)
     if any(not isinstance(document.get("identifier"), str) for document in documents):
-        raise OmniAPIError("Content Validator response is missing an identity required for label filtering")
+        raise OmniAPIError("Content Validator response is missing an identity required for label filtering",
+                           reason_code="content_label_identity_unavailable")
     filtered["content"] = [
         document
         for document in documents
@@ -499,7 +508,7 @@ def compare_history(
     if payload is None:
         return [], "missing"
     if not isinstance(payload, dict):
-        raise OmniAPIError("Content validation history has an invalid envelope")
+        raise OmniAPIError("Content validation history has an invalid envelope", reason_code="invalid_content_history")
     if "diagnostic_schema_version" in payload:
         # Public output intentionally lacks identity evidence. Even a report
         # augmented with history-like fields must never become a trusted baseline.
@@ -507,7 +516,7 @@ def compare_history(
     if "schema_version" not in payload:
         return [], "invalidated_legacy"
     if type(payload["schema_version"]) is not int:
-        raise OmniAPIError("Content validation history has an invalid schema version")
+        raise OmniAPIError("Content validation history has an invalid schema version", reason_code="invalid_content_history")
     if payload["schema_version"] == 2:
         # Version 2 predates depth selection and used the API default. Read it
         # only in that scope; new version-3 history cannot be reused by old code
@@ -518,7 +527,7 @@ def compare_history(
     elif payload["schema_version"] != HISTORY_SCHEMA_VERSION:
         return [], "invalidated_version"
     if any(key not in payload for key in context):
-        raise OmniAPIError("Content validation history is missing comparison context")
+        raise OmniAPIError("Content validation history is missing comparison context", reason_code="invalid_content_history")
     if (
         not isinstance(payload["model_id"], str) or not payload["model_id"].strip()
         or any(payload[key] is not None and (not isinstance(payload[key], str) or not payload[key].strip())
@@ -529,10 +538,10 @@ def compare_history(
         or not isinstance(payload.get("requested_validation_depth"), str)
         or payload["requested_validation_depth"] not in {"api_default", "full"}
     ):
-        raise OmniAPIError("Content validation history has invalid comparison context")
+        raise OmniAPIError("Content validation history has invalid comparison context", reason_code="invalid_content_history")
     issues = payload.get("issues")
     if not isinstance(issues, list):
-        raise OmniAPIError("Content validation history has an invalid issue list")
+        raise OmniAPIError("Content validation history has an invalid issue list", reason_code="invalid_content_history")
     for item in issues:
         if (
             not isinstance(item, dict)
@@ -542,7 +551,7 @@ def compare_history(
             or item.get("id") != issue_identity(item["raw"])
             or item["comparison_eligible"] != _comparison_eligible(item["raw"])
         ):
-            raise OmniAPIError("Content validation history contains invalid issue evidence")
+            raise OmniAPIError("Content validation history contains invalid issue evidence", reason_code="invalid_content_history")
     actual_context = {key: payload[key] for key in context}
     actual_context["labels"] = sorted(set(actual_context["labels"]))
     if actual_context != context:
@@ -715,7 +724,8 @@ def run_content_validation(
         not isinstance(record, dict) or not isinstance(record.get("identifier"), str) or not record["identifier"].strip()
         for record in records
     ):
-        raise OmniAPIError("Content metadata is missing an identity required for label filtering")
+        raise OmniAPIError("Content metadata is missing an identity required for label filtering",
+                           reason_code="content_label_identity_unavailable")
     records_by_identifier = index_content_records(records)
     if baseline_needed:
         if (isinstance(payload, dict) and "content" in payload
@@ -867,6 +877,7 @@ def run_content_validation(
         "comparison_ambiguous_issues": ambiguous_issues,
         "blocking_issues": len(report_new) + (0 if fail_on_new_only else len(report_existing)) + len(evidence),
         "validation_complete": not evidence,
+        "execution_status": "unavailable" if evidence else "completed",
         "issues": [*report_new, *report_existing, *report_resolved, *evidence],
         "new_issue_samples": report_new[:max_samples],
         "existing_issue_samples": report_existing[:max_samples],
@@ -935,6 +946,12 @@ def _report_issue(
         **context,
         "validator": "content",
         "type": "content_validation_issue",
+        # Categories follow the verified response member, never a guess from
+        # untrusted free text. Specific underlying defects remain unknown.
+        "reason_code": {
+            "dashboard_filter": "content_dashboard_filter_validation_issue",
+            "query": "content_query_validation_issue",
+        }.get(issue_type, "content_validation_issue"),
         "issue_type": issue_type if issue_type in {"dashboard_filter", "query"} else "content",
         "severity": severity,
         "message": item.get("summary") or "Omni content validation issue",

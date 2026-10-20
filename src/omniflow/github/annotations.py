@@ -11,9 +11,11 @@ def public_annotation_lines(issues: list[dict[str, Any]], *, limit: int) -> list
     groups = group_findings([issue for issue in issues if issue.get("active") is not False])
     selected = []
     for finding, count in groups[:limit]:
-        qualifiers = [finding.get(key) for key in ("context_reference", "validator", "rule_id", "state")]
+        qualifiers = [finding.get(key) for key in ("diagnostic_code", "context_reference", "validator", "rule_id", "state")]
         context = " / ".join(str(value) for value in qualifiers if value)
         message = f"{context}: {count} occurrence{'s' if count != 1 else ''}. {finding.get('message', '')}"
+        if finding.get("next_action"):
+            message += f" Next: {finding['next_action']}"
         selected.append({**finding, "message": message})
     lines = annotation_lines(selected)
     if len(groups) > limit:
@@ -34,13 +36,18 @@ def annotation_lines(issues: list[dict[str, Any]]) -> list[str]:
         level = "error" if severity == "error" else ("warning" if severity in {"warning", "warn"} else "notice")
         if severity == "error" and not is_blocking(issue):
             level = "notice"
-        file_path = _escape_property(issue.get("file") or "omniflow")
+        properties = []
+        if issue.get("file"):
+            properties.append(f"file={_escape_property(issue['file'])}")
+            if type(issue.get("line")) is int and issue["line"] > 0:
+                properties.append(f"line={issue['line']}")
         message = _escape_data(issue.get("message") or issue.get("summary") or "OmniFlow issue")
         if is_blocking(issue):
             message = f"Blocks under configured policy: {message}"
         elif issue.get("blocking") is False:
             message = f"Does not block under configured policy: {message}"
-        lines.append(f"::{level} file={file_path},line=1::{message}")
+        location = " " + ",".join(properties) if properties else ""
+        lines.append(f"::{level}{location}::{message}")
     return lines
 
 

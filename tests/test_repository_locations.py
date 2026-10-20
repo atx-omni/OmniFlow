@@ -30,6 +30,35 @@ def index(files=None, model_path="omni/sales"):
     return SnapshotIndex(model_path, FILES if files is None else files)
 
 
+def test_large_inventory_with_spaces_unicode_and_relationship_list_keeps_exact_location():
+    files = {f"schema/table_{number}.view.yaml": f"name: table_{number}\ndimensions:\n  id:\n    sql: x\n"
+             for number in range(1217)}
+    files["orders.view.yaml"] = "name: orders\ndimensions:\n  id:\n    sql: x\n"
+    files["relationships.yaml"] = "[]\n"
+    source = SnapshotIndex("omni/Analytics Démo", files)
+    assert len(source._parsed) == 0  # Inventory construction is lazy.
+    detail = source.detail({"validator": "model", "yaml_path": "orders.view.yaml,dimensions,id,sql"})
+    assert detail["file"] == "omni/Analytics Démo/orders.view.yaml"
+    assert detail["line"] == 4
+    assert detail["field"] == "orders.id"
+    assert len(files) == 1219
+
+
+def test_exact_file_key_remains_useful_when_identity_scan_budget_is_exceeded(monkeypatch):
+    monkeypatch.setattr(repository_locations, "MAX_FILES", 1)
+    source = index()
+    detail = source.detail({"validator": "model", "yaml_path": "views/orders.view,measures,total,sql"})
+    assert detail["file"] == "omni/sales/views/orders.view" and detail["line"] == 11
+    assert "field" not in detail  # Uniqueness cannot be established at this budget.
+    assert source.unavailable_reason == "source_index_budget"
+
+
+def test_malformed_view_does_not_authorize_global_identity_mapping():
+    source = index({"orders.view": ORDERS, "broken.view": "[not a view]"})
+    assert source.detail({"validator": "content", "field": "orders.revenue"}) == {}
+    assert source.unavailable_reason == "unsupported_source_yaml"
+
+
 @pytest.mark.parametrize("rule,identity,file,line", [
     ("require_field_descriptions", {"field": "orders.id"}, "views/orders.view", 4),
     ("require_measure_descriptions", {"field": "orders.total"}, "views/orders.view", 9),
@@ -123,11 +152,15 @@ def test_content_does_not_extract_substrings_or_invent_missing_reference_identit
     {"file": "views/orders.view", "yaml_path": "topics/orders.topic,base_view"},
     {"yaml_path": "views/orders.view,dimensions,id", "field": "orders.revenue"},
     {"file": "views/orders.view", "field": "missing.id"},
-    {"file": "orders.view", "field": "orders.id"},
     {"file": "views__orders.view", "field": "orders.id"},
 ])
 def test_conflicting_cross_file_and_inferred_api_aliases_are_not_locations(issue):
     assert index().detail({"validator": "model", **issue}) == {}
+
+
+def test_unique_filename_and_verified_semantic_field_resolve_without_directory():
+    detail = index().detail({"validator": "model", "file": "orders.view", "field": "orders.id"})
+    assert (detail["file"], detail["line"]) == ("omni/sales/views/orders.view", 4)
 
 
 def test_duplicate_semantic_names_and_field_groups_are_not_guessed():

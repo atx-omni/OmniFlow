@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .artifact_identity import identity_digest, match_artifacts
 from .candidate import (
     MAX_TREE_ENTRIES,
     _api_files,
@@ -29,9 +30,11 @@ from .exceptions import ConfigError, SecurityPolicyError
 from .file_scope import excluded_semantic_paths
 from .model_paths import identity_index
 from .repository_locations import SnapshotIndex
-from .repository_policy import RepositoryPolicy, resolve_repository_policy
+from .repository_locations import _path as diagnostic_path
+from .repository_policy import POLICY_REASONS, RepositoryPolicy, resolve_repository_policy
 from .revision_data import FULL_SHA, read_git_text, read_github_text
 from .security import secure_write_text
+from .view_identity import normalize_api_view_names
 from .yaml_security import MAX_YAML_FILE_BYTES
 
 REPORT_NAMES = ("report.json", "report.md", "report.sarif", "junit.xml")
@@ -44,6 +47,8 @@ class Snapshot:
     files: dict[str, str]
     digest: str
     index: SnapshotIndex
+    model_path: str
+    identity_digest: str | None = None
 
 
 @dataclass
@@ -60,6 +65,70 @@ class RepositorySession:
     contexts_verified: int = 0
     contexts_unavailable: int = 0
     output_ready: bool = False
+    unavailable_reasons: dict[str, int] = field(default_factory=dict)
+    report_failed: bool = False
+
+
+def _unavailable(state: RepositorySession, reason: str) -> None:
+    state.unavailable_reasons[reason] = state.unavailable_reasons.get(reason, 0) + 1
+
+
+def record_candidate_diagnostics(context: Any, exc: Exception, issue: dict) -> None:
+    """Authorize *observations*, not correspondence, for the private audience.
+
+    A mismatch cannot require a successful match to explain itself. We instead
+    require the existing live private-repo policy, immutable registration and
+    sampled Git revision. This never creates a candidate proof or source line.
+    """
+    from .candidate import CandidateVerificationError
+
+    state = _session.get()
+    if state is None or not state.policy.enabled or not isinstance(exc, CandidateVerificationError):
+        return
+    side = "base" if getattr(exc, "validation_scope", None) == "base" else "head"
+    sha = state.policy.base_sha if side == "base" else state.policy.head_sha
+    try:
+        if (getattr(exc, "candidate_git_sha", None) != sha
+                or getattr(exc, "candidate_model_id", None) != context.model_id
+                or getattr(exc, "candidate_branch_id", None) != (None if side == "base" else context.branch_id)
+                or not _registered_context(state.policy, context)):
+            _unavailable(state, "candidate_sample_context_unverified")
+            return
+        entries = _semantic_inventory(_tree(state.policy, sha), context.model_path, include_unrecognized=True)
+        samples = []
+        for sample in getattr(exc, "candidate_samples", [])[:5]:
+            if not isinstance(sample, dict):
+                continue
+            git_path, omni_path = sample.get("git_path"), sample.get("omni_path")
+            if git_path is not None and (not diagnostic_path(git_path) or git_path not in entries):
+                continue
+            if omni_path is not None and not diagnostic_path(omni_path):
+                continue
+            if git_path is None and omni_path is None:
+                continue
+            safe = {}
+            if git_path is not None:
+                full_path = git_path if context.model_path == "." else f"{context.model_path}/{git_path}"
+                if not diagnostic_path(full_path):
+                    continue
+                safe["git_path"] = full_path
+            if omni_path is not None:
+                safe["omni_path"] = omni_path
+            safe["comparison"] = "different" if sample.get("comparison") == "different" else "not_compared"
+            safe["pairing"] = sample.get("pairing") if sample.get("pairing") in {
+                "basename_hint", "case_hint", "suffix_hint", "unpaired", "authored_identity", "ambiguous_identity"
+            } else "unpaired"
+            samples.append(safe)
+        if not samples:
+            _unavailable(state, "candidate_samples_unavailable")
+            return
+        state.details[id(issue)] = (issue, {
+            "candidate_samples": samples, "source_revision": side, "git_revision": sha,
+            "candidate_evidence_kind": "observations_not_correspondence",
+        })
+        state.contexts_verified += 1  # Disclosure eligibility, NOT candidate verification.
+    except Exception:
+        _unavailable(state, "candidate_samples_unavailable")
 
 
 @contextmanager
@@ -172,6 +241,7 @@ def _load_snapshot(
         raise ConfigError("Repository diagnostic snapshot is empty")
     # Snapshot keys and digests remain exact Git paths. Independently reject
     # ambiguous serialization aliases even when a candidate proof is supplied.
+    # Duplicate basenames in different schemas remain valid exact sources.
     identity_index(inventory)
     files = {}
     digest = hashlib.sha256()
@@ -181,27 +251,59 @@ def _load_snapshot(
         name = path.encode("utf-8")
         digest.update(len(name).to_bytes(8, "big") + name + len(raw).to_bytes(8, "big") + raw)
         files[path] = text
-    return Snapshot(sha, files, digest.hexdigest(), SnapshotIndex(model_path, files))
+    return Snapshot(sha, files, digest.hexdigest(), SnapshotIndex(model_path, files), model_path)
+
+
+def _api_evidence(client: Any, context: Any, *, side: str, branch_id: str | None) -> tuple[dict, dict | None]:
+    payload = client.get_model_yaml(
+        context.model_id, branch_id=branch_id if side == "head" else None,
+        mode="combined", include_checksums=False, fully_resolved=False,
+    )
+    actual = _api_files(payload)
+    names = normalize_api_view_names(
+        payload["viewNames"], {path: raw.decode("utf-8") for path, raw in actual.items()},
+        parse_contents=False,
+    ) if "viewNames" in payload else None
+    return actual, names
 
 
 def _matches(snapshot: Snapshot, *, proof: dict | None, side: str, client: Any,
-             context: Any, branch_id: str | None, api_files: dict | None = None) -> bool:
+             context: Any, branch_id: str | None, api_files: dict | None = None,
+             omni_view_names: dict[str, str] | None = None) -> bool:
     if proof:
-        return (proof.get("status") in {"verified", "pending_recheck"}
+        proof_matches = (proof.get("status") in {"verified", "pending_recheck"}
                 and proof.get("method") == "authored_yaml_snapshot"
                 and proof.get(f"{side}_sha") == snapshot.sha
                 and proof.get("snapshot_digest") == snapshot.digest
                 and proof.get("file_count") == len(snapshot.files))
-    actual = api_files if api_files is not None else _api_files(client.get_model_yaml(
-        context.model_id, branch_id=branch_id if side == "head" else None,
-        mode="combined", include_checksums=False, fully_resolved=False,
-    ))
-    expected_paths = identity_index(snapshot.files)
-    actual_paths = identity_index(actual)
-    return expected_paths.keys() == actual_paths.keys() and all(
-        snapshot.files[git_path].encode("utf-8") == actual[actual_paths[identity]]
-        for identity, git_path in expected_paths.items()
+        if not proof_matches:
+            return False
+    if api_files is None:
+        actual, omni_view_names = _api_evidence(client, context, side=side, branch_id=branch_id)
+    else:
+        actual = api_files
+    matched = match_artifacts(
+        snapshot.files, {path: raw.decode("utf-8") for path, raw in actual.items()},
+        omni_view_names=omni_view_names,
     )
+    if matched.unmatched_git or matched.unmatched_omni or any(
+        snapshot.files[git_path].encode("utf-8") != actual[api_path]
+        for git_path, api_path in matched.pairs.items()
+    ):
+        return False
+    observed_identity = identity_digest(matched.pairs, omni_view_names=omni_view_names)
+    if ((proof and "identity_digest" in proof and proof["identity_digest"] != observed_identity)
+            or (snapshot.identity_digest is not None and snapshot.identity_digest != observed_identity)):
+        return False
+    # A proof binds Git bytes, not arbitrary API names. Independently verified
+    # pairings supply aliases and canonical view names for this exact snapshot.
+    aliases = {api_path: git_path for git_path, api_path in matched.pairs.items()}
+    canonical = {name: aliases[api_path] for name, api_path in (omni_view_names or {}).items()
+                 if api_path in aliases}
+    snapshot.index = SnapshotIndex(snapshot.model_path, snapshot.files,
+                                   api_aliases=aliases, canonical_view_names=canonical)
+    snapshot.identity_digest = observed_identity
+    return True
 
 
 def start_repository_context(context: Any, client: Any, *, branch_id: str | None,
@@ -219,33 +321,24 @@ def start_repository_context(context: Any, client: Any, *, branch_id: str | None
             # candidate proof; an unverified rule cannot authorize disclosure.
             if non_omni_rules and not proof:
                 continue
-            # The common recognized-source case can reuse the live candidate
-            # proof without another API call. Custom API filenames need the
-            # same API-aware selection used by candidate verification.
-            if proof:
-                snapshot = _load_snapshot(
-                    state.policy, context.model_path, side, non_omni_rules=non_omni_rules, allow_empty=True,
-                )
-                if _matches(snapshot, proof=proof, side=side, client=client, context=context, branch_id=branch_id):
-                    evidence.snapshots[side] = snapshot
-                    continue
-            actual = _api_files(client.get_model_yaml(
-                context.model_id, branch_id=branch_id if side == "head" else None,
-                mode="combined", include_checksums=False, fully_resolved=False,
-            ))
+            # The candidate proof alone cannot authorize API path/canonical-name
+            # aliases. Bind a fresh authored inventory and metadata to Git bytes.
+            actual, names = _api_evidence(client, context, side=side, branch_id=branch_id)
             snapshot = _load_snapshot(
                 state.policy, context.model_path, side, non_omni_rules=non_omni_rules, api_files=actual,
             )
             if _matches(snapshot, proof=proof, side=side, client=client, context=context,
-                        branch_id=branch_id, api_files=actual):
+                        branch_id=branch_id, api_files=actual, omni_view_names=names):
                 evidence.snapshots[side] = snapshot
     except Exception:
         # Detail unavailable is never a new validation error or an excuse to
         # publish arbitrary exception text. The main checks proceed normally.
         state.contexts_unavailable += 1
+        _unavailable(state, "snapshot_evidence_unavailable")
         return None
     if not evidence.snapshots:
         state.contexts_unavailable += 1
+        _unavailable(state, "snapshot_evidence_unavailable")
         return None
     return evidence
 
@@ -275,10 +368,15 @@ def finish_repository_context(evidence: ContextEvidence | None, context: Any, cl
             detail = snapshot.index.detail(issue)
             if detail:
                 pending[id(issue)] = (issue, {**detail, "source_revision": side})
+            else:
+                reason = snapshot.index.unavailable_reason
+                pending[id(issue)] = (issue, {"location_unavailable_reason": reason})
+                _unavailable(state, reason)
         state.details.update(pending)
         state.contexts_verified += 1
     except Exception:
         state.contexts_unavailable += 1
+        _unavailable(state, "snapshot_evidence_unavailable")
 
 
 def _enrich(original: Any, safe: Any, state: RepositorySession) -> Any:
@@ -286,7 +384,12 @@ def _enrich(original: Any, safe: Any, state: RepositorySession) -> Any:
         result = {key: _enrich(original.get(key), child, state) for key, child in safe.items()}
         record = state.details.get(id(original))
         if record is not None and record[0] is original:
-            result.update(record[1])
+            details = dict(record[1])
+            # Locations may add a more precise fixed explanation, but the same
+            # finding keeps its catalog code across public/private formats.
+            if "diagnostic_code" in details and "diagnostic_code" in result:
+                details["location_diagnostic_code"] = details.pop("diagnostic_code")
+            result.update(details)
         return result
     if isinstance(original, list) and isinstance(safe, list):
         records = [item for item in original if isinstance(item, dict)]
@@ -315,6 +418,7 @@ def write_repository_reports(report: dict, safe_report: dict, *, output_dir: str
             projected["repository_diagnostics"] = {
                 **status, "unmapped_findings": len(projected.get("issues", [])) - mapped,
                 "contexts_unavailable": state.contexts_unavailable,
+                "unavailable_reasons": dict(state.unavailable_reasons),
             }
             write_reports(projected, output_dir=directory, formats=["json", "markdown", "sarif", "junit"])
         elif enabled:
@@ -327,9 +431,26 @@ def write_repository_reports(report: dict, safe_report: dict, *, output_dir: str
         raise
     except Exception:
         clear_repository_reports(output_dir)
+        if state is not None:
+            state.report_failed = True
         secure_write_text(directory / "status.json", json.dumps({
             "mode": "minimal", "reason": "repository_report_unavailable", "mapped_findings": 0,
         }, indent=2) + "\n")
+
+
+def repository_diagnostic_availability() -> dict:
+    """Safe availability metadata; absence of detail must itself be explained."""
+    state = _session.get()
+    if state is None:
+        return {"status": "unavailable", "diagnostics_reason": "no_trusted_run_context"}
+    if state.output_ready:
+        return {"status": "available", "diagnostics_reason": "repository_verified"}
+    reason = state.policy.reason
+    if state.policy.enabled:
+        reason = "repository_report_unavailable" if state.report_failed else "snapshot_evidence_unavailable"
+    if reason not in POLICY_REASONS | {"repository_report_unavailable", "snapshot_evidence_unavailable"}:
+        reason = "no_trusted_run_context"
+    return {"status": "unavailable", "diagnostics_reason": reason}
 
 
 def publish_repository_output() -> None:
@@ -343,11 +464,10 @@ def publish_repository_output() -> None:
                 stream.write(f"repository_diagnostics_ready={'true' if ready else 'false'}\n")
         except OSError:
             print("Could not mark repository diagnostics ready; do not upload repository-detail artifacts.")
-    reason = state.policy.reason if state else "no_trusted_run_context"
+    reason = repository_diagnostic_availability()["diagnostics_reason"]
     if ready:
-        print("Repository diagnostics: detailed source locations are available in the separate repository artifact. "
+        print("Repository diagnostics are available in the separate repository artifact. "
               "PR comments and logs remain minimal.")
     else:
-        if state is not None and state.policy.enabled:
-            reason = "snapshot_or_report_unavailable"
-        print(f"Repository diagnostics: minimal ({reason}). Validation decisions are unchanged.")
+        print(f"Repository diagnostics unavailable ({reason}). Public report contains safe codes and recovery steps; "
+              "source paths require a verified private-repository context. Validation decisions are unchanged.")
