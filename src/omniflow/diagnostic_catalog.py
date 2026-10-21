@@ -20,6 +20,22 @@ LINT_MESSAGES = {
     ),
 }
 
+# Separate remediation from the title so recognized rules never receive the
+# unknown-rule fallback. Fixed text only: no API prose or customer values.
+LINT_ACTIONS = {
+    "require_field_descriptions": "Add a description to the affected field in model YAML, then rerun lint.",
+    "require_measure_descriptions": "Add a description to the affected measure in model YAML, then rerun lint.",
+    "require_primary_keys": "Verify the view's row grain and declare the correct primary key; do not mark a nonunique field as a key just to pass lint.",
+    "require_topic_labels": "Add a readable label to the affected topic, then rerun lint.",
+    "require_owner_metadata": "Add the documented owner metadata to the affected topic, then rerun lint.",
+    "forbid_many_to_many_without_comment": "Review join grain and fanout and record the governance review; do not invent an unsupported YAML comment property.",
+    "block_deleted_fields": "Review downstream references to the deleted field; restore it or migrate the affected consumers before accepting the removal.",
+    "warn_field_type_change": "Check dependent filters and calculations against the intended field type, then validate affected content.",
+    "warn_measure_aggregation_change": "Verify the intended aggregation and reconcile dependent metrics before accepting the change.",
+    "warn_relationship_cardinality_change": "Verify the relationship's join grain, cardinality and fanout against the data and dependent metrics.",
+    "forbid_personal_folder_validation_scope": "Review omni.include_personal_folders on the trusted target branch and select the intended governed scope; do not waive the scope restriction as existing debt.",
+}
+
 CHANGE_MESSAGES = {
     **{f"{kind}_{change}": f"A {kind} was {change}. Review the semantic diff and downstream dependencies."
        for kind in ("field", "view", "topic", "relationship") for change in ("added", "deleted", "modified")},
@@ -33,6 +49,10 @@ CHANGE_MESSAGES = {
     "field_kind_changed": "A field changed between semantic kinds. Review dimension/measure usage in dependent content.",
     "measure_aggregation_changed": "A measure aggregation changed. Verify intended calculations and dependent metrics.",
     "relationship_cardinality_changed": "Join cardinality changed. Verify join grain, fanout, and dependent metrics.",
+    "relationship_relocated": (
+        "A relationship moved between topic and global definitions without changing the verified effective "
+        "join behavior of the affected topics. This relocation is informational; other checks still apply."
+    ),
     "governance_changed": "Model governance settings changed. Review access rules and ownership before accepting the change.",
 }
 
@@ -51,6 +71,10 @@ CHECK_GUIDANCE = {
     "dbt_impact": "Review the changed dbt resources and their mapped Omni dependencies.",
     "dbt_sync": "Review refresh and post-sync validation status before considering deployment complete.",
     "ai_eval": "Inspect the AI evaluation and cleanup status in the authorized Omni environment.",
+    "query_validation": (
+        "Review the approved query contract, comparison scope and result-quality evidence. "
+        "Incomplete or incomparable query results do not establish a clean regression check."
+    ),
     "ai_repair": "Inspect repair and rollback status before accepting any proposed change.",
     "breaking_change_hold": "Review deployment synchronization and current-head revalidation before releasing the hold.",
     "reporting": "Check artifact output permissions and use only fresh artifacts from this run.",
