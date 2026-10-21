@@ -77,6 +77,10 @@ The example workflow uses `pull_request_target` so it can read policy from the t
 
 ## Step 4: Add Ownership And Protect The Base Branch
 
+For existing installations, follow the [report-delivery upgrade checklist](VALIDATION_DIAGNOSTICS.md#upgrade-report-delivery-in-an-existing-workflow).
+An Action-pin update alone cannot add missing upload/receipt steps. After generation, the updated workflow's
+**Diagnostic publication** section confirms successful uploads separately from the validation decision.
+
 **New private-repository reporting default:** after upgrading to a supporting revision, eligible private GitHub.com runs generate repository-only diagnostics with verified source identifiers and locations. The updated validation workflow uploads these separately as `omniflow-repository-diagnostics` with seven-day retention; PR comments, logs and annotations stay minimal. Repository readers can download the detailed artifact. To opt out, merge the following into the required root policy on the trusted base before adopting the new pin:
 
 ```yaml
@@ -196,6 +200,19 @@ The installation is ready for controlled alpha use when all of these are true:
 - [ ] Omni's post-merge Git integration behavior has been verified separately.
 
 For setup failures, continue with [Troubleshooting](TROUBLESHOOTING.md). For safe diagnostic sharing, see [Support](../SUPPORT.md).
+
+## Optional reviewed query-result checks
+
+Core model/content validation does not prove result correctness. The experimental
+[query-contract guide](QUERY_VALIDATION.md) adds opt-in, reviewed aggregate checks
+for join effects, uniqueness, grouping and NULLs. Leave it off until qualified in
+your tenant. AI proposals are local preparation only, not an automatic CI action.
+
+When upgrading report delivery, copy the current workflow example as well as
+updating the Action pin. Its short PR summary reports current-head blockers and
+links to post-upload receipts; failure/recovery transitions create deduplicated
+comments. GitHub notification preferences still control email delivery. A report
+inside a downloaded artifact is a pre-upload snapshot, not an upload receipt.
 
 ## Step 10: Optionally Add Post-Deployment dbt Sync
 

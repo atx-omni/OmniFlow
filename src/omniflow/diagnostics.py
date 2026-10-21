@@ -53,11 +53,12 @@ def record_private_report(report: dict[str, Any]) -> None:
 VALIDATORS = frozenset({
     "context", "setup", "execution", "content", "model", "candidate", "semantic_diff",
     "semantic_lint", "downstream", "contracts", "dbt_exposures", "dbt_impact", "dbt_sync",
-    "ai_eval", "ai_repair", "breaking_change_hold", "reporting",
+    "ai_eval", "ai_repair", "query_validation", "breaking_change_hold", "reporting",
 })
 TYPES = frozenset({
     "content_evidence_unavailable", "content_validation_issue", "validation_execution_failed",
     "model_evidence_unavailable",
+    "query_validation_issue", "query_validation_unavailable",
     "internal_execution_failure", "dependency_coverage_gap", "candidate_verification_failed",
     "breaking_change_sync_state_unavailable", "breaking_change_dbt_overlap",
     "breaking_change_pending_deployment", "dbt_exposures", "model_validation_issue",
@@ -109,7 +110,10 @@ ENUMS = {
     "status": {"completed", "failed", "not_run", "disabled", "skipped", "passed", "unknown",
                "verified", "unverified", "pending_recheck", "not_applicable", "success", "refused",
                "proposed", "rolled_back", "manual_review_required", "available", "unavailable", "committed",
-               "not_needed", "rollback_failed", "partial", "status_unknown", "timed_out", "running"},
+               "not_needed", "rollback_failed", "partial", "status_unknown", "timed_out", "running", "generated"},
+    # Uploaded status/URLs belong to the workflow's current-run receipt, never
+    # untrusted input reports or a CLI that runs before artifact publication.
+    "publication_status": {"unconfirmed"},
     "execution_status": {"completed", "skipped", "partial", "unavailable", "failed", "not_applicable"},
     "service": {"omni", "github", "git"},
     "api_operation": API_OPERATIONS,
@@ -126,6 +130,10 @@ ENUMS = {
     "blocked_by": VALIDATORS,
     "diagnostics_reason": POLICY_REASONS | {"no_trusted_run_context", "snapshot_evidence_unavailable", "repository_report_unavailable"},
     "validation_status": {"passed", "failed", "skipped", "incomplete"},
+    "query_validation_status": {"disabled", "passed", "regression", "inconclusive"},
+    "query_validation_mode": {"off", "report", "enforce"},
+    "assertion_type": {"null_rate", "unique_grain", "group_count", "aggregate_delta", "rate_delta", "aggregate_range"},
+    "query_assertion_type": {"null_rate", "unique_grain", "group_count", "aggregate_delta", "rate_delta", "aggregate_range"},
     "post_sync_validation_status": {"not_run", "failed", "passed"},
     "coverage_status": {"available", "partial", "unavailable", "unknown"},
     "comparison_mode": {"all_issues", "new_only", "unknown"},
@@ -159,12 +167,16 @@ COUNTS = frozenset({
     "http_status", "attempt_count", "max_attempts", "elapsed_ms", "source_line", "source_column", "entry_index",
     "compared_file_count", "candidate_sample_count", "candidate_sample_omitted_count",
     "failed_finding_count", "failed_check_count",
+    "contracts_total", "contracts_checked", "new_issue_count", "existing_issue_count", "query_ordinal",
+    "query_submission_count", "query_poll_count", "query_contract_number", "pending_job_count", "occurrence_count",
+    "query_assertion_number",
 })
 FLAGS = frozenset({
     "validation_complete", "coverage_complete", "blocking", "active", "content_validation_required",
     "manual_review_required", "verified", "raw_query_results_stored", "query_execution_acknowledged",
     "operational_failure", "cleanup_required",
     "health_only", "retryable",
+    "snapshot_attested", "native_qualified", "remote_execution_may_continue",
 })
 OBJECTS = frozenset({
     "summary", "change_classification", "candidate_verification", "refresh", "post_sync_validation",
@@ -246,6 +258,9 @@ def public_diagnostic(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _finding_message(issue: dict[str, Any]) -> str:
+    descriptor = diagnostic_descriptor(issue)
+    if descriptor["diagnostic_code"] == "OF-CANDIDATE-VIEW-METADATA":
+        return descriptor["title"] + " Validation is incomplete; this does not establish a model or content defect."
     noun = "model" if issue.get("validator") == "model" else "content"
     reason = (issue.get("reason_code") if issue.get("reason_code") in {"dbt_refresh_status_unknown", "ai_repair_timeout"}
               else issue.get("cause_code") or issue.get("reason_code"))

@@ -5,15 +5,67 @@ instructions. A reason is evidence of a category, not proof of its root cause.
 """
 from __future__ import annotations
 
-from .diagnostic_catalog import CHANGE_MESSAGES, CHECK_GUIDANCE, LINT_MESSAGES
+from .diagnostic_catalog import CHANGE_MESSAGES, CHECK_GUIDANCE, LINT_ACTIONS, LINT_MESSAGES
 
-CATALOG_VERSION = 1
+CATALOG_VERSION = 2
 # code, title, corrective/investigative action, category
 REASON_DETAILS: dict[str, tuple[str, str, str, str]] = {}
 
 
 def _add(reason: str, code: str, title: str, action: str, category: str = "incomplete_evidence") -> None:
     REASON_DETAILS[reason] = (code, title, action, category)
+
+
+for _reason, _title, _action in (
+    ("invalid_query_validation_config", "The query-validation policy is invalid.",
+     "Use the bounded reviewed-contract schema in docs/QUERY_VALIDATION.md; unknown keys and mutable substitutions are rejected."),
+    ("query_contract_regression", "A reviewed query assertion detected a new or worsened finding.",
+     "Inspect the numbered contract and assertion in trusted policy. Compare the same fixed scope on base and branch in Omni; inspect join keys, grain, NULLs and grouping."),
+    ("query_contract_existing", "A reviewed query assertion has an unchanged or improved baseline finding.",
+     "Track this existing data-quality issue separately. It does not by itself block under regression policy."),
+    ("query_provenance_unverified", "The query's PR comparison scope is not verified.",
+     "Run on a synchronized PR with exact base/head evidence. A main-only health run cannot establish PR impact."),
+    ("query_contract_unreviewed", "The query contract is not fully reviewed.",
+     "Review the fixed aggregate query, independent oracle, grain and fixed data window before approving its attestations."),
+    ("query_added_entity_unverified", "The absolute query contract does not target a verified new topic.",
+     "Use regression mode for existing topics. Absolute checks require a topic proven added by this PR, with explicit expected ranges."),
+    ("query_native_qualification_required", "Enforcement requires tenant qualification.",
+     "Qualify the reviewed contract in report mode against known good and intentionally broken isolated fixtures before enabling enforcement."),
+    ("query_snapshot_unattested", "A stable data snapshot has not been attested.",
+     "Use an independently stable dataset/window and record its evidence reference in trusted policy. Repeated equal reads alone do not prove snapshot isolation."),
+    ("query_budget_exhausted", "The bounded query budget was exhausted.",
+     "Reduce the contract set or review query/poll/deadline limits. Client timeout does not cancel warehouse execution; reconcile pending jobs first."),
+    ("query_population_insufficient", "The query returned too little population for its assertion.",
+     "Check fixed filters, access scope and minimum population. Empty results cannot establish correctness."),
+    ("query_result_not_scalar", "The aggregate probe returned multiple rows or reached its safety limit.",
+     "Use reviewed scalar aggregate measures with exactly one result row. Do not silently truncate grouped results."),
+    ("query_result_schema_invalid", "The query result did not match the approved numeric field schema.",
+     "Verify exact returned field names and numeric measure types. Missing, renamed, NULL or extra columns are incomplete evidence."),
+    ("query_metric_invalid", "A query metric could not support the assertion.",
+     "Check nonnegative integral counts, valid denominators and compatible grain. Do not replace invalid values with zero."),
+    ("query_relative_baseline_zero", "A relative comparison has a zero baseline.",
+     "Use an explicitly reviewed absolute-change threshold where a zero baseline is valid."),
+    ("query_data_drift", "Repeated observations changed during the query comparison.",
+     "Stabilize the underlying data snapshot, filters and security scope before rerunning. Do not attribute observed data drift to the PR."),
+    ("query_evidence_unavailable", "Query evidence is unavailable.",
+     "Inspect the safe API reason and contract number, then reconcile execution before rerunning."),
+    ("query_job_evidence_invalid", "Asynchronous query-job identity was not usable.",
+     "Reconcile the original query through Omni. Do not start a duplicate query to hide missing job evidence."),
+    ("query_async_result_unavailable", "The asynchronous result is not supported by this adapter.",
+     "This version accepts complete synchronous JSON scalar results, not Arrow-only results. Qualify a smaller bounded probe or wait for adapter support."),
+    ("query_execution_failed", "Omni reported query execution failure.",
+     "Run the numbered reviewed contract in Omni for the same scope and inspect its native error. Do not publish raw SQL or rows."),
+    ("query_unfinished", "The query did not finish within bounded polling.",
+     "Reconcile the existing query before retrying. A client deadline does not guarantee warehouse cancellation."),
+    ("query_scope_invalid", "The query scope was invalid or changed.",
+     "Keep model, branch, environment, identity, timezone and filters fixed by trusted execution context."),
+    ("query_proposal_invalid", "The AI response was not a usable query proposal.",
+     "Review the requested topic and supported query schema. AI output is never automatically approved or executed."),
+    ("query_proposal_unavailable", "An AI query proposal was not available.",
+     "Check AI API access and the supported request contract. Author a reviewed deterministic contract manually if needed."),
+):
+    _add(_reason, "OF-" + _reason.upper().replace("_", "-"), _title, _action,
+         "validation" if _reason in {"query_contract_regression", "query_contract_existing"} else "incomplete_evidence")
 
 
 for _service in ("omni", "github"):
@@ -111,6 +163,9 @@ _add("content_mismatch", "OF-CANDIDATE-CONTENT", "Matched authored files have di
      "definitions, then rerun. Do not overwrite either side without reviewing the difference.", "synchronization")
 _add("changed_during_validation", "OF-CANDIDATE-DRIFT", "The selected snapshot changed during validation.",
      "Wait for synchronization/editing to finish and rerun against the latest PR revisions.", "synchronization")
+_add("relationship_scope_unresolved", "OF-RELATIONSHIP-SCOPE", "A relationship relocation could not be proven equivalent.",
+     "Inspect topic join paths and competing local/global relationship definitions. Resolve ambiguous precedence "
+     "or missing join coverage, then rerun; moving a definition must not silently change another topic.")
 _add("missing_candidate_branch", "OF-CANDIDATE-BRANCH", "No Omni candidate branch was selected.",
      "Verify the PR branch association and create or synchronize the intended Omni branch before rerunning.", "configuration")
 _add("branch_not_found", "OF-BRANCH-NOT-FOUND", "No corresponding Omni branch was found.",
@@ -232,6 +287,18 @@ _add("ai_repair_validation_incomplete", "OF-REPAIR-VALIDATION-INCOMPLETE", "Post
 
 def diagnostic_descriptor(issue: dict) -> dict[str, str]:
     """Fixed human guidance for a projected finding; never copy input prose."""
+    if issue.get("metadata_stage") == "view_names" and issue.get("metadata_reason") in {
+        "unsupported_orientation", "duplicate_name", "duplicate_path", "invalid_identity",
+        "non_view_identity", "incomplete_identity",
+    } and not issue.get("cause_code"):
+        return {
+            "diagnostic_code": "OF-CANDIDATE-VIEW-METADATA",
+            "title": "The Omni view-identity metadata response is incomplete or ambiguous.",
+            "next_action": "Review the fixed metadata reason and scope with the OmniFlow maintainer. "
+                           "Verify the supported viewNames response contract; do not rename files or move "
+                           "folders to work around malformed API metadata. Do not share raw response bodies.",
+            "category": "incomplete_evidence",
+        }
     # A write with unknown outcome must retain reconciliation guidance even if
     # its underlying HTTP failure also has a useful catalog entry.
     reason = (issue.get("reason_code") if issue.get("reason_code") in {"dbt_refresh_status_unknown", "ai_repair_timeout"}
@@ -257,6 +324,8 @@ def diagnostic_descriptor(issue: dict) -> dict[str, str]:
         elif validator in {"semantic_diff", "contracts"} and issue.get("type") in CHANGE_MESSAGES:
             title = CHANGE_MESSAGES[issue["type"]]
         action = CHECK_GUIDANCE.get(validator, CHECK_GUIDANCE["execution"])
+        if validator == "semantic_lint" and rule in LINT_ACTIONS:
+            action = LINT_ACTIONS[rule]
         if validator in {"semantic_diff", "contracts"} and issue.get("type") == "topic_organization_changed":
             action = "Confirm the intended topic grouping in Omni; review any separate validation or synchronization findings."
     return {"diagnostic_code": code, "title": title, "next_action": action, "category": category}
