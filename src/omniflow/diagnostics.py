@@ -13,6 +13,7 @@ from copy import deepcopy
 from typing import Any
 from uuid import uuid4
 
+from .candidate_difference import DIFFERENCE_CLASSES, LINE_ENDING_STYLES
 from .diagnostic_catalog import CHANGE_MESSAGES, CHECK_GUIDANCE, LINT_MESSAGES
 from .diagnostic_contract import CATALOG_VERSION, DOCUMENT_IDENTITY_REASONS, REASON_DETAILS, diagnostic_descriptor
 from .exceptions import API_OPERATIONS, TRANSPORT_REASON_CODES, MissingPolicyError, exception_diagnostic
@@ -131,6 +132,10 @@ ENUMS = {
     "skipped_reason": {"no_branch", "no_matching_prompt_set"},
     "incomplete_reason": {"final_recheck_not_run", "check_interrupted"},
     "contents_comparison": {"not_compared", "different", "equal", "partial"},
+    "difference_class": DIFFERENCE_CLASSES,
+    "newline_missing_from": {"git", "omni"},
+    "git_line_ending": LINE_ENDING_STYLES,
+    "omni_line_ending": LINE_ENDING_STYLES,
     "blocked_by": VALIDATORS,
     "diagnostics_reason": POLICY_REASONS | {"no_trusted_run_context", "snapshot_evidence_unavailable", "repository_report_unavailable"},
     "validation_status": {"passed", "failed", "skipped", "incomplete"},
@@ -180,6 +185,7 @@ FLAGS = frozenset({
     "manual_review_required", "verified", "raw_query_results_stored", "query_execution_acknowledged",
     "operational_failure", "cleanup_required",
     "health_only", "retryable",
+    "candidate_summary_written",
     "snapshot_attested", "native_qualified", "remote_execution_may_continue",
 })
 OBJECTS = frozenset({

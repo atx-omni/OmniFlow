@@ -12,7 +12,7 @@ from ..content_impact_reporting import content_impact_line, coverage_explanation
 from ..diagnostics import ENUMS, public_diagnostic
 from .finding_groups import group_findings
 from .issue_policy import is_blocking
-from .recovery import candidate_detail_hint, diagnostic_guide, first_step
+from .recovery import diagnostic_guide, first_step, mismatch_description
 
 
 def query_result_coverage(report: dict[str, Any]) -> str:
@@ -125,9 +125,22 @@ def _comparison_count(safe: dict[str, Any], validator: str) -> str:
     return f"{total} new"
 
 
-def _primary_action(issue: dict[str, Any], report: dict[str, Any]) -> str:
+def _primary_action(issue: dict[str, Any], report: dict[str, Any], *, run_url: str = "",
+                    publication: list[dict[str, str]] | None = None) -> str:
     action = "**Next action:** " + first_step(issue)
     url = diagnostic_guide(issue, report)
+    if issue.get("candidate_reason") == "content_mismatch":
+        detail = report.get("repository_diagnostics") or {}
+        verified = detail.get("status") in {"generated", "available"} and (
+            detail.get("diagnostics_reason") == "repository_verified")
+        if verified and _run_link(run_url).startswith("["):
+            receipt = next((item for item in publication or [] if item.get("kind") == "repository"), {})
+            artifact_url = receipt.get("url", "")
+            if receipt.get("status") == "uploaded" and re.fullmatch(re.escape(run_url) + r"/artifacts/[1-9][0-9]*", artifact_url):
+                return action + f" · [Open private comparison report]({artifact_url})"
+            if detail.get("candidate_summary_written") is True:
+                return action + f" · [See filename and line in the run Summary]({run_url})"
+        return action + (f" · [Find the filename and line locally]({url})" if url else "")
     return action + (f" · [Troubleshooting guide]({url})" if url else "")
 
 
@@ -143,6 +156,7 @@ def render_pr_comment(
     safe = public_diagnostic(report)
     decision = notification_decision(safe)
     blockers = [issue for issue in safe.get("issues", []) if is_blocking(issue)]
+    primary = next(iter(blockers), None)
     title = {
         "pass": "Validation passed", "fail": "Action required",  # nosec B105
         "skipped": "Skipped — not validated", "advisory": "Advisory — impact unverified",
@@ -155,6 +169,14 @@ def render_pr_comment(
             f"Model: {_comparison_count(safe, 'model')} · Content: {_comparison_count(safe, 'content')} "
             f"· Head: `{_head_reference(head_sha)}`",
         ])
+    elif primary and primary.get("candidate_reason") == "content_mismatch":
+        lines = [
+            "## OmniFlow: Content mismatch",
+            mismatch_description(primary),
+            _primary_action(primary, safe, run_url=run_url, publication=publication),
+            f"Validation is incomplete. Blocking findings: {len(blockers)}. Head: `{_head_reference(head_sha)}` "
+            "· `OF-CANDIDATE-CONTENT`",
+        ]
     else:
         lines.append(f"**Blocking findings: {len(blockers)}.** Head: `{_head_reference(head_sha)}`")
         if safe.get("validation_complete") is not True:
@@ -163,6 +185,9 @@ def render_pr_comment(
         if groups:
             lines.append("")
         for issue, count in groups[:3]:
+            if issue.get("candidate_reason") == "content_mismatch":
+                lines.append(f"**Content mismatch.** {mismatch_description(issue)} (`OF-CANDIDATE-CONTENT`)")
+                continue
             scope = " / ".join(issue[key] for key in ("context_reference", "validation_scope", "state") if key in issue)
             policy = query_policy_reference(issue)
             lines.append(f"- **{issue.get('title', 'A blocking check needs review.')}** "
@@ -173,11 +198,11 @@ def render_pr_comment(
         remaining = sum(count for _, count in groups[3:])
         if remaining:
             lines.append(f"Plus {remaining} additional blocking occurrence(s); see the full report.")
-        primary = next(iter(blockers), None)
-        if primary and primary.get("coverage_description"):
+        if primary and primary.get("coverage_description") and primary.get("candidate_reason") != "content_mismatch":
             lines.append(primary["coverage_description"])
-        lines.append(_primary_action(primary, safe) if primary else
+        lines.append(_primary_action(primary, safe, run_url=run_url, publication=publication) if primary else
                      "**Next action:** Inspect this run's routing, coverage and policy before treating it as validated.")
+    if decision != "pass":
         health = sum(not is_blocking(item) and item.get("active", True) for item in safe.get("issues", []))
         if health:
             lines.append(f"Nonblocking findings: {health:,}. See the report for details.")
@@ -198,7 +223,7 @@ def render_pr_comment(
                 and re.fullmatch(re.escape(run_url) + r"/artifacts/[1-9][0-9]*", url)):
             links += f" · [Full report]({url})"
         else:
-            links += " · Report download unavailable; check the run."
+            links += " · Public report download unavailable; check the run."
     lines.append(links)
     # Two-space breaks keep the short status readable in rendered GitHub Markdown.
     return "  \n".join(lines) + "\n"
@@ -216,7 +241,9 @@ def render_transition_notice(*, transition: str, head_sha: str, run_url: str,
         safe = public_diagnostic(report)
         primary = next((issue for issue in safe.get("issues", []) if is_blocking(issue)), None)
         if primary:
-            lines.extend([f"{primary['title']} (`{primary['diagnostic_code']}`).", _primary_action(primary, safe)])
+            headline = ("**Content mismatch.** " + mismatch_description(primary)
+                        if primary.get("candidate_reason") == "content_mismatch" else primary["title"])
+            lines.extend([f"{headline} (`{primary['diagnostic_code']}`).", _primary_action(primary, safe, run_url=run_url)])
     lines.append(_run_link(run_url, "View current result"))
     separator = "  \n" if len(lines) > 2 else " "
     return separator.join(lines) + "\n"
@@ -256,18 +283,18 @@ restricts their shape, preventing Markdown or identity injection by other caller
         lines.append(f"Compared findings: **{summary.get('new_issues', 0)} new or worsened**, "
                      f"{summary.get('existing_issues', 0)} existing. Counts are occurrences, not unique objects.")
     for issue, count in group_findings(blockers)[:3]:
+        if issue.get("candidate_reason") == "content_mismatch":
+            lines.append(f"**Content mismatch.** {mismatch_description(issue)} (`OF-CANDIDATE-CONTENT`)")
+            continue
         policy = query_policy_reference(issue)
         lines.append(f"- **{issue.get('title', 'A blocking check needs review.')}** "
                      f"(`{issue.get('diagnostic_code', 'OF-UNKNOWN')}`, {count} occurrence(s))"
                      + (f" — {policy}." if policy else ""))
     primary = next(iter(blockers), None)
     if primary:
-        if primary.get("coverage_description"):
+        if primary.get("coverage_description") and primary.get("candidate_reason") != "content_mismatch":
             lines.append(primary["coverage_description"])
-        lines.extend(["", _primary_action(primary, safe)])
-        detail_hint = candidate_detail_hint(primary, safe)
-        if detail_hint:
-            lines.append(detail_hint)
+        lines.extend(["", _primary_action(primary, safe, run_url=run_url, publication=publication)])
     elif decision == "pass":
         lines.append("**Next action:** Review the current-head result and remaining nonblocking findings before merging.")
     else:

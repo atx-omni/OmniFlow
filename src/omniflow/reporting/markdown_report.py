@@ -5,13 +5,15 @@ from pathlib import Path
 from typing import Any
 
 from ..content_impact_reporting import content_impact_line
+from ..repository_locations import _path as diagnostic_path
 from ..repository_policy import PRIVACY_REASON_MESSAGES
+from ..revision_data import FULL_SHA
 from ..security import redact, secure_write_text
 from .diagnostic_fields import DIAGNOSTIC_FACTS
 from .finding_groups import group_findings
 from .issue_policy import is_blocking
 from .notification import query_policy_reference, query_result_coverage
-from .recovery import candidate_detail_hint, diagnostic_guide
+from .recovery import candidate_detail_hint, diagnostic_guide, mismatch_description
 
 
 def _render_minimal_diagnostic(report: dict[str, Any]) -> str:
@@ -227,12 +229,20 @@ def _primary_blocker_lines(primary: dict[str, Any] | None, report: dict[str, Any
     title = primary.get("title") or primary.get("message") or "The check could not establish a safe result."
     code = primary.get("diagnostic_code") or primary.get("reason_code") or primary.get("type", "unknown")
     lines = ["", f"**Primary blocker:** {_safe_text(title)} (`{_safe_code(code)}`)"]
-    if primary.get("context_reference") or primary.get("validation_scope"):
+    mismatch = primary.get("candidate_reason") == "content_mismatch"
+    if mismatch:
+        location = candidate_location_lines(primary, report)
+        if location:
+            lines.extend(["", *location])
+        lines.extend(["", _safe_text(mismatch_description(primary))])
+        if hint := candidate_detail_hint(primary, report):
+            lines.extend(["", hint])
+    elif primary.get("context_reference") or primary.get("validation_scope"):
         lines.append(f"- Affected check: `{_safe_code(primary.get('context_reference', 'context'))}` / "
                      f"`{_safe_code(primary.get('validator', 'execution'))}` / "
                      f"`{_safe_code(primary.get('validation_scope', 'unknown'))}` scope.")
     if primary.get("recovery_steps"):
-        if primary.get("outcome_label"):
+        if primary.get("outcome_label") and not mismatch:
             lines.append(f"- Outcome: {_safe_text(primary['outcome_label'])}")
         if primary.get("coverage_description"):
             lines.append(f"- Comparison: {_safe_text(primary['coverage_description'])}")
@@ -255,17 +265,40 @@ def _recovery_lines(finding: dict[str, Any], report: dict[str, Any], *, indent: 
     for index, step in enumerate(finding["recovery_steps"][:3], 1):
         lines.append(f"{indent}{index}. {_safe_text(step)}")
     lines.append("")
-    detail_hint = candidate_detail_hint(finding, report)
-    if detail_hint:
-        lines.append(indent + detail_hint)
     if finding.get("verify_recovery"):
         lines.append(indent + "**Confirm the fix:** " + _safe_text(finding["verify_recovery"]))
     if finding.get("support_action"):
-        lines.append(indent + "**If it persists:** " + _safe_text(finding["support_action"]))
+        lines.extend(["", indent + "**If it persists:** " + _safe_text(finding["support_action"])])
     url = diagnostic_guide(finding, report)
     if url:
-        lines.append(indent + f"[Troubleshooting guide]({url})")
+        label = ("Find the filename locally" if finding.get("candidate_reason") == "content_mismatch"
+                 and not candidate_location_lines(finding, report) else "Troubleshooting guide")
+        lines.extend(["", indent + f"[{label}]({url})"])
     return lines
+
+
+def candidate_location_lines(finding: dict[str, Any], report: dict[str, Any]) -> list[str]:
+    """Display only already-authorized, matched paths bound to this private revision."""
+    availability = report.get("repository_diagnostics") or {}
+    sha = finding.get("git_revision")
+    if (report.get("diagnostic_audience") != "repository"
+            or availability.get("status") != "generated" or availability.get("diagnostics_reason") != "repository_verified"
+            or finding.get("candidate_reason") != "content_mismatch"
+            or finding.get("candidate_evidence_kind") != "observations_not_correspondence"
+            or finding.get("source_revision") != ("base" if finding.get("validation_scope") == "base" else "head")
+            or not isinstance(sha, str) or not FULL_SHA.fullmatch(sha)):
+        return []
+    samples = finding.get("candidate_samples")
+    if not isinstance(samples, list):
+        return []
+    for sample in samples[:5]:
+        if not isinstance(sample, dict):
+            continue
+        left, right, line = sample.get("git_path"), sample.get("omni_path"), sample.get("first_differing_line")
+        if (sample.get("pairing") == "authored_identity" and sample.get("comparison") == "different"
+                and diagnostic_path(left) and diagnostic_path(right) and type(line) is int and 1 <= line <= 2**31 - 1):
+            return [f"Git file `{_safe_code(left)}` differs from Omni file `{_safe_code(right)}` at line {line}."]
+    return []
 
 
 def _next_action_lines(report: dict[str, Any], findings: list[dict[str, Any]]) -> list[str]:

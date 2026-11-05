@@ -26,6 +26,7 @@ from .candidate import (
     _semantic_inventory,
     _source_inventory,
 )
+from .candidate_difference import shareable_difference_fields
 from .exceptions import ConfigError, SecurityPolicyError
 from .file_scope import excluded_semantic_paths
 from .model_paths import identity_index
@@ -67,6 +68,7 @@ class RepositorySession:
     output_ready: bool = False
     unavailable_reasons: dict[str, int] = field(default_factory=dict)
     report_failed: bool = False
+    candidate_summary_written: bool = False
 
 
 def _unavailable(state: RepositorySession, reason: str) -> None:
@@ -78,7 +80,8 @@ def record_candidate_diagnostics(context: Any, exc: Exception, issue: dict) -> N
 
     A mismatch cannot require a successful match to explain itself. We instead
     require the existing live private-repo policy, immutable registration and
-    sampled Git revision. This never creates a candidate proof or source line.
+    sampled Git revision. A first-difference line/EOF position is a comparison
+    observation, not a verified model defect location or candidate proof.
     """
     from .candidate import CandidateVerificationError
 
@@ -118,6 +121,14 @@ def record_candidate_diagnostics(context: Any, exc: Exception, issue: dict) -> N
             safe["pairing"] = sample.get("pairing") if sample.get("pairing") in {
                 "basename_hint", "case_hint", "suffix_hint", "unpaired", "authored_identity", "ambiguous_identity"
             } else "unpaired"
+            if (exc.candidate_reason == "content_mismatch" and git_path is not None and omni_path is not None
+                    and safe["pairing"] == "authored_identity" and safe["comparison"] == "different"):
+                detail = shareable_difference_fields(sample)
+                if detail and detail == shareable_difference_fields(exc.diagnostic_context):
+                    safe.update(detail)
+                    line = sample.get("first_differing_line")
+                    if type(line) is int and 1 <= line <= MAX_YAML_FILE_BYTES + 1:
+                        safe["first_differing_line"] = line
             samples.append(safe)
         if not samples:
             _unavailable(state, "candidate_samples_unavailable")
@@ -428,6 +439,9 @@ def write_repository_reports(report: dict, safe_report: dict, *, output_dir: str
         secure_write_text(directory / "status.json", json.dumps(status, indent=2) + "\n")
         if enabled:
             state.output_ready = status["mode"] == "repository"
+            if state.output_ready and not state.candidate_summary_written:
+                from .reporting.private_summary import write_private_candidate_summary
+                state.candidate_summary_written = write_private_candidate_summary(projected)
     except SecurityPolicyError:
         clear_repository_reports(output_dir)
         raise
@@ -448,6 +462,7 @@ def repository_diagnostic_availability() -> dict:
                 "publication_status": "unconfirmed"}
     if state.output_ready:
         return {"status": "generated", "diagnostics_reason": "repository_verified",
+                **({"candidate_summary_written": True} if state.candidate_summary_written else {}),
                 "publication_status": "unconfirmed"}
     reason = state.policy.reason
     if state.policy.enabled:

@@ -129,6 +129,44 @@ def test_mismatch_samples_are_private_observations_without_successful_candidate_
     assert safe["repository_diagnostics"]["publication_status"] == "unconfirmed"
 
 
+@pytest.mark.parametrize("destination", ["runner", "symlink", "outside"])
+def test_only_real_runner_summary_receives_a_bound_file_and_line(repository, tmp_path, monkeypatch, destination):
+    from omniflow.candidate import CandidateVerificationError
+
+    context, _, policy = repository
+    folder = tmp_path / "_runner_file_commands"
+    folder.mkdir()
+    summary = folder / "step_summary_00000000-0000-4000-8000-000000000000"
+    other = tmp_path / "other"
+    other.touch()
+    if destination == "symlink":
+        summary.symlink_to(other)
+    else:
+        summary.touch()
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(other if destination == "outside" else summary))
+    sample = {"git_path": "orders.view", "omni_path": "orders.view", "comparison": "different",
+              "pairing": "authored_identity", "first_differing_line": 4, "difference_class": "terminal_newline_only",
+              "newline_missing_from": "git"}
+    error = CandidateVerificationError("content_mismatch", candidate_samples=[sample])
+    error.diagnostic_context.update(difference_class="terminal_newline_only", newline_missing_from="git")
+    error.candidate_git_sha, error.candidate_model_id = policy.head_sha, context.model_id
+    error.candidate_branch_id, error.validation_scope = context.branch_id, "branch"
+    issue = {"validator": "candidate", "type": "candidate_verification_failed", "severity": "error",
+             "validation_scope": "branch", "candidate_reason": "content_mismatch",
+             "difference_class": "terminal_newline_only", "newline_missing_from": "git"}
+    with repository_reporting(object(), output_dir=Path(".omniflow")):
+        record_candidate_diagnostics(context, error, issue)
+        safe = write({**report([issue]), "exit_code": 2, "validation_complete": False})
+    assert other.read_text() == ""
+    assert "orders.view" not in json.dumps(safe)
+    assert bool(safe["repository_diagnostics"].get("candidate_summary_written")) is (destination == "runner")
+    if destination == "runner":
+        assert "omni/orders.view" in summary.read_text()
+        assert "line 4" in summary.read_text() and "Add the final newline" in summary.read_text()
+
+
 @pytest.mark.parametrize("binding", ["candidate_git_sha", "candidate_model_id", "candidate_branch_id"])
 def test_mismatch_samples_require_registered_live_context_and_exact_revision(repository, binding):
     from omniflow.candidate import CandidateVerificationError
@@ -607,3 +645,30 @@ def test_failed_readiness_handoff_does_not_advertise_an_upload(repository, monke
     assert "readiness could not be handed to the workflow" in output
     assert "not a model defect" in output
     assert "are available" not in output
+
+
+def test_real_candidate_line_and_direction_project_only_to_their_authorized_audiences(repository, monkeypatch):
+    from omniflow.candidate import CandidateVerificationError, verify_candidate
+    from omniflow.exceptions import exception_diagnostic
+
+    context, client, policy = repository
+    monkeypatch.setattr("omniflow.candidate.pull_request_revision", lambda _: (policy.head_sha, policy.repository))
+    text = client.get_model_yaml(context.model_id, branch_id=context.branch_id)["files"]["orders.view"]
+    assert text.endswith("\n") and not text.endswith("\n\n")
+    monkeypatch.setattr(client, "get_model_yaml", lambda *args, **kwargs: {"files": {"orders.view": text[:-1]}})
+    with pytest.raises(CandidateVerificationError) as failure:
+        verify_candidate(client, context)
+    error = failure.value
+    issue = {"validator": "candidate", "type": "candidate_verification_failed", "severity": "error", "blocking": True,
+             "candidate_reason": error.candidate_reason, **exception_diagnostic(error), **error.candidate_counts}
+    with repository_reporting(object(), output_dir=Path(".omniflow")):
+        record_candidate_diagnostics(context, error, issue)
+        safe = write({**report([issue]), "exit_code": 2, "validation_complete": False})
+    private = json.loads(Path(".omniflow/repository/report.json").read_text())
+    sample = private["issues"][0]["candidate_samples"][0]
+    assert sample["git_path"] == "omni/orders.view" and sample["first_differing_line"] == text.count("\n")
+    assert sample["difference_class"] == "terminal_newline_only" and sample["newline_missing_from"] == "omni"
+    assert safe["issues"][0]["newline_missing_from"] == "omni"
+    assert safe["exit_code"] == 2 and safe["validation_complete"] is False
+    assert "first_differing_line" not in json.dumps(safe) and "orders.view" not in json.dumps(safe)
+    assert "unrelated change" not in json.dumps(private) and "source_preview" not in json.dumps(private)

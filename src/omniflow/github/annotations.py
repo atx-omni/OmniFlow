@@ -5,7 +5,8 @@ from typing import Any
 from ..git import tool_revision
 from ..reporting.finding_groups import group_findings
 from ..reporting.issue_policy import is_blocking
-from ..reporting.recovery import diagnostic_guide, first_step
+from ..reporting.recovery import diagnostic_guide, first_step, mismatch_description
+from ..repository_diagnostics import repository_diagnostic_availability
 
 
 def public_annotation_lines(issues: list[dict[str, Any]], *, limit: int) -> list[str]:
@@ -14,6 +15,16 @@ def public_annotation_lines(issues: list[dict[str, Any]], *, limit: int) -> list
     selected = []
     source = {"tool_revision": tool_revision()}
     for finding, count in groups[:limit]:
+        if finding.get("candidate_reason") == "content_mismatch":
+            guide = diagnostic_guide(finding, source)
+            message = f"Content mismatch. {mismatch_description(finding)} Fix: {first_step(finding)} [OF-CANDIDATE-CONTENT]"
+            if repository_diagnostic_availability().get("candidate_summary_written") is True:
+                message += " Open this run’s Summary for the filename and line."
+            elif guide:
+                message += f" Find the filename and line: {guide}"
+            selected.append({"severity": finding.get("severity"), "blocking": is_blocking(finding),
+                             "candidate_reason": "content_mismatch", "message": message})
+            continue
         qualifiers = [finding.get(key) for key in (
             "diagnostic_code", "context_reference", "validator", "rule_id", "validation_scope", "state",
         )]
@@ -63,7 +74,7 @@ def annotation_lines(issues: list[dict[str, Any]]) -> list[str]:
             if type(issue.get("line")) is int and issue["line"] > 0:
                 properties.append(f"line={issue['line']}")
         message = _escape_data(issue.get("message") or issue.get("summary") or "OmniFlow issue")
-        if is_blocking(issue):
+        if is_blocking(issue) and issue.get("candidate_reason") != "content_mismatch":
             message = f"Blocks under configured policy: {message}"
         elif issue.get("blocking") is False:
             message = f"Does not block under configured policy: {message}"

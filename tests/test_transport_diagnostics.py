@@ -282,8 +282,29 @@ def test_candidate_content_failure_reports_only_observed_mismatch(monkeypatch):
     assert error.contents_comparison == "different"
     assert error.candidate_counts["compared_file_count"] == 1
     assert error.candidate_samples == [{"git_path": "orders.view.yaml", "omni_path": "orders.view",
-                                       "comparison": "different", "pairing": "authored_identity", "validation_scope": "branch"}]
-    assert "changed" not in json.dumps(error.candidate_samples)
+                                       "comparison": "different", "pairing": "authored_identity", "validation_scope": "branch",
+                                       "difference_class": "authored_text_changed", "first_differing_line": 1}]
+    assert '"changed"' not in json.dumps(error.candidate_samples)
+
+
+@pytest.mark.parametrize("git,omni,kind,additional,line", [
+    ("note: a", "note: a\n", "terminal_newline_only", {"newline_missing_from": "git"}, 1),
+    ("note: a\r\n", "note: a", "terminal_newline_only", {"newline_missing_from": "omni"}, 1),
+    ("x\n\n", "x\n", "terminal_newline_only", {}, 2),
+    ("x\n", "x\n\n", "terminal_newline_only", {}, 2),
+    ("x\r\n", "x\r", "line_endings_only", {"git_line_ending": "crlf", "omni_line_ending": "cr"}, 1),
+    ("x\r\ny\n", "x\ny\n", "line_endings_only", {"git_line_ending": "mixed", "omni_line_ending": "lf"}, 1),
+])
+def test_ci_difference_context_has_only_shareable_cause_and_private_position(monkeypatch, git, omni, kind, additional, line):
+    from omniflow.candidate_difference import shareable_difference_fields
+    client, context, _ = candidate_fixture(monkeypatch, {"orders.view.yaml": git}, {"orders.view": omni})
+    with pytest.raises(CandidateVerificationError) as caught:
+        verify_candidate(client, context)
+    error = caught.value
+    assert error.exit_code == 2 and error.candidate_counts["compared_file_count"] == 1
+    assert shareable_difference_fields(error.diagnostic_context) == {"difference_class": kind, **additional}
+    assert "first_differing_line" not in error.diagnostic_context and "orders.view" not in json.dumps(error.diagnostic_context)
+    assert error.candidate_samples[0]["first_differing_line"] == line
 
 
 @pytest.mark.parametrize("file_count", [2, 4])

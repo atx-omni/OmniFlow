@@ -5,7 +5,9 @@ Start with the primary blocker on the PR or the first failed setup step in Actio
 <a id="guide-file-contents"></a>
 ## A saved model file differs from Git
 
-`OF-CANDIDATE-CONTENT` means the filenames matched and the first text difference stopped comparison. If Git and Omni each have 1,253 files and the first difference is file 379, then 378 matched byte for byte and 874 still need comparison. One sample establishes **at least one** mismatch. A line ending and a changed SQL expression both trigger this check.
+`OF-CANDIDATE-CONTENT` means OmniFlow found a text difference in a matched file. Start with the **Fix** in the annotation. For example, if Git is missing a final newline present in Omni, add that newline to the Git file, commit it, and rerun after synchronization. If the authored YAML differs, review both definitions before choosing the intended version.
+
+For an eligible private run, open **Actions → the failed run → Summary → Content mismatch**. The card identifies the matched Git and Omni files and the first differing line. For an internal or public repository, or if the card is unavailable, use the local command below. The filenames and source text stay out of shareable annotations. If the run stopped at file 379 of 1,253, 378 matched byte for byte and 874 still need comparison. That run establishes **at least one** mismatch.
 
 1. In the failed GitHub run, identify the PR and the head commit for that event. For a base-scope finding, also identify the event's target commit. The **OmniFlow Action revision** identifies the tool itself.
 2. For branch scope, ask an Omni Organization Admin to open the shared model's **Model → Advanced → Webhook Deliveries**, expand the PR delivery, and compare its commit with the run. Wait if delivery is queued or syncing. Open the delivery error if it failed. If the delivery is marked **Not started** or **Stalled**, follow Omni's redelivery procedure. For base scope compare the shared model with the target commit. [Omni webhook delivery instructions](https://docs.omni.co/integrations/git/webhook-deliveries)
@@ -23,7 +25,9 @@ The command compares the currently saved Omni model with immutable Git objects f
 
 Read the paired Git and Omni paths, the first differing line, and the classification on that workstation. Review the intended change in the corresponding file. A formatting classification still requires judgment when the YAML contains SQL block text. Save or sync the intended definition in the correct direction. Then validate the current commit. **Recovered** means candidate verification completes for that scope. Other checks can now report genuine regressions.
 
-Internal and public repositories receive a shareable report without model file paths. The local command does not upload its findings. A private repository can have a separate detailed artifact when the run explicitly confirms publication. If you need support, provide the diagnostic code, run reference, scope, delivery outcome and classification through your approved channel. Keep source text local.
+For an authored text difference, add `--show-diff` to that command in an approved interactive terminal to see a short Git/Omni excerpt at the first differing line. Source can contain customer data. Use this option only on an authorized device and keep the preview out of pasted logs and tickets. The default output omits source. For newline differences the direction or line-ending style already describes the change.
+
+Internal and public repositories receive a shareable report without model file paths. The local command does not upload its findings. A private repository can also have a separate detailed artifact when the run confirms publication. A trusted `reporting.diagnostics.mode: minimal` setting disables private paths both in artifacts and in the run summary. If you need support, provide the diagnostic code, run reference, scope, delivery outcome and classification through your approved channel. Keep source text local.
 
 <a id="guide-compare-branches"></a>
 ## Omni and Git selected different files, branches, or revisions

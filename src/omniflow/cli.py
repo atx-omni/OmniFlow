@@ -148,6 +148,9 @@ def build_parser() -> argparse.ArgumentParser:
     diagnose.add_argument("--scope", choices=("branch", "base"), default="branch")
     diagnose.add_argument("--model-path", help="Exact registered model path; required when the selection is ambiguous")
     diagnose.add_argument("--config", help="Canonical relative policy path at the trusted PR base (default .omniflow.yml)")
+    diagnose.add_argument("--show-diff", action="store_true",
+                          help="Show one bounded source line per side only on an approved interactive terminal; "
+                               "may contain sensitive customer data. Never pipe, share, log or upload it.")
     diagnose.set_defaults(func=cmd_candidate_diagnose)
 
     route_parser = subcommands.add_parser(

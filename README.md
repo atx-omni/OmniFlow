@@ -475,6 +475,8 @@ Start with the report's **Primary blocker** and **Next action**. Safe diagnostic
 
 A mismatch can also produce up to five **observed path examples** after the private-repository, trusted model and immutable revision checks succeed. These observations explain the mismatch; they do not establish correspondence, weaken the gate, or claim contents were compared when they were not. The public report explicitly explains when this separate artifact is unavailable.
 
+For **Content mismatch**, the shareable message describes the first observed difference and gives its correction. An eligible private run can show both filenames and the first differing line under **Actions → run → Summary**. Internal repositories can locate the same evidence using the [local comparison instructions](docs/ERROR_CODES.md#guide-file-contents).
+
 To opt out, merge this setting into the required root `.omniflow.yml` on the trusted target branch (usually `main`):
 
 ```yaml

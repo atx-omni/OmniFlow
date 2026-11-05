@@ -7,6 +7,7 @@ from unittest.mock import Mock
 import pytest
 
 from omniflow import candidate_diagnosis
+from omniflow.candidate_difference import difference_details
 from omniflow.cli import main
 
 
@@ -167,9 +168,8 @@ def test_unsafe_or_unverifiable_diagnoses_do_not_emit_samples(local, capsys, mon
     ("a: [\n", "a: 1\n", "unclassified_text_difference", 1),
 ])
 def test_local_difference_categories_do_not_waive_exact_equality(git_text, omni_text, kind, line):
-    assert candidate_diagnosis.difference_details(git_text, omni_text) == {
-        "first_differing_line": line, "difference_class": kind,
-    }
+    result = difference_details(git_text, omni_text)
+    assert (result["first_differing_line"], result["difference_class"]) == (line, kind)
 
 
 def test_sensitive_or_unsafe_paths_do_not_print_raw_metadata(local):
@@ -227,3 +227,47 @@ def test_local_git_invocations_only_read_objects_without_protocols_or_prompts(lo
         assert "protocol.allow=never" in argv and "gc.auto=0" in argv
         assert env["GIT_NO_LAZY_FETCH"] == "1" and env["GIT_ALLOW_PROTOCOL"] == "" and env["GIT_TERMINAL_PROMPT"] == "0"
         assert set(argv).intersection({"ls-tree", "rev-parse", "cat-file"})
+
+
+def test_show_diff_refuses_captured_output_and_ci_without_remote_calls(local, capsys, monkeypatch):
+    monkeypatch.setattr(candidate_diagnosis, "_interactive_terminal", lambda: False)
+    assert main([*local.argv, "--show-diff"]) == 2
+    assert "interactive terminal" in capsys.readouterr().err
+    monkeypatch.setattr(candidate_diagnosis, "_interactive_terminal", lambda: True)
+    monkeypatch.setenv("CI", "true")
+    assert main([*local.argv, "--show-diff"]) == 2
+    local.gh.request.assert_not_called()
+
+
+def test_explicit_terminal_diff_reveals_only_first_differing_line_after_bound_comparison(local, capsys, monkeypatch):
+    monkeypatch.setattr(candidate_diagnosis, "_interactive_terminal", lambda: True)
+    files = local.client.get_model_yaml.return_value["files"]
+    files["orders.view"] = "label: intended text\nother: hidden-second-line\n"
+    assert main([*local.argv, "--show-diff"]) == 2
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["source_preview"] == {"git": "label: private-raw-value", "omni": "label: intended text"}
+    assert "hidden-second-line" not in captured.out + captured.err
+    assert main(local.argv) == 2
+    assert "private-raw-value" not in capsys.readouterr().out
+    assert not Path(".omniflow").exists()
+
+
+@pytest.mark.parametrize("sensitive", ["fixture-private-token", "password: imaginary", "ghp_secret-canary",
+                                       "123-45-6789", "local-external-secret"])
+def test_terminal_source_preview_screens_whole_line_before_truncation(local, sensitive, monkeypatch):
+    monkeypatch.setenv("OTHER_ACCESS_KEY", "local-external-secret")
+    preview = candidate_diagnosis._terminal_preview(
+        "x: value\n", "x: value" + " " * 240 + sensitive + "\n",
+        {"first_differing_line": 1, "difference_class": "authored_text_changed"},
+    )
+    assert preview["omni"] == "[withheld: sensitive pattern]"
+
+
+def test_terminal_preview_skips_newline_only_and_bounds_long_lines():
+    assert not candidate_diagnosis._terminal_preview("x", "x\n", {"difference_class": "terminal_newline_only"})
+    preview = candidate_diagnosis._terminal_preview(
+        "x " * 160 + "left", "x " * 160 + "right",
+        {"first_differing_line": 1, "difference_class": "authored_text_changed"},
+    )
+    assert all(len(value) <= candidate_diagnosis.MAX_PREVIEW_CHARS for value in preview.values())
+    assert "left" in preview["git"] and "right" in preview["omni"]

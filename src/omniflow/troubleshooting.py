@@ -17,6 +17,38 @@ CHECK_GUIDES = {
 }
 GUIDE_ANCHORS = frozenset({*CHECK_GUIDES.values(), "file-contents", "api-access", "api-response"})
 ACTION_REPOSITORIES = frozenset({"exploreomni/OmniFlow", "atx-omni/OmniFlow"})
+ENDING_NAMES = {"lf": "LF", "crlf": "CRLF", "cr": "CR", "mixed": "mixed line endings"}
+
+
+def _mismatch_remedy(issue: dict) -> tuple[str, str]:
+    """Describe only what the first mismatched pair proves, using fixed vocabulary."""
+    kind = issue.get("difference_class")
+    base = issue.get("validation_scope") == "base"
+    git_side = "target branch" if base else "PR branch"
+    omni_side = "shared Omni model" if base else "Omni branch"
+    if kind == "terminal_newline_only":
+        missing = issue.get("newline_missing_from")
+        if missing == "git":
+            return ("The Git file is missing the final newline present in Omni.",
+                    f"Add the final newline to the Git file, commit the fix to the {git_side}, and rerun after sync.")
+        if missing == "omni":
+            return ("The Omni file is missing the final newline present in Git.",
+                    f"Open the file in the {omni_side}, match the intended final newline, save and sync, then rerun.")
+        return ("The two copies differ only by a final newline.",
+                "Match the final newline in the two copies, save and sync the intended version, then rerun.")
+    if kind == "line_endings_only":
+        left, right = ENDING_NAMES.get(issue.get("git_line_ending")), ENDING_NAMES.get(issue.get("omni_line_ending"))
+        detail = f" Git uses {left} and Omni uses {right}." if left and right else ""
+        return ("The two copies use different line endings." + detail,
+                f"Use your editor's line-ending setting to match the intended file on the {git_side} and in Omni, then sync and rerun.")
+    if kind == "yaml_comment_or_whitespace_only":
+        return ("Only YAML comments or formatting differ in this pair.",
+                "Compare the comment or formatting at the reported line, keep the intended version on both sides, then sync and rerun.")
+    if kind == "authored_text_changed":
+        return ("The authored YAML text differs beyond comments or whitespace.",
+                f"Compare the Git and Omni lines in the local diagnostic. Save the intended definition in the {omni_side} and {git_side}, then rerun.")
+    return ("A model file has different text in Git and Omni.",
+            "Use the local comparison in the guide to locate the differing line, then sync the version you intend to validate.")
 
 
 def guide_url(anchor: str, action_revision: str | None = None, action_repository: str | None = None) -> str:
@@ -44,12 +76,11 @@ def recovery_details(issue: dict) -> dict:
         anchor = "file-contents"
         base = issue.get("validation_scope") == "base"
         revision = "target (base)" if base else "PR head"
+        difference, fix = _mismatch_remedy(issue)
         steps = [
-            f"Find the {revision} commit recorded for the failing PR event in GitHub.",
-            ("Compare the shared Omni model with this target commit." if base else
-             "Ask an Omni Organization Admin to open Model → Advanced → Webhook Deliveries on the shared model. Match the PR and commit."),
-            ("Use omniflow candidate diagnose locally with --scope base to locate the first difference." if base else
-             "Wait for a pending sync or address a failed delivery. If the same commit already synced, run omniflow candidate diagnose locally."),
+            fix,
+            ("Use omniflow candidate diagnose locally with --scope base to compare the shared model and target commit." if base else
+             "If the difference persists, ask an Omni Organization Admin to check the PR commit in Model → Advanced → Webhook Deliveries."),
         ]
         total, compared = issue.get("git_file_count"), issue.get("compared_file_count")
         if (type(total) is int and type(compared) is int and 0 < compared <= total
@@ -131,6 +162,8 @@ def recovery_details(issue: dict) -> dict:
         outcome = "Blocks the PR because validation is incomplete"
     result = {"recovery_steps": steps, "verify_recovery": verify, "support_action": support,
               "guide_anchor": anchor, "outcome_label": outcome}
+    if code == "OF-CANDIDATE-CONTENT":
+        result["difference_description"] = difference
     if coverage:
         result["coverage_description"] = coverage
     return result

@@ -232,7 +232,7 @@ _add("file_inventory_mismatch", "OF-CANDIDATE-FILES", "Some model files are pres
      "Review the Git-only and Omni-only counts for the selected scope. Check missing/extra artifacts, "
      "view database/catalog and schema qualification, topic names and capitalization, then contents. "
      "Do not rename or overwrite model files solely to make this check pass.", "synchronization")
-_add("content_mismatch", "OF-CANDIDATE-CONTENT", "At least one saved Omni model file differs from the corresponding Git commit.",
+_add("content_mismatch", "OF-CANDIDATE-CONTENT", "Content mismatch",
      "Compare the selected Omni scope with its Git revision. Use the read-only local comparison to locate the difference.", "synchronization")
 _add("changed_during_validation", "OF-CANDIDATE-DRIFT", "The selected snapshot changed during validation.",
      "Wait for synchronization/editing to finish and rerun against the latest PR revisions.", "synchronization")

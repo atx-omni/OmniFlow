@@ -10,10 +10,6 @@ from __future__ import annotations
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-import yaml
-from yaml.nodes import MappingNode, ScalarNode, SequenceNode
-from yaml.tokens import AliasToken, AnchorToken, DirectiveToken, TagToken
-
 from .candidate import (
     MAX_TREE_ENTRIES,
     _bounded_git,
@@ -22,23 +18,15 @@ from .candidate import (
     _safe_path,
     _semantic_inventory,
 )
+from .candidate_difference import _Unverified, _yaml_signature
 from .discovery import ModelContext
 from .exceptions import OmniFlowError
 from .revision_data import FULL_SHA, pull_request_revision
-from .yaml_security import MAX_YAML_FILE_BYTES, MAX_YAML_TOTAL_BYTES, parse_secure_yaml
+from .yaml_security import MAX_YAML_FILE_BYTES, MAX_YAML_TOTAL_BYTES
 
 _MODEL_SUFFIXES = {".view", ".topic", ".composite_topic", ".relationships"}
 _PROTECTED_NAMES = {"dbt_project.yml", "dbt_project.yaml", "packages.yml", "packages.yaml",
                     "dependencies.yml", "dependencies.yaml", "profiles.yml", "profiles.yaml"}
-_DEPENDENCY_KEYS = {"extends", "extend", "extension", "extensions", "include", "includes",
-                    "import", "imports", "inherit", "inherits", "inheritance", "dependencies",
-                    "dependency", "parent_model", "base_model", "shared_model", "dbt"}
-_SCALAR_TAGS = {f"tag:yaml.org,2002:{name}" for name in ("str", "int", "float", "bool", "null")}
-
-
-class _Unverified(Exception):
-    def __init__(self, reason: str) -> None:
-        self.reason = reason
 
 
 def _result(classification: str, reason: str) -> dict[str, Any]:
@@ -140,46 +128,3 @@ def _blob(entry: dict, *, root: Path) -> str:
     if len(raw) != entry["size"]:
         raise _Unverified("incomplete_git_snapshot")
     return raw.decode("utf-8")
-
-
-def _yaml_signature(text: str) -> tuple:
-    try:
-        # Shared limits bound file size, nesting and parser work. Construction
-        # does not define equality: coercions would hide authored differences.
-        parse_secure_yaml(text, source="PR snapshot")
-        tokens = list(yaml.scan(text, Loader=yaml.SafeLoader))
-        if any(isinstance(token, (AliasToken, AnchorToken, DirectiveToken, TagToken)) for token in tokens):
-            raise _Unverified("unsupported_yaml_construct")
-        node = yaml.compose(text, Loader=yaml.SafeLoader)
-        if node is None:
-            raise _Unverified("empty_yaml_document")
-        _validate_node(node)
-        # YAML's scanner, not regex comment stripping, identifies actual scalar
-        # spans. Retain exact authored scalar bytes, types, order and delimiters;
-        # a '#' inside SQL, a quoted value or a block is never discarded.
-        return tuple((type(token).__name__, getattr(token, "value", None),
-                      getattr(token, "style", None),
-                      text[token.start_mark.index:token.end_mark.index]) for token in tokens)
-    except (yaml.YAMLError, RecursionError, OmniFlowError):
-        raise _Unverified("invalid_or_unsupported_yaml") from None
-
-
-def _validate_node(node: Any) -> None:
-    if isinstance(node, MappingNode):
-        seen: set[str] = set()
-        for key, value in node.value:
-            if not isinstance(key, ScalarNode) or key.tag != "tag:yaml.org,2002:str":
-                raise _Unverified("ambiguous_yaml_key")
-            if key.value in seen:
-                raise _Unverified("duplicate_yaml_key")
-            seen.add(key.value)
-            if key.value.casefold() in _DEPENDENCY_KEYS:
-                raise _Unverified("external_dependency_unverified")
-            _validate_node(value)
-    elif isinstance(node, SequenceNode):
-        for child in node.value:
-            _validate_node(child)
-    elif not isinstance(node, ScalarNode) or node.tag not in _SCALAR_TAGS:
-        raise _Unverified("unsupported_yaml_construct")
-    elif any(marker in node.value for marker in ("{{", "{%")):
-        raise _Unverified("external_dependency_unverified")

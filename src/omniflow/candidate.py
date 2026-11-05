@@ -6,12 +6,13 @@ import hashlib
 import os
 import subprocess  # nosec B404
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .artifact_identity import ArtifactIdentityError, identity_digest, match_artifacts
+from .candidate_difference import difference_details, shareable_difference_fields
 from .exceptions import ConfigError, OmniFlowError, exception_diagnostic
 from .file_scope import FileScopeError, NonOmniRule, excluded_semantic_paths
 from .git import git_executable
@@ -101,6 +102,7 @@ def verify_candidate(
 def _verify_snapshot(
     client: Any, context: Any, *, revision_side: str, non_omni_rules: Sequence[NonOmniRule] = (),
     local_diagnosis_revision: tuple[str, str] | None = None,
+    local_preview: Callable[[str, str, dict], None] | None = None,
 ) -> dict[str, Any]:
     if revision_side not in {"head", "base"}:
         raise CandidateVerificationError("invalid_pr_revision")
@@ -233,16 +235,18 @@ def _verify_snapshot(
         if raw != actual[api_path]:
             sample = {"git_path": path, "omni_path": api_path,
                       "comparison": "different", "pairing": "authored_identity"}
-            if local_diagnosis_revision is not None:
-                # Local-only evidence; keep the CI exception/report schema unchanged.
-                from .candidate_diagnosis import difference_details
-
-                sample.update(difference_details(text, omni_files[api_path]))
-            raise _bind_samples(CandidateVerificationError(
+            detail = difference_details(text, omni_files[api_path])
+            sample.update(detail)
+            error = CandidateVerificationError(
                 "content_mismatch", **counts,
                 candidate_samples=[sample],
                 candidate_sample_count=1, candidate_sample_omitted_count=0, compared_file_count=compared_count,
-            ), sha=sha, model_id=context.model_id, branch_id=branch_id, comparison="different")
+            )
+            # Never place paths, line positions or source text in public context.
+            error.diagnostic_context.update(shareable_difference_fields(detail))
+            if local_diagnosis_revision is not None and local_preview is not None:
+                local_preview(text, omni_files[api_path], detail)
+            raise _bind_samples(error, sha=sha, model_id=context.model_id, branch_id=branch_id, comparison="different")
         name = path.encode("utf-8")
         digest.update(len(name).to_bytes(8, "big") + name + len(raw).to_bytes(8, "big") + raw)
     proof = {

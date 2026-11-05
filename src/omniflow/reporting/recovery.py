@@ -21,15 +21,18 @@ def first_step(finding: dict[str, Any]) -> str:
     return steps[0] if steps else finding.get("next_action", "Inspect the failed check in this run.")
 
 
+def mismatch_description(finding: dict[str, Any]) -> str:
+    return finding.get("difference_description") or "A saved Omni file differs from its matching Git file."
+
+
 def candidate_detail_hint(finding: dict[str, Any], report: dict[str, Any]) -> str:
     if finding.get("candidate_reason") != "content_mismatch":
         return ""
-    if report.get("diagnostic_audience") == "repository" and finding.get("candidate_samples"):
-        return "The Findings section lists the paired paths and Git revision for this comparison."
     availability = report.get("repository_diagnostics") or {}
     if availability.get("status") == "unavailable":
         reason = ("GitHub marks this repository internal. "
                   if availability.get("diagnostics_reason") == "repository_internal" else "")
-        return reason + ("No detailed artifact was generated for this run. "
-                         "Use the guide’s local comparison command to identify the file.")
+        return reason + "No detailed artifact was generated for this run."
+    if availability.get("candidate_summary_written") is True and report.get("diagnostic_audience") != "repository":
+        return "Open this run’s Summary for the filename and line."
     return ""

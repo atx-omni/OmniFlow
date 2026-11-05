@@ -222,3 +222,50 @@ def test_customer_mismatch_guidance_across_channels(visibility, monkeypatch):
     for channel in (markdown, pr, summary, notice, logs):
         assert f"/{pin}/" in url and url in channel
         assert "SENSITIVE_" not in channel
+
+
+def test_mismatch_names_and_lines_are_private_but_the_actual_fix_is_shared(monkeypatch):
+    from omniflow.diagnostics import public_diagnostic
+    from omniflow.github import annotations
+    from omniflow.reporting.markdown_report import candidate_location_lines
+    from omniflow.reporting.notification import render_pr_comment
+
+    metadata = {"status": "generated", "diagnostics_reason": "repository_verified"}
+    raw = report(repository_diagnostics=metadata, issues=[{
+        "validator": "candidate", "type": "candidate_verification_failed", "candidate_reason": "content_mismatch",
+        "severity": "error", "blocking": True, "validation_scope": "branch", "difference_class": "terminal_newline_only",
+        "newline_missing_from": "git",
+    }])
+    image = public_diagnostic(raw)
+    issue = image["issues"][0]
+    sample = {"git_path": "omni/private_model/agents.view.yaml", "omni_path": "agents.view",
+              "comparison": "different", "pairing": "authored_identity", "first_differing_line": 9}
+    private_issue = dict(issue, candidate_evidence_kind="observations_not_correspondence", candidate_samples=[sample],
+                         git_revision="b" * 40, source_revision="head")
+    private = dict(image, diagnostic_audience="repository", issues=[private_issue])
+    top = render_markdown_report(private).split("**How to resolve it**")[0]
+    assert "agents.view.yaml` differs from Omni file `agents.view` at line 9" in top
+    assert "Git file is missing the final newline" in top
+    assert not candidate_location_lines(private_issue, image)
+    assert not candidate_location_lines(dict(private_issue, source_revision="base"), private)
+    for changes in ({"git_path": "../private"}, {"first_differing_line": True}, {"pairing": "basename_hint"}):
+        assert not candidate_location_lines(dict(private_issue, candidate_samples=[sample | changes]), private)
+
+    run = "https://github.com/demo/repo/actions/runs/123"
+    receipt = {"kind": "repository", "status": "uploaded", "url": f"{run}/artifacts/12"}
+    log = "\n".join(annotations.public_annotation_lines(image["issues"], limit=5))
+    pr = render_pr_comment(private, head_sha="b" * 40, run_url=run, publication=[receipt])
+    assert log.startswith("::error::Content mismatch. The Git file is missing")
+    assert "candidate_reason=" not in log and "Find the filename and line" in log
+    assert f"[Open private comparison report]({receipt['url']})" in pr and "locally]" not in pr
+    assert pr.startswith("## OmniFlow: Content mismatch")
+    for text in (pr, log):
+        assert "Add the final newline to the Git file" in text
+        assert "agents.view" not in text and "line 9" not in text
+    for wrong_receipt in (dict(receipt, url="https://elsewhere.invalid"), dict(receipt, status="unconfirmed")):
+        fallback = render_pr_comment(private, head_sha="b" * 40, run_url=run, publication=[wrong_receipt])
+        assert "Find the filename and line locally" in fallback
+        assert "Open private comparison report" not in fallback
+    monkeypatch.setattr(annotations, "repository_diagnostic_availability",
+                        lambda: dict(metadata, candidate_summary_written=True))
+    assert "Open this run’s Summary" in "\n".join(annotations.public_annotation_lines(image["issues"], limit=5))

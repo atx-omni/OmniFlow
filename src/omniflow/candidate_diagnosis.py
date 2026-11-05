@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,19 +22,28 @@ from .candidate import (
     _safe_path,
     _verify_snapshot,
 )
+from .candidate_difference import shareable_difference_fields
 from .config import DEFAULT_CONFIG_PATH, OmniFlowConfig, _to_config, parse_policy_text, require_api_key
 from .diagnostics import CANDIDATE_REASONS, safe_exception_message
 from .discovery import FLOW_PATH, _model_from_payload, parse_flow_metadata_text
 from .exceptions import ConfigError, ExitCodes, OmniFlowError
 from .github.revalidation import GitHubRepository
-from .nonsemantic import _Unverified, _yaml_signature
 from .omni_client import OmniClient
 from .repository_locations import _path as displayable_path
 from .revision_data import FULL_SHA, REPOSITORY
-from .security import validate_base_url, validate_branch_name
+from .security import redact, validate_base_url, validate_branch_name
 from .trust import MAX_TRUSTED_FILE_BYTES
 
-MAX_CLASSIFICATION_BYTES = 128 * 1024
+MAX_PREVIEW_CHARS = 160
+_EOL = re.compile(r"\r\n|\r|\n")
+_CREDENTIAL_LABEL = re.compile(
+    r"api[ _-]?key|token|secret|password|authorization|bearer|credential|private[ _-]?key|access[ _-]?key",
+    re.IGNORECASE,
+)
+_CREDENTIAL_VALUE = re.compile(
+    r"-----BEGIN |gh[pousr]_|github_pat_|sk[-_]|xox[baprs]-|(?:AKIA|ASIA)[A-Z0-9]{16}|"
+    r"eyJ[A-Za-z0-9_-]+\.|[A-Za-z0-9_+/=-]{32,}|(?<!\d)\d(?:[ _-]?\d){8,}(?!\d)", re.IGNORECASE,
+)
 
 
 class DiagnosisSetupError(ConfigError):
@@ -48,28 +58,44 @@ class PRSnapshot:
     head_ref: str
 
 
-def difference_details(git: str, omni: str) -> dict:
-    # The first unequal character (including EOF), without printing an excerpt.
-    at = next((i for i, (a, b) in enumerate(zip(git, omni, strict=False)) if a != b),
-              min(len(git), len(omni)))
-    prefix = git[:at]
-    line = 1 + prefix.count("\n") + prefix.count("\r") - prefix.count("\r\n")
-    def normalize(s):
-        return s.replace("\r\n", "\n").replace("\r", "\n")
-
-    if normalize(git) == normalize(omni):
-        kind = "line_endings_only"
-    elif any(git == omni + end or omni == git + end for end in ("\r\n", "\n", "\r")):
-        kind = "terminal_newline_only"
-    elif max(len(git.encode()), len(omni.encode())) > MAX_CLASSIFICATION_BYTES:
-        kind = "unclassified_text_difference"
+def _preview_line(text: str, number: int, offset: int, secrets: tuple[str, ...]) -> str:
+    """Extract one local display window. Screen the entire line before truncation."""
+    start = 0
+    for i, end in enumerate(_EOL.finditer(text), 1):
+        if i == number:
+            stop = end.start()
+            break
+        start = end.end()
     else:
-        try:
-            kind = ("yaml_comment_or_whitespace_only" if _yaml_signature(git) == _yaml_signature(omni)
-                    else "authored_text_changed")
-        except (_Unverified, RecursionError, ValueError):
-            kind = "unclassified_text_difference"
-    return {"difference_class": kind, "first_differing_line": line}
+        stop = len(text)
+        if stop == start:
+            return "[end of file]"
+    if stop - start > 4096:
+        return "[line too long for a safe preview]"
+    line = text[start:stop]
+    if (redact(line) != line or _CREDENTIAL_LABEL.search(line) or _CREDENTIAL_VALUE.search(line)
+            or any(secret in line for secret in secrets)):
+        return "[withheld: sensitive pattern]"
+    if len(line) <= MAX_PREVIEW_CHARS:
+        return line
+    left = max(0, min(len(line) - MAX_PREVIEW_CHARS + 2, offset - start - MAX_PREVIEW_CHARS // 2))
+    right = left + MAX_PREVIEW_CHARS - 2
+    return ("…" if left else "") + line[left:right] + ("…" if right < len(line) else "")
+
+
+def _terminal_preview(git: str, omni: str, details: dict) -> dict:
+    if details["difference_class"] in {"line_endings_only", "terminal_newline_only"}:
+        return {}  # Direction/style is the actionable difference; no excerpt needed.
+    number = details["first_differing_line"]
+    offset = next((i for i, (a, b) in enumerate(zip(git, omni, strict=False)) if a != b),
+                  min(len(git), len(omni)))
+    secrets = tuple(piece for name, value in os.environ.items() if value and _CREDENTIAL_LABEL.search(name)
+                    for piece in value.splitlines() if piece)
+    return {"git": _preview_line(git, number, offset, secrets), "omni": _preview_line(omni, number, offset, secrets)}
+
+
+def _interactive_terminal() -> bool:
+    return sys.stdout.isatty() and sys.stderr.isatty()
 
 
 def _check_local(args) -> None:
@@ -79,6 +105,8 @@ def _check_local(args) -> None:
         raise DiagnosisSetupError("Refused: run this private path diagnostic on an approved local workstation, not in CI.")
     if args.verbose:
         raise DiagnosisSetupError("Do not enable --verbose for private candidate diagnostics.")
+    if args.show_diff and not _interactive_terminal():
+        raise DiagnosisSetupError("--show-diff requires an approved interactive terminal; do not pipe, capture or upload source.")
     if (not REPOSITORY.fullmatch(args.repository) or not 1 <= args.pr <= 2**31 - 1
             or not FULL_SHA.fullmatch(args.head_sha) or (args.base_sha and not FULL_SHA.fullmatch(args.base_sha))):
         raise DiagnosisSetupError("Use a GitHub OWNER/REPO, positive PR number and full Git commit SHAs, not refs.")
@@ -196,9 +224,14 @@ def _diagnose(args) -> tuple[int, dict]:
     output = {"diagnostic": "local_candidate_comparison", "scope": args.scope, "git_revision": sha,
               "model_path": _path_label(context.model_path) if context.model_path != "." else ".",
               "not_a_validation_run": True}
+    preview: dict[str, str] = {}
+    def capture_preview(git: str, omni: str, details: dict) -> None:
+        preview.update(_terminal_preview(git, omni, details))
+
     try:
         proof = _verify_snapshot(client, context, revision_side=side, non_omni_rules=config.files.non_omni,
-                                 local_diagnosis_revision=(sha, args.repository))
+                                 local_diagnosis_revision=(sha, args.repository),
+                                 local_preview=capture_preview if args.show_diff else None)
     except CandidateVerificationError as exc:
         reason = exc.candidate_reason if exc.candidate_reason in CANDIDATE_REASONS else "verification_unavailable"
         code = exc.exit_code
@@ -215,7 +248,7 @@ def _diagnose(args) -> tuple[int, dict]:
                     item[key] = _path_label(value)
             if "first_differing_line" in observation:
                 item.update(first_differing_line=observation["first_differing_line"],
-                            difference_class=observation["difference_class"])
+                            **shareable_difference_fields(observation))
             if item:
                 samples.append(item)
         output["samples"] = samples
@@ -237,12 +270,16 @@ def _diagnose(args) -> tuple[int, dict]:
                       next_action="Observed snapshots match now. Run fresh CI; this does not validate the PR or reconstruct the old run.")
     if _read_pr(api, args, **binding) != pr:
         raise DiagnosisSetupError("The PR changed during diagnosis. Discard these observations and start a fresh run.")
+    if preview and all("[withheld]" not in sample.values() for sample in output.get("samples", [])):
+        output["source_preview"] = preview
     return code, output
 
 
 def cmd_candidate_diagnose(args) -> int:
     try:
         code, result = _diagnose(args)
+        if args.show_diff and not _interactive_terminal():
+            raise DiagnosisSetupError("Source preview canceled: output is not an interactive terminal.")
     except DiagnosisSetupError as exc:
         print(str(exc), file=sys.stderr)  # Literal setup instructions, never remote payloads.
         return exc.exit_code

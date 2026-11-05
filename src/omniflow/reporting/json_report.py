@@ -9,6 +9,7 @@ from ..security import redact, secure_write_text
 MAX_PUBLIC_REPORT_BYTES = 16 * 1024 * 1024
 RECOVERY_FIELDS = frozenset({
     "outcome_label", "recovery_steps", "verify_recovery", "support_action", "guide_anchor", "coverage_description",
+    "difference_description",
 })
 
 

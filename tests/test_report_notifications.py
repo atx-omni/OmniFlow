@@ -227,7 +227,7 @@ def test_compact_candidate_failure_is_not_described_as_a_new_model_defect():
 def test_compact_unconfirmed_or_private_artifact_never_becomes_full_report_link(receipt):
     text = render_pr_comment(report("pass"), head_sha=HEAD, run_url=RUN_URL, publication=[receipt])
     assert "[Full report]" not in text and "INJECT" not in text
-    assert "Report download unavailable" in text and "Validation passed" in text
+    assert "Public report download unavailable" in text and "Validation passed" in text
 
 
 def impact_report():

@@ -390,6 +390,7 @@ def test_directory_independence_still_compares_contents(snapshot, side):
     assert caught.value.candidate_samples == [{
         "git_path": "SCHEMA/orders.view", "omni_path": "different/orders.view.yaml",
         "comparison": "different", "pairing": "authored_identity",
+        "difference_class": "authored_text_changed", "first_differing_line": 2,
         "validation_scope": "branch" if side == "head" else "base",
     }]
 
