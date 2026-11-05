@@ -54,8 +54,15 @@ def recovery_details(issue: dict) -> dict:
         total, compared = issue.get("git_file_count"), issue.get("compared_file_count")
         if (type(total) is int and type(compared) is int and 0 < compared <= total
                 and total == issue.get("omni_file_count") and issue.get("git_only_count") == issue.get("omni_only_count") == 0):
-            coverage = (f"All {total:,} file identities matched. The first text difference was file {compared:,}. "
-                        f"Comparison stopped there with {total - compared:,} files unchecked. At least one file differs.")
+            if total == 1:
+                coverage = "The only file matched by name. Its text differs."
+            elif compared == total:
+                coverage = f"All {total:,} file identities matched. Only the last file differs in text."
+            else:
+                remaining = total - compared
+                noun = "file" if remaining == 1 else "files"
+                coverage = (f"All {total:,} file identities matched. The first text difference was file {compared:,}. "
+                            f"Comparison stopped there with {remaining:,} {noun} unchecked. At least one file differs.")
         verify = f"A fresh run verifies the {revision} commit and proceeds to compare PR impact."
     elif code in {"OF-MODEL-METADATA-MISSING", "OF-MISSING-POLICY-CONFIG"}:
         anchor = "setup"

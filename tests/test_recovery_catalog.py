@@ -39,3 +39,15 @@ def test_guides_only_link_to_known_code_repositories_at_valid_tool_revisions():
     assert guide_url("../bad", pin) == ""
     url = guide_url("setup", "../fake", "example.com/other")
     assert url == "https://github.com/exploreomni/OmniFlow/blob/main/docs/ERROR_CODES.md#guide-setup"
+
+
+@pytest.mark.parametrize("total,compared,phrase", [
+    (1, 1, "The only file matched by name"),
+    (2, 2, "Only the last file differs"),
+    (2, 1, "1 file unchecked"),
+])
+def test_first_mismatch_uses_the_observed_scan_boundary(total, compared, phrase):
+    issue = {"type": "candidate_verification_failed", "validator": "candidate", "severity": "error",
+             "candidate_reason": "content_mismatch", "git_file_count": total, "omni_file_count": total,
+             "git_only_count": 0, "omni_only_count": 0, "compared_file_count": compared}
+    assert phrase in public_diagnostic({"issues": [issue]})["issues"][0]["coverage_description"]
