@@ -1,5 +1,7 @@
 # OmniFlow Troubleshooting
 
+Start with the [error code and recovery guide](ERROR_CODES.md) for a failed check, especially when the report withholds source paths.
+
 ## Leader/follower release PR targets a different base branch
 
 Version 1 registers one base branch per model. Do not retarget a legitimate release

@@ -2,20 +2,26 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..git import tool_revision
 from ..reporting.finding_groups import group_findings
 from ..reporting.issue_policy import is_blocking
+from ..reporting.recovery import diagnostic_guide, first_step
 
 
 def public_annotation_lines(issues: list[dict[str, Any]], *, limit: int) -> list[str]:
     """Group public categories before sampling so repeated warnings cannot crowd out causes."""
     groups = group_findings([issue for issue in issues if issue.get("active") is not False])
     selected = []
+    source = {"tool_revision": tool_revision()}
     for finding, count in groups[:limit]:
         qualifiers = [finding.get(key) for key in (
             "diagnostic_code", "context_reference", "validator", "rule_id", "validation_scope", "state",
         )]
         context = " / ".join(str(value) for value in qualifiers if value)
-        message = f"{context}: {count} occurrence{'s' if count != 1 else ''}. {finding.get('message', '')}"
+        description = finding.get("title") or finding.get("message", "")
+        if description in {"A validation finding was recorded.", "The check could not establish complete evidence."}:
+            description = finding.get("message", description)
+        message = f"{description} ({context}, {count} occurrence{'s' if count != 1 else ''})."
         facts = [f"{key}={finding[key]}" for key in (
             "reason_code", "cause_code", "transport_reason", "document_reference", "candidate_reason", "api_operation", "http_status",
             "attempt_count", "max_attempts", "config_key", "expected_type", "source_kind",
@@ -23,8 +29,14 @@ def public_annotation_lines(issues: list[dict[str, Any]], *, limit: int) -> list
         ) if key in finding]
         if facts:
             message += " Evidence: " + "; ".join(facts) + "."
-        if finding.get("next_action"):
-            message += f" Next: {finding['next_action']}"
+        if finding.get("coverage_description"):
+            message += " " + finding["coverage_description"]
+        if finding.get("next_action") or finding.get("recovery_steps"):
+            message += f" Next: {first_step(finding)}"
+        if is_blocking(finding):
+            url = diagnostic_guide(finding, source)
+            if url:
+                message += f" Guide: {url}"
         selected.append({**finding, "message": message})
     lines = annotation_lines(selected)
     if len(groups) > limit:

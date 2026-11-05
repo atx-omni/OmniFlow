@@ -19,6 +19,7 @@ from urllib.parse import quote
 from ..diagnostics import safe_exception_message
 from ..exceptions import OmniFlowError
 from ..json_evidence import reject_duplicate_keys
+from ..reporting.json_report import MAX_PUBLIC_REPORT_BYTES
 from ..reporting.notification import (
     notification_decision,
     render_notification,
@@ -50,7 +51,7 @@ def _positive(value: Any) -> int:
     return value
 
 
-def _read_json(path: Path, *, bound: int = 16 * 1024 * 1024) -> dict:
+def _read_json(path: Path, *, bound: int = MAX_PUBLIC_REPORT_BYTES) -> dict:
     # No symlinked checkout output, and no unbounded raw evidence reads.
     if any(parent.is_symlink() for parent in (path, *path.parents)):
         raise PublicationUnavailable("Publication input is not a fresh regular file.")
@@ -280,7 +281,8 @@ def publish(api, report: dict, event: dict, env: dict[str, str]) -> dict:
         duplicate = any(data == stamp for data in transition_stamps)
         if not duplicate:
             assert_current(api, event, env, stamp)
-            notice = render_transition_notice(transition=transition, head_sha=stamp["head"], run_url=_run_url(env))
+            notice = render_transition_notice(transition=transition, head_sha=stamp["head"],
+                                              run_url=_run_url(env), report=report)
             api.request("POST", f"/issues/{number}/comments", {
                 "body": f"{TRANSITION_PREFIX}{serialized} -->\n{notice}",
             })

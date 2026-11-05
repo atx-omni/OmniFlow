@@ -22,6 +22,7 @@ from .artifacts import (
     write_public_reports,
 )
 from .breaking_hold import evaluate_breaking_hold, hold_triggered
+from .candidate_diagnosis import cmd_candidate_diagnose
 from .config import (
     DEFAULT_REPORT_FORMATS,
     load_config,
@@ -135,6 +136,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_parser.add_argument("--skip-reason", help=argparse.SUPPRESS)
     run_parser.set_defaults(func=cmd_run)
+
+    candidate = subcommands.add_parser("candidate", help="Local read-only snapshot troubleshooting")
+    diagnose = candidate.add_subparsers(required=True).add_parser(
+        "diagnose", help="Compare an exact PR revision to the live Omni scope; private workstation output only",
+    )
+    diagnose.add_argument("--repository", required=True, help="Trusted GitHub.com OWNER/REPO")
+    diagnose.add_argument("--pr", type=int, required=True, help="Open same-repository PR number")
+    diagnose.add_argument("--head-sha", required=True, help="Full PR head commit from the failing run (not the Action pin)")
+    diagnose.add_argument("--base-sha", help="Full PR base commit from the failing run; stops if the base moved")
+    diagnose.add_argument("--scope", choices=("branch", "base"), default="branch")
+    diagnose.add_argument("--model-path", help="Exact registered model path; required when the selection is ambiguous")
+    diagnose.add_argument("--config", help="Canonical relative policy path at the trusted PR base (default .omniflow.yml)")
+    diagnose.set_defaults(func=cmd_candidate_diagnose)
 
     route_parser = subcommands.add_parser(
         "route",

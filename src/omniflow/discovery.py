@@ -189,7 +189,8 @@ def discover_deployment_contexts(
     if auto:
         flow = load_flow_metadata(flow_path)
         if flow is None:
-            raise ConfigError("Missing trusted .omni/flow.json metadata for dbt synchronization")
+            raise ConfigError("Missing trusted .omni/flow.json metadata for dbt synchronization",
+                              reason_code="model_metadata_missing")
         contexts = [_model_from_payload(item, branch_name=branch_name) for item in flow["models"]]
         missing_base_branch = [context.model_id for context in contexts if not context.base_branch]
         if missing_base_branch:
@@ -261,6 +262,12 @@ def load_flow_metadata(path: str | Path = FLOW_PATH, *, missing_ok: bool = False
     if text is None:
         raise ConfigError("Missing trusted OmniFlow model metadata", reason_code="model_metadata_missing",
                           diagnostic_context={"source_kind": "model_metadata"})
+    return parse_flow_metadata_text(text, source=candidate)
+
+
+def parse_flow_metadata_text(text: str, *, source: Path = FLOW_PATH) -> dict[str, Any]:
+    """Validate model identity metadata independently of how its bytes were obtained."""
+    candidate = source
     try:
         payload = json.loads(text)
     except json.JSONDecodeError as exc:
@@ -475,7 +482,8 @@ def select_model_contexts(
             sample = ", ".join(unmatched_omni_files[:3])
             raise ConfigError(
                 "Omni semantic files changed outside every registered model_path: "
-                f"{sample}. Update trusted .omni/flow.json metadata or add a valid PR marker."
+                f"{sample}. Update trusted .omni/flow.json metadata or add a valid PR marker.",
+                reason_code="unregistered_model_path",
             )
         return []
     if allow_skip and not changed_files:

@@ -9,6 +9,7 @@ from .content_impact_reporting import clear_content_impact
 from .diagnostics import public_diagnostic, record_private_report
 from .exceptions import OmniFlowError, SecurityPolicyError
 from .git import tool_revision
+from .reporting.json_report import diagnostic_json
 from .reporting.writer import write_reports
 from .repository_diagnostics import (
     clear_repository_reports,
@@ -64,7 +65,7 @@ def write_public_reports(
             if evidence_path.exists() or evidence_path.is_symlink():
                 # Normal orchestration replaces this with its current evidence
                 # envelope next. Until then, only current safe evidence remains.
-                secure_write_text(evidence_path, json.dumps(safe_report, indent=2) + "\n")
+                secure_write_text(evidence_path, diagnostic_json(safe_report))
     except SecurityPolicyError:
         # Never retry an output path rejected by the filesystem safety checks.
         raise
@@ -125,7 +126,7 @@ def write_public_json(
         payload.setdefault("tool_revision", tool_revision())
     safe_payload = public_diagnostic(payload)
     target = Path(path)
-    secure_write_text(target, json.dumps(safe_payload, indent=2, sort_keys=True) + "\n")
+    secure_write_text(target, diagnostic_json(safe_payload))
     return safe_payload
 
 

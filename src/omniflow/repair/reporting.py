@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from ..artifacts import public_dir, write_public_json
+from ..reporting.recovery import diagnostic_guide
 from ..security import public_safe, secure_write_text
 
 
@@ -69,8 +70,14 @@ def render_repair_markdown(report: dict[str, Any]) -> str:
         lines.extend(["## Failure and Recovery", ""])
         for issue in findings[:20]:
             code = _safe_text(issue.get("diagnostic_code") or "OF-AI-REPAIR")
-            lines.append(f"- **{code}**: {_safe_text(issue.get('message') or 'Repair did not establish success.')}")
-            if issue.get("next_action"):
+            lines.append(f"- **{_safe_text(issue.get('title') or issue.get('message') or 'Repair needs review.')}** (`{code}`)")
+            if issue.get("recovery_steps"):
+                for n, step in enumerate(issue["recovery_steps"], start=1):
+                    lines.append(f"  {n}. {_safe_text(step)}")
+                lines.append(f"  - Verify: {_safe_text(issue['verify_recovery'])}")
+                if url := diagnostic_guide(issue, report):
+                    lines.append(f"  - [Troubleshooting guide]({url})")
+            elif issue.get("next_action"):
                 lines.append(f"  - Next: {_safe_text(issue['next_action'])}")
             for key in ("reason_code", "cause_code", "operation_phase", "api_operation", "http_status"):
                 if key in issue:

@@ -17,6 +17,7 @@ from .diagnostic_catalog import CHANGE_MESSAGES, CHECK_GUIDANCE, LINT_MESSAGES
 from .diagnostic_contract import CATALOG_VERSION, DOCUMENT_IDENTITY_REASONS, REASON_DETAILS, diagnostic_descriptor
 from .exceptions import API_OPERATIONS, TRANSPORT_REASON_CODES, MissingPolicyError, exception_diagnostic
 from .repository_policy import POLICY_REASONS
+from .troubleshooting import ACTION_REPOSITORIES, guide_url, recovery_details
 from .validators.content_identity import IDENTITY_MESSAGES
 
 _receipt: ContextVar[list | None] = ContextVar("omniflow_private_receipt", default=None)
@@ -254,12 +255,16 @@ def public_diagnostic(payload: dict[str, Any]) -> dict[str, Any]:
                 commit = item.get("commit")
                 if item.get("source") == "github_action_ref" and isinstance(commit, str) and re.fullmatch(r"[a-fA-F0-9]{40}", commit):
                     result[key] = {"commit": commit.lower(), "source": "github_action_ref"}
+                    repo = item.get("repository")
+                    if isinstance(repo, str) and repo in ACTION_REPOSITORIES:
+                        result[key]["repository"] = repo
         if "exit_code" in result:
             result["exit_code_reason"] = EXIT_REASONS.get(result["exit_code"], "unknown failure")
         if "severity" in value or "type" in value and "validator" in value:
             result.setdefault("type", "omniflow_finding")
             result["message"] = _finding_message(result)
             result.update(diagnostic_descriptor(result))
+            result.update(recovery_details(result))
         return result
 
     safe = project(payload)
@@ -276,7 +281,7 @@ def _finding_message(issue: dict[str, Any]) -> str:
     reason = (issue.get("reason_code") if issue.get("reason_code") in {
                   "dbt_refresh_status_unknown", "ai_repair_timeout", *DOCUMENT_IDENTITY_REASONS}
               else issue.get("cause_code") or issue.get("reason_code"))
-    if reason in REASON_DETAILS and reason not in {"empty_api_response", "invalid_json_response"}:
+    if reason in REASON_DETAILS and reason not in {"empty_api_response", "invalid_json_response", "missing_policy_config"}:
         return REASON_DETAILS[reason][1]
     if issue.get("validator") == "semantic_lint" and issue.get("rule_id") in LINT_MESSAGES:
         return LINT_MESSAGES[issue["rule_id"]]
@@ -307,7 +312,7 @@ def _finding_message(issue: dict[str, Any]) -> str:
                 "Authored artifacts cannot be matched unambiguously. Repeated view filenames across databases or "
                 "schemas are valid; preserve canonical Omni identity or catalog/schema/table qualification. "
                 "Check duplicate topic names, model/global relationships definitions and export copies. "
-                "Inspect repository-only path examples; do not rename valid schema-scoped views."
+                "Use the local comparison to inspect file identities; do not rename valid schema-scoped views."
             ),
             "content_mismatch": (
                 "Git and Omni file inventories match, but authored file contents differ. "
@@ -389,7 +394,7 @@ def _finding_message(issue: dict[str, Any]) -> str:
             return ("Content query validation failed. Open Content Validator for the same model and branch "
                     "and inspect the reported query and model references.")
         return "Content validation failed. Open Content Validator in Omni for the same model and branch."
-    return ("No recognized diagnostic category was supplied for this check. "
+    return ("OmniFlow could not identify a more specific cause in this result. "
             + CHECK_GUIDANCE.get(issue.get("validator"), CHECK_GUIDANCE["execution"]))
 
 
@@ -398,10 +403,12 @@ def safe_exception_message(exc: Exception) -> str:
     category = EXIT_REASONS.get(code, "internal tool error") if type(code) is int else "internal tool error"
     reason = getattr(exc, "reason_code", None)
     suffix = f" ({reason})" if isinstance(reason, str) and reason in REASONS else ""
-    if isinstance(reason, str) and reason in {"empty_api_response", "invalid_json_response", "missing_policy_config"}:
-        return f"{_finding_message({'reason_code': reason})} Reason: {reason}."
     issue = public_diagnostic({"issues": [{"validator": "setup" if code == 2 else "execution",
                                           "severity": "error", "type": "validation_execution_failed",
                                           **exception_diagnostic(exc)}]})["issues"][0]
+    from .git import tool_revision
+    revision = tool_revision()
+    guide = guide_url(issue["guide_anchor"], revision["commit"], revision.get("repository"))
+    steps = " ".join(f"{n}. {step}" for n, step in enumerate(issue["recovery_steps"], start=1))
     return (f"{issue['diagnostic_code']}: OmniFlow {category}{suffix}. {issue['message']} "
-            f"Next: {issue['next_action']}")
+            f"Next: {steps} Verify: {issue['verify_recovery']} Guide: {guide}")

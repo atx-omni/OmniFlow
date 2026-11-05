@@ -46,7 +46,12 @@ def tool_revision() -> dict[str, str | None]:
     """
     action_ref = os.getenv("OMNIFLOW_ACTION_REF", "")
     if re.fullmatch(r"[0-9a-fA-F]{40}", action_ref):
-        return {"commit": action_ref.lower(), "source": "github_action_ref"}
+        from .troubleshooting import ACTION_REPOSITORIES
+        revision = {"commit": action_ref.lower(), "source": "github_action_ref"}
+        repo = os.getenv("OMNIFLOW_ACTION_REPOSITORY")
+        if repo in ACTION_REPOSITORIES:
+            revision["repository"] = repo
+        return revision
     return {"commit": None, "source": "unavailable"}
 
 

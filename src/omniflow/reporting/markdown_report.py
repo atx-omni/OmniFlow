@@ -11,6 +11,7 @@ from .diagnostic_fields import DIAGNOSTIC_FACTS
 from .finding_groups import group_findings
 from .issue_policy import is_blocking
 from .notification import query_policy_reference, query_result_coverage
+from .recovery import candidate_detail_hint, diagnostic_guide
 
 
 def _render_minimal_diagnostic(report: dict[str, Any]) -> str:
@@ -18,10 +19,11 @@ def _render_minimal_diagnostic(report: dict[str, Any]) -> str:
     summary = report.get("summary", {})
     findings = report.get("issues", [])
     blocking_count = sum(is_blocking(finding) for finding in findings)
+    primary = next((finding for finding in findings if is_blocking(finding)), None)
     lines = [
         "# OmniFlow", "", "## Decision", "",
         f"**{_report_decision(report)}**",
-        *_primary_blocker_lines(findings),
+        *_primary_blocker_lines(primary, report),
         "", f"- Exit reason: `{_safe_code(report.get('exit_code_reason', 'unknown'))}`",
         f"- Run reference: `{_safe_code(report.get('run_reference', 'unavailable'))}`",
         f"- Validation complete: `{str(report.get('validation_complete', False)).lower()}`",
@@ -87,7 +89,7 @@ def _render_minimal_diagnostic(report: dict[str, Any]) -> str:
             for reason, count in sorted(reasons.items()):
                 if type(count) is int and count > 0:
                     lines.append(f"- Location evidence unavailable: `{_safe_code(reason)}` — `{count}` occurrence(s).")
-    lines.extend(_public_finding_lines(findings, repository_detail=repository_detail))
+    lines.extend(_public_finding_lines(findings, report, primary=primary, repository_detail=repository_detail))
     contexts = report.get("model_reports") or [report]
     lines.extend(["", "## Check Execution", ""])
     for context in contexts:
@@ -163,7 +165,8 @@ def _render_minimal_diagnostic(report: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _public_finding_lines(findings: list[dict[str, Any]], *, repository_detail: bool = False) -> list[str]:
+def _public_finding_lines(findings: list[dict[str, Any]], report: dict[str, Any], *,
+                          primary: dict[str, Any] | None, repository_detail: bool = False) -> list[str]:
     lines = ["", "## Findings", ""]
     if not findings:
         return lines + ["No findings recorded. Check execution completeness before interpreting this as a pass."]
@@ -189,8 +192,14 @@ def _public_finding_lines(findings: list[dict[str, Any]], *, repository_detail: 
                 lines.append(f"   - diagnostic code: `{_safe_code(finding['diagnostic_code'])}`")
             if finding.get("title") and finding["title"] != finding.get("message"):
                 lines.append(f"   - diagnosis: {_safe_text(finding['title'])}")
-            if finding.get("next_action"):
+            if blocking and finding != primary and finding.get("recovery_steps"):
+                lines.extend(_recovery_lines(finding, report, indent="   "))
+            elif not finding.get("recovery_steps") and finding.get("next_action"):
                 lines.append(f"   - next action: {_safe_text(finding['next_action'])}")
+            elif not blocking and finding.get("active", True):
+                url = diagnostic_guide(finding, report)
+                if url:
+                    lines.append(f"   - [Troubleshooting guide]({url})")
             policy = query_policy_reference(finding)
             if policy:
                 lines.append(f"   - assertion location: {policy} (positions are one-based).")
@@ -212,8 +221,7 @@ def _public_finding_lines(findings: list[dict[str, Any]], *, repository_detail: 
     return lines
 
 
-def _primary_blocker_lines(findings: list[dict[str, Any]]) -> list[str]:
-    primary = next((finding for finding in findings if is_blocking(finding)), None)
+def _primary_blocker_lines(primary: dict[str, Any] | None, report: dict[str, Any]) -> list[str]:
     if primary is None:
         return []
     title = primary.get("title") or primary.get("message") or "The check could not establish a safe result."
@@ -223,13 +231,46 @@ def _primary_blocker_lines(findings: list[dict[str, Any]]) -> list[str]:
         lines.append(f"- Affected check: `{_safe_code(primary.get('context_reference', 'context'))}` / "
                      f"`{_safe_code(primary.get('validator', 'execution'))}` / "
                      f"`{_safe_code(primary.get('validation_scope', 'unknown'))}` scope.")
+    if primary.get("recovery_steps"):
+        if primary.get("outcome_label"):
+            lines.append(f"- Outcome: {_safe_text(primary['outcome_label'])}")
+        if primary.get("coverage_description"):
+            lines.append(f"- Comparison: {_safe_text(primary['coverage_description'])}")
+        if primary.get("candidate_reason") == "content_mismatch":
+            health = sum(item.get("validator") in {"model", "content"} and item.get("active", True)
+                         and not is_blocking(item) for item in report.get("issues", []))
+            if health:
+                lines.append(f"- {health:,} nonblocking model and content finding{'s' if health != 1 else ''}"
+                             " recorded separately.")
+        lines.extend(_recovery_lines(primary, report))
+        return lines
     action = primary.get("next_action")
     if action:
         lines.append(f"**Next action:** {_safe_text(action)}")
     return lines
 
 
+def _recovery_lines(finding: dict[str, Any], report: dict[str, Any], *, indent: str = "") -> list[str]:
+    lines = ["", indent + "**How to resolve it**", ""]
+    for index, step in enumerate(finding["recovery_steps"][:3], 1):
+        lines.append(f"{indent}{index}. {_safe_text(step)}")
+    lines.append("")
+    detail_hint = candidate_detail_hint(finding, report)
+    if detail_hint:
+        lines.append(indent + detail_hint)
+    if finding.get("verify_recovery"):
+        lines.append(indent + "**Confirm the fix:** " + _safe_text(finding["verify_recovery"]))
+    if finding.get("support_action"):
+        lines.append(indent + "**If it persists:** " + _safe_text(finding["support_action"]))
+    url = diagnostic_guide(finding, report)
+    if url:
+        lines.append(indent + f"[Troubleshooting guide]({url})")
+    return lines
+
+
 def _next_action_lines(report: dict[str, Any], findings: list[dict[str, Any]]) -> list[str]:
+    if any(finding.get("recovery_steps") and is_blocking(finding) for finding in findings):
+        return []  # Current reports put each remedy beside its finding.
     lines = ["", "## Next Steps", ""]
     seen = set()
     active = [finding for finding in findings if finding.get("active", True)]
@@ -269,7 +310,9 @@ def _candidate_observation_lines(finding: dict[str, Any]) -> list[str]:
     samples = finding.get("candidate_samples")
     if not isinstance(samples, list) or not samples:
         return []
-    lines = ["   - Candidate path observations (not verified correspondence):"]
+    matched_contents = finding.get("candidate_reason") == "content_mismatch"
+    lines = ["   - Matched files with different contents:" if matched_contents
+             else "   - Candidate path observations (not verified correspondence):"]
     for sample in samples[:5]:
         if not isinstance(sample, dict):
             continue
@@ -283,8 +326,9 @@ def _candidate_observation_lines(finding: dict[str, Any]) -> list[str]:
                       else "contents not compared")
         hint = "; basename hint only" if sample.get("pairing") == "basename_hint" else ""
         lines.append(f"     - {'; '.join(paths)} — {comparison}{hint}.")
-    lines.append("   - Observed paths and filename hints do not prove that files correspond. "
-                 "Do not rename or overwrite files solely to make the check pass.")
+    if not matched_contents:
+        lines.append("   - Observed paths and filename hints do not prove that files correspond. "
+                     "Do not rename or overwrite files solely to make the check pass.")
     return lines
 
 
@@ -326,6 +370,14 @@ def _comparison_outcome(check: dict[str, Any], validator: str) -> str:
 
 def render_markdown_report(report: dict[str, Any]) -> str:
     if report.get("diagnostic_schema_version") == 2:
+        if (report.get("diagnostic_catalog_version") == 3 and report.get("diagnostic_audience") != "repository"
+                and any("recovery_steps" not in issue for issue in report.get("issues", []))):
+            # Rebuild from public evidence, never trust prose in an input catalog.
+            from ..diagnostics import public_diagnostic
+            original_ref = report.get("run_reference")
+            report = public_diagnostic(report)
+            if isinstance(original_ref, str) and re.fullmatch("[0-9a-f]{32}", original_ref):
+                report["run_reference"] = original_ref
         return _render_minimal_diagnostic(report)
     summary = report.get("summary", {})
     decision = str(report.get("policy_decision") or "unknown")

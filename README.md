@@ -576,6 +576,7 @@ Exit codes are `0` success, intentional skip, or explicitly nonblocking onboardi
 - [Breaking change hold for single-branch monorepos](docs/BREAKING_CHANGE_HOLD.md)
 - [dbt impact analysis on Omni references](docs/DBT_IMPACT.md)
 - [AI Repair development scaffold](docs/AI_REPAIR.md)
+- [Fix a failed check by error code](docs/ERROR_CODES.md)
 - [Troubleshooting](docs/TROUBLESHOOTING.md)
 - [Support and safe diagnostic sharing](SUPPORT.md)
 - [Security policy](SECURITY.md)

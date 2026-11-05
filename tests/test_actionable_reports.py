@@ -77,7 +77,7 @@ def test_public_annotations_group_before_limit_and_keep_policy_levels(monkeypatc
     cli._emit_github_annotations(safe["issues"], limit=20)
     lines = capsys.readouterr().out.splitlines()
     assert len(lines) == 8
-    assert lines[0].startswith("::error::") and "Dashboard-filter validation failed" in lines[0]
+    assert lines[0].startswith("::error::") and "dashboard filter failed validation" in lines[0]
     assert sum(line.startswith("::error::") for line in lines) == 1
     assert sum(line.startswith("::notice::") for line in lines) == 2
     assert sum(line.startswith("::warning::") for line in lines) == 5
@@ -91,7 +91,7 @@ def test_annotation_omission_is_explicit_and_inactive_findings_do_not_use_limit(
     inactive = {**safe["issues"][0], "active": False}
     lines = public_annotation_lines([inactive, *safe["issues"]], limit=1)
     assert len(lines) == 2
-    assert "Dashboard-filter validation failed" in lines[0]
+    assert "dashboard filter failed validation" in lines[0]
     assert "7 categories, 342 occurrences, 0 blocking" in lines[1]
 
 

@@ -181,3 +181,44 @@ def test_query_report_points_to_exact_trusted_policy_assertion_and_safe_check_co
     assert "query validation status: `regression`" in text
     assert "contracts checked: `2`" in text and "query submission count: `6`" in text
     assert "PRIVATE_CONTRACT" not in text and "PRIVATE_QUERY" not in text and "0.87654" not in text
+
+
+@pytest.mark.parametrize("visibility", ["repository_internal", "repository_public", "repository_verified"])
+def test_customer_mismatch_guidance_across_channels(visibility, monkeypatch):
+    from omniflow.diagnostics import public_diagnostic
+    from omniflow.github.annotations import public_annotation_lines
+    from omniflow.reporting.notification import render_notification, render_pr_comment, render_transition_notice
+    from omniflow.reporting.recovery import diagnostic_guide
+
+    pin = "a" * 40
+    monkeypatch.setenv("OMNIFLOW_ACTION_REF", pin)
+    raw = report(issues=[{
+        "validator": "candidate", "type": "candidate_verification_failed", "candidate_reason": "content_mismatch",
+        "severity": "error", "blocking": True, "validation_scope": "branch", "git_file_count": 1253,
+        "omni_file_count": 1253, "git_only_count": 0, "omni_only_count": 0, "compared_file_count": 379,
+        "message": "SENSITIVE_SQL", "candidate_samples": [{"git_path": "SENSITIVE_PATH"}],
+        "guide_anchor": "SENSITIVE_ANCHOR", "recovery_steps": ["SENSITIVE_STEP"],
+    }, {"validator": "model", "type": "model_validation_issue", "severity": "error", "blocking": False,
+        "regression_status": "unknown"}], repository_diagnostics={
+            "status": "generated" if visibility == "repository_verified" else "unavailable",
+            "diagnostics_reason": visibility,
+        })
+    safe = public_diagnostic(raw)
+    issue = safe["issues"][0]
+    url = diagnostic_guide(issue, safe)
+    markdown = render_markdown_report(safe)
+    assert "874" in markdown and "1 nonblocking model and content finding" in markdown
+    assert "How to resolve it" in markdown.split("## Findings")[0]
+    assert markdown.count("How to resolve it") == 1
+    assert "Confirm the fix" in markdown and "If it persists" in markdown
+    assert ("No detailed artifact was generated" in markdown) == (visibility != "repository_verified")
+    args = {"head_sha": "b" * 40, "run_url": "https://github.com/demo/repo/actions/runs/123"}
+    pr = render_pr_comment(raw, **args)
+    summary = render_notification(raw, **args, run_attempt=1)
+    notice = render_transition_notice(report=raw, transition="failure", **args)
+    logs = "\n".join(public_annotation_lines(safe["issues"], limit=10))
+    assert pr.index(issue["title"]) < pr.index("OF-CANDIDATE-CONTENT")
+    assert issue["recovery_steps"][0] in notice and "How to resolve it" not in pr
+    for channel in (markdown, pr, summary, notice, logs):
+        assert f"/{pin}/" in url and url in channel
+        assert "SENSITIVE_" not in channel

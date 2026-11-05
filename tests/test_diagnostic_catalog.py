@@ -88,7 +88,8 @@ def test_lint_action_survives_all_report_formats_without_changing_gate(rule_id):
     assert expected in "\n".join(public_annotation_lines(safe["issues"], limit=20))
     # Markdown escapes punctuation; inspect its structure as well as safe JSON.
     markdown = render_markdown_report(safe)
-    assert "next action:" in markdown and "no recognized lint rule code" not in markdown
+    assert "How to resolve it" in markdown and expected.split(";")[0] in markdown.replace("\\", "")
+    assert "no recognized lint rule code" not in markdown
     assert_no_private_markers(markdown + json.dumps(sarif) + to_junit(safe))
 
 

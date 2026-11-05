@@ -100,6 +100,7 @@ def verify_candidate(
 
 def _verify_snapshot(
     client: Any, context: Any, *, revision_side: str, non_omni_rules: Sequence[NonOmniRule] = (),
+    local_diagnosis_revision: tuple[str, str] | None = None,
 ) -> dict[str, Any]:
     if revision_side not in {"head", "base"}:
         raise CandidateVerificationError("invalid_pr_revision")
@@ -109,7 +110,7 @@ def _verify_snapshot(
     scope = getattr(context, "model_path", None)
     model_path = "." if scope == "." else _safe_path(scope)
     try:
-        revision = pull_request_revision(revision_side)
+        revision = local_diagnosis_revision or pull_request_revision(revision_side)
     except ConfigError as exc:
         error = CandidateVerificationError("invalid_pr_revision")
         error.diagnostic_context.update(exception_diagnostic(exc))
@@ -124,9 +125,12 @@ def _verify_snapshot(
     sha, repository = revision
     root = Path(".")
     try:
-        entries = _local_tree(sha, root=root)
+        entries = (_local_tree(sha, root=root, local_only=True) if local_diagnosis_revision
+                   else _local_tree(sha, root=root))
         remote = False
     except _GitUnavailable as local_error:
+        if local_diagnosis_revision is not None:
+            raise CandidateVerificationError("git_snapshot_unavailable") from None
         try:
             entries = _remote_tree(repository, sha)
         except OmniFlowError as exc:
@@ -168,7 +172,17 @@ def _verify_snapshot(
     git_files = {}
     for path, entry in sorted(expected.items()):
         try:
-            if remote:
+            if local_diagnosis_revision is not None:
+                # Read the already inventoried blob directly. Never lazy-fetch
+                # missing objects or invoke configured remote credential helpers.
+                try:
+                    text = _bounded_git(["cat-file", "blob", entry["sha"]], root=root,
+                                        limit=MAX_YAML_FILE_BYTES, local_only=True).decode("utf-8")
+                except _GitUnavailable:
+                    raise CandidateVerificationError("git_snapshot_unavailable") from None
+                except UnicodeError:
+                    raise CandidateVerificationError("invalid_snapshot_encoding") from None
+            elif remote:
                 text = read_github_text(repository, sha, entry["path"], max_bytes=MAX_YAML_FILE_BYTES)
             else:
                 text = read_git_text(sha, entry["path"], root=root, max_bytes=MAX_YAML_FILE_BYTES)
@@ -217,10 +231,16 @@ def _verify_snapshot(
         raw = _utf8(text)
         api_path = correspondence.pairs[path]
         if raw != actual[api_path]:
+            sample = {"git_path": path, "omni_path": api_path,
+                      "comparison": "different", "pairing": "authored_identity"}
+            if local_diagnosis_revision is not None:
+                # Local-only evidence; keep the CI exception/report schema unchanged.
+                from .candidate_diagnosis import difference_details
+
+                sample.update(difference_details(text, omni_files[api_path]))
             raise _bind_samples(CandidateVerificationError(
                 "content_mismatch", **counts,
-                candidate_samples=[{"git_path": path, "omni_path": api_path,
-                                    "comparison": "different", "pairing": "authored_identity"}],
+                candidate_samples=[sample],
                 candidate_sample_count=1, candidate_sample_omitted_count=0, compared_file_count=compared_count,
             ), sha=sha, model_id=context.model_id, branch_id=branch_id, comparison="different")
         name = path.encode("utf-8")
@@ -389,15 +409,20 @@ def _semantic_inventory(
     return selected if include_unrecognized else _source_inventory(selected, {})
 
 
-def _bounded_git(args: list[str], *, root: Path, limit: int) -> bytes:
+def _bounded_git(args: list[str], *, root: Path, limit: int, local_only: bool = False) -> bytes:
     """Bound captured bytes as well as duration; kill before draining overflow."""
     try:
         executable = git_executable()
     except OSError:
         raise _GitUnavailable("git_missing_executable") from None
     try:
+        options = ["--no-replace-objects"]
+        env = None
+        if local_only:
+            options += ["--no-optional-locks", "--no-pager", "-c", "protocol.allow=never", "-c", "gc.auto=0"]
+            env = {**os.environ, "GIT_ALLOW_PROTOCOL": "", "GIT_NO_LAZY_FETCH": "1", "GIT_TERMINAL_PROMPT": "0"}
         with subprocess.Popen(  # nosec B603
-            [executable, "--no-replace-objects", *args], cwd=root,
+            [executable, *options, *args], cwd=root, env=env,
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         ) as process:
             with ThreadPoolExecutor(max_workers=1) as reader:
@@ -421,10 +446,11 @@ def _bounded_git(args: list[str], *, root: Path, limit: int) -> bytes:
         raise _GitUnavailable() from None
 
 
-def _local_tree(sha: str, *, root: Path) -> list[dict]:
-    if _bounded_git(["cat-file", "-t", sha], root=root, limit=32).strip() != b"commit":
+def _local_tree(sha: str, *, root: Path, local_only: bool = False) -> list[dict]:
+    if _bounded_git(["cat-file", "-t", sha], root=root, limit=32, local_only=local_only).strip() != b"commit":
         raise CandidateVerificationError("invalid_pr_revision")
-    raw = _bounded_git(["ls-tree", "--full-tree", "-r", "-l", "-z", sha], root=root, limit=MAX_TREE_BYTES)
+    raw = _bounded_git(["ls-tree", "--full-tree", "-r", "-l", "-z", sha], root=root,
+                       limit=MAX_TREE_BYTES, local_only=local_only)
     if raw and not raw.endswith(b"\0"):
         raise CandidateVerificationError("invalid_git_inventory")
     entries = []

@@ -264,12 +264,17 @@ def load_raw_config(path: str | Path | None = None) -> tuple[dict[str, Any], Pat
         error = MissingPolicyError()
         error.diagnostic_context = {"source_kind": "policy"}
         raise error
-    payload = parse_secure_yaml(text, source=str(candidate), source_kind="policy")
+    return parse_policy_text(text, source=candidate), candidate
+
+
+def parse_policy_text(text: str, *, source: Path) -> dict[str, Any]:
+    """Validate policy read from an already selected trusted data source."""
+    payload = parse_secure_yaml(text, source=str(source), source_kind="policy")
     if not isinstance(payload, dict) or not payload:
         raise _config_error("Policy must contain a non-empty top-level mapping", "config", "non_empty_mapping")
-    reject_secret_keys(payload, source=str(candidate))
+    reject_secret_keys(payload, source=str(source))
     _validate_config_schema(payload)
-    return expand_env_vars(payload), candidate
+    return expand_env_vars(payload)
 
 
 @dataclass

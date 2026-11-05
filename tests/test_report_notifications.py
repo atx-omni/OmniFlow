@@ -199,7 +199,7 @@ def test_compact_failure_limits_groups_but_counts_all_blockers_and_retains_actio
     data = report() | {"issues": [issue | {"query_assertion_number": n} for n in range(1, 8)]}
     before = deepcopy(data)
     text = render_pr_comment(data, head_sha=HEAD, run_url=RUN_URL, publication=publication_receipts(environment()))
-    assert "Blocking findings: 7" in text and text.count("- **OF-") == 3
+    assert "Blocking findings: 7" in text and text.count("(`OF-") == 3
     assert "Plus 4 additional blocking occurrence(s)" in text
     assert "entry 1, assertion 3" in text and "assertion 4" not in text
     assert "**Next action:**" in text and "RAW_" not in text and "PRIVATE_" not in text
@@ -536,7 +536,7 @@ def test_recovery_timeout_reconciles_exact_notification_without_duplicate():
     assert len(api.comments) == 3
     assert "Failure notification" in api.comments[-1]["body"]
     notice = api.comments[-1]["body"].split("-->\n", 1)[1]
-    assert len(notice.splitlines()) == 1 and "[View current result]" in notice
+    assert "OF-MODEL" in notice and "**Next action:**" in notice and "[View current result]" in notice
 
 
 def test_existing_newer_bot_state_prevents_old_run_overwrite_even_if_run_list_lags():

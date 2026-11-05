@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from .diagnostic_catalog import CHANGE_MESSAGES, CHECK_GUIDANCE, LINT_ACTIONS, LINT_MESSAGES
 
-CATALOG_VERSION = 2
+CATALOG_VERSION = 3
 # code, title, corrective/investigative action, category
 REASON_DETAILS: dict[str, tuple[str, str, str, str]] = {}
 
@@ -224,13 +224,16 @@ for _reason in (
          "For pull requests, update the trusted target-branch policy/metadata first; a PR-only policy cannot authorize itself.",
          "configuration")
 
-_add("file_inventory_mismatch", "OF-CANDIDATE-FILES", "Git and Omni have unmatched authored artifacts.",
-     "Inspect the repository-only mismatch samples and exact base/candidate scope. Check missing/extra artifacts, "
+_add("missing_policy_config", "OF-MISSING-POLICY-CONFIG", "The target branch is missing the required OmniFlow policy.",
+     "Open the PR target branch and add the required .omniflow.yml policy at the configured path.", "configuration")
+_add("unregistered_model_path", "OF-SETUP-MODEL-PATH", "Changed Omni files fall outside every registered model folder.",
+     "Compare models[].model_path in the trusted .omni/flow.json with the actual repository directory, including case and spaces.", "configuration")
+_add("file_inventory_mismatch", "OF-CANDIDATE-FILES", "Some model files are present on only one side of the comparison.",
+     "Review the Git-only and Omni-only counts for the selected scope. Check missing/extra artifacts, "
      "view database/catalog and schema qualification, topic names and capitalization, then contents. "
      "Do not rename or overwrite model files solely to make this check pass.", "synchronization")
-_add("content_mismatch", "OF-CANDIDATE-CONTENT", "Matched authored files have different contents.",
-     "Inspect the reported file at the recorded Git revision and selected Omni scope; save/synchronize the intended "
-     "definitions, then rerun. Do not overwrite either side without reviewing the difference.", "synchronization")
+_add("content_mismatch", "OF-CANDIDATE-CONTENT", "At least one saved Omni model file differs from the corresponding Git commit.",
+     "Compare the selected Omni scope with its Git revision. Use the read-only local comparison to locate the difference.", "synchronization")
 _add("changed_during_validation", "OF-CANDIDATE-DRIFT", "The selected snapshot changed during validation.",
      "Wait for synchronization/editing to finish and rerun against the latest PR revisions.", "synchronization")
 _add("relationship_scope_unresolved", "OF-RELATIONSHIP-SCOPE", "A relationship relocation could not be proven equivalent.",
@@ -288,7 +291,7 @@ for _reason, _title, _action, _category in (
 
 _add("ambiguous_file_identity", "OF-CANDIDATE-AMBIGUOUS-FILE-IDENTITY",
      "Authored artifacts cannot be matched to one unambiguous identity.",
-     "Inspect the repository-only file examples. Repeated view filenames across databases or schemas are valid: "
+     "Compare the matching file identities locally. Repeated view filenames across databases or schemas are valid: "
      "retain their canonical Omni identity or catalog/schema/table qualification. Keep topic names unique and "
      "one model/global relationships definition. Remove duplicate export copies only after confirming ownership; "
      "identical contents do not resolve ambiguous identity. Do not rename valid schema-scoped views.")
@@ -441,6 +444,12 @@ def diagnostic_descriptor(issue: dict) -> dict[str, str]:
                  else "A validation finding was recorded.")
         if validator == "semantic_lint" and rule in LINT_MESSAGES:
             title = LINT_MESSAGES[rule]
+        elif validator in {"model", "content"} and category == "validation" and issue.get("type") in {
+            "model_validation_issue", "content_validation_issue",
+        }:
+            title = ("Omni found an issue in this model definition." if validator == "model" else
+                     "An Omni dashboard filter failed validation." if issue.get("issue_type") == "dashboard_filter" else
+                     "Omni found an issue when validating content.")
         elif validator in {"semantic_diff", "contracts"} and issue.get("type") in CHANGE_MESSAGES:
             title = CHANGE_MESSAGES[issue["type"]]
         action = CHECK_GUIDANCE.get(validator, CHECK_GUIDANCE["execution"])

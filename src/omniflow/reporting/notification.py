@@ -12,6 +12,7 @@ from ..content_impact_reporting import content_impact_line, coverage_explanation
 from ..diagnostics import ENUMS, public_diagnostic
 from .finding_groups import group_findings
 from .issue_policy import is_blocking
+from .recovery import candidate_detail_hint, diagnostic_guide, first_step
 
 
 def query_result_coverage(report: dict[str, Any]) -> str:
@@ -124,6 +125,12 @@ def _comparison_count(safe: dict[str, Any], validator: str) -> str:
     return f"{total} new"
 
 
+def _primary_action(issue: dict[str, Any], report: dict[str, Any]) -> str:
+    action = "**Next action:** " + first_step(issue)
+    url = diagnostic_guide(issue, report)
+    return action + (f" · [Troubleshooting guide]({url})" if url else "")
+
+
 def render_pr_comment(
     report: dict[str, Any], *, head_sha: str, run_url: str,
     publication: list[dict[str, str]] | None = None,
@@ -158,8 +165,8 @@ def render_pr_comment(
         for issue, count in groups[:3]:
             scope = " / ".join(issue[key] for key in ("context_reference", "validation_scope", "state") if key in issue)
             policy = query_policy_reference(issue)
-            lines.append(f"- **{issue.get('diagnostic_code', 'OF-UNKNOWN')}**: "
-                         f"{issue.get('title', 'A blocking check needs review.')} ({count} occurrence(s))"
+            lines.append(f"- **{issue.get('title', 'A blocking check needs review.')}** "
+                         f"(`{issue.get('diagnostic_code', 'OF-UNKNOWN')}`, {count} occurrence(s))"
                          + (f" — {scope}" if scope else "") + (f" — {policy}" if policy else ""))
         if groups:
             lines.append("")
@@ -167,9 +174,13 @@ def render_pr_comment(
         if remaining:
             lines.append(f"Plus {remaining} additional blocking occurrence(s); see the full report.")
         primary = next(iter(blockers), None)
-        action = (primary.get("next_action", "Inspect the failed check in this run.") if primary else
-                  "Inspect this run's routing, coverage and policy before treating it as validated.")
-        lines.append(f"**Next action:** {action}")
+        if primary and primary.get("coverage_description"):
+            lines.append(primary["coverage_description"])
+        lines.append(_primary_action(primary, safe) if primary else
+                     "**Next action:** Inspect this run's routing, coverage and policy before treating it as validated.")
+        health = sum(not is_blocking(item) and item.get("active", True) for item in safe.get("issues", []))
+        if health:
+            lines.append(f"Nonblocking findings: {health:,}. See the report for details.")
 
     impact_line = content_impact_line(safe)
     if impact_line:
@@ -193,14 +204,22 @@ def render_pr_comment(
     return "  \n".join(lines) + "\n"
 
 
-def render_transition_notice(*, transition: str, head_sha: str, run_url: str) -> str:
+def render_transition_notice(*, transition: str, head_sha: str, run_url: str,
+                             report: dict[str, Any] | None = None) -> str:
     """A notification points to the result instead of repeating the PR summary."""
     description = {
         "failure": "Action is required",
         "recovery": "Validation passed",  # nosec B105
     }[transition]
-    return (f"**{transition.capitalize()} notification:** {description} for `{_head_reference(head_sha)}`. "
-            f"{_run_link(run_url, 'View current result')}\n")
+    lines = [f"**{transition.capitalize()} notification:** {description} for `{_head_reference(head_sha)}`."]
+    if transition == "failure" and report:
+        safe = public_diagnostic(report)
+        primary = next((issue for issue in safe.get("issues", []) if is_blocking(issue)), None)
+        if primary:
+            lines.extend([f"{primary['title']} (`{primary['diagnostic_code']}`).", _primary_action(primary, safe)])
+    lines.append(_run_link(run_url, "View current result"))
+    separator = "  \n" if len(lines) > 2 else " "
+    return separator.join(lines) + "\n"
 
 
 def render_notification(
@@ -238,12 +257,17 @@ restricts their shape, preventing Markdown or identity injection by other caller
                      f"{summary.get('existing_issues', 0)} existing. Counts are occurrences, not unique objects.")
     for issue, count in group_findings(blockers)[:3]:
         policy = query_policy_reference(issue)
-        lines.append(f"- **{issue.get('diagnostic_code', 'OF-UNKNOWN')}**: "
-                     f"{issue.get('title', 'A blocking check needs review.')} ({count} occurrence(s))"
+        lines.append(f"- **{issue.get('title', 'A blocking check needs review.')}** "
+                     f"(`{issue.get('diagnostic_code', 'OF-UNKNOWN')}`, {count} occurrence(s))"
                      + (f" — {policy}." if policy else ""))
     primary = next(iter(blockers), None)
     if primary:
-        lines.extend(["", "**Next action:** " + primary.get("next_action", "Inspect the failed check in this run.")])
+        if primary.get("coverage_description"):
+            lines.append(primary["coverage_description"])
+        lines.extend(["", _primary_action(primary, safe)])
+        detail_hint = candidate_detail_hint(primary, safe)
+        if detail_hint:
+            lines.append(detail_hint)
     elif decision == "pass":
         lines.append("**Next action:** Review the current-head result and remaining nonblocking findings before merging.")
     else:
@@ -270,5 +294,4 @@ restricts their shape, preventing Markdown or identity injection by other caller
                 status = "unconfirmed"
             lines.append(f"- {label}: **{status}**{link}.")
         lines.append("Publication is separate from validation. Repository-only detail is not a shareable support attachment.")
-    lines.extend(["", "Detailed findings and check coverage are in the artifacts; this short summary excludes source text and data."])
     return "\n".join(lines) + "\n"
