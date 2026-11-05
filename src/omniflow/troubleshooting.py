@@ -106,7 +106,7 @@ def recovery_details(issue: dict) -> dict:
         steps = ["Open the first failed setup or routing step and find the named setting or file.", action]
         verify = "Setup completes and the workflow selects its intended operation."
     elif anchor == "semantic-changes":
-        steps = ["Find the reported rule or change type and open the affected definition in the model.", action]
+        steps = [action, "Save the reviewed definition on the branch and rerun the rule or semantic comparison."]
         verify = "Check the rule or change type on the saved branch and review its updated blocking count."
     elif anchor in {"dependencies", "dbt-impact"}:
         steps = [action, "Check the reported dependency coverage for the changed field or relation."]
