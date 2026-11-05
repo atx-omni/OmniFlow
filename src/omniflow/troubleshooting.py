@@ -34,8 +34,8 @@ def _mismatch_remedy(issue: dict) -> tuple[str, str]:
         if missing == "omni":
             return ("The Omni file is missing the final newline present in Git.",
                     f"Open the file in the {omni_side}, match the intended final newline, save and sync, then rerun.")
-        return ("The two copies differ only by a final newline.",
-                "Match the final newline in the two copies, save and sync the intended version, then rerun.")
+        return ("Only the trailing line breaks differ.",
+                "Match the line breaks at the end of the two files, save and sync the intended version, then rerun.")
     if kind == "line_endings_only":
         left, right = ENDING_NAMES.get(issue.get("git_line_ending")), ENDING_NAMES.get(issue.get("omni_line_ending"))
         detail = f" Git uses {left} and Omni uses {right}." if left and right else ""
@@ -43,7 +43,7 @@ def _mismatch_remedy(issue: dict) -> tuple[str, str]:
                 f"Use your editor's line-ending setting to match the intended file on the {git_side} and in Omni, then sync and rerun.")
     if kind == "yaml_comment_or_whitespace_only":
         return ("Only YAML comments or formatting differ in this pair.",
-                "Compare the comment or formatting at the reported line, keep the intended version on both sides, then sync and rerun.")
+                "Find the differing line in the private Summary or local comparison, match the intended comment or formatting, then sync and rerun.")
     if kind == "authored_text_changed":
         return ("The authored YAML text differs beyond comments or whitespace.",
                 f"Compare the Git and Omni lines in the local diagnostic. Save the intended definition in the {omni_side} and {git_side}, then rerun.")
